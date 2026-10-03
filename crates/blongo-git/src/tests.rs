@@ -229,3 +229,62 @@ async fn huge_untracked_files_skip_the_checkpoint() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn capture_leaves_the_users_index_file_alone() {
+    let repo = Repo::new("index-untouched", true).await;
+    repo.write("a.txt", "staged\n");
+    git(&repo.0, &["add", "a.txt"]).await.unwrap();
+    let index = repo.0.join(".git/index");
+    let before = std::fs::read(&index).unwrap();
+    capture_checkpoint(&repo.0, &checkpoint_ref("t", "r"))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&index).unwrap(), before);
+}
+
+#[tokio::test]
+async fn worktrees_with_ignored_files_are_kept() {
+    let repo = Repo::new("wt-ignored", true).await;
+    let path = repo.0.with_extension("wt");
+    add_worktree(&repo.0, &path, "blongo/ignored")
+        .await
+        .unwrap();
+    std::fs::create_dir_all(path.join("target")).unwrap();
+    std::fs::write(path.join("target/secret.env"), "TOKEN=x\n").unwrap();
+    let err = remove_pristine_worktree(&repo.0, &path).await.unwrap_err();
+    assert!(format!("{err:#}").contains("ignored"), "{err:#}");
+    assert!(path.join("target/secret.env").exists());
+    std::fs::remove_dir_all(path.join("target")).unwrap();
+    remove_pristine_worktree(&repo.0, &path).await.unwrap();
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn thread_refs_still_used_are_kept() {
+    let repo = Repo::new("refs-keep", true).await;
+    let used = capture_checkpoint(&repo.0, &checkpoint_ref("t", "r1"))
+        .await
+        .unwrap();
+    repo.write("a.txt", "changed\n");
+    capture_checkpoint(&repo.0, &checkpoint_ref("t", "r2"))
+        .await
+        .unwrap();
+    capture_checkpoint(&repo.0, &format!("{PRE_ROLLBACK_REF_PREFIX}/t/r2"))
+        .await
+        .unwrap();
+    delete_thread_refs(&repo.0, "t", &HashSet::from([used])).await;
+    let refs = git(
+        &repo.0,
+        &["for-each-ref", "--format=%(refname)", "refs/blongo/"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refs.lines().collect::<Vec<_>>(),
+        vec![
+            "refs/blongo/checkpoints/t/r1",
+            "refs/blongo/pre-rollback/t/r2"
+        ]
+    );
+}

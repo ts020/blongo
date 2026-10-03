@@ -33,6 +33,7 @@
 //!
 //! **Worktrees**: `git worktree add -b <branch> <path> HEAD`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,7 +126,22 @@ pub async fn capture_checkpoint(cwd: &Path, ref_name: &str) -> anyhow::Result<St
         let head = head(cwd).await;
         // The user's index as it is (fails while it has conflicts: then
         // there is no clean tree to save and restore re-syncs with HEAD).
-        let saved_index = match git(cwd, &["write-tree"]).await {
+        // Read from a copy: `write-tree` on the real index would take
+        // index.lock and rewrite it.
+        let real_index = git(cwd, &["rev-parse", "--git-path", "index"]).await?;
+        let real_index = cwd.join(real_index);
+        let user_index = index.with_extension("user-index");
+        if real_index.is_file() {
+            std::fs::copy(&real_index, &user_index)?;
+        }
+        let written = git_env(
+            cwd,
+            &["write-tree"],
+            &[("GIT_INDEX_FILE", user_index.as_path())],
+        )
+        .await;
+        let _ = std::fs::remove_file(&user_index);
+        let saved_index = match written {
             Ok(tree) => {
                 let mut args = vec!["commit-tree", tree.as_str()];
                 if let Some(head) = &head {
@@ -300,24 +316,30 @@ pub async fn delete_refs(cwd: &Path, refs: &[String]) {
     }
 }
 
-/// Delete every checkpoint and pre-rollback ref of a thread (best effort).
-pub async fn delete_thread_refs(cwd: &Path, thread: &str) {
-    for prefix in [CHECKPOINT_REF_PREFIX, PRE_ROLLBACK_REF_PREFIX] {
-        let Ok(list) = git(
-            cwd,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                &format!("{prefix}/{thread}/"),
-            ],
-        )
-        .await
-        else {
-            continue;
-        };
-        let refs: Vec<String> = list.lines().map(str::to_owned).collect();
-        delete_refs(cwd, &refs).await;
-    }
+/// Delete a thread's checkpoint refs (best effort), except those pointing
+/// at a commit in `keep` (still used by a fork's copied runs).
+/// Pre-rollback refs are never deleted here: they hold files a rollback
+/// replaced, which only the user may discard.
+pub async fn delete_thread_refs(cwd: &Path, thread: &str, keep: &HashSet<String>) {
+    let Ok(list) = git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            &format!("{CHECKPOINT_REF_PREFIX}/{thread}/"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let refs: Vec<String> = list
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(commit, _)| !keep.contains(*commit))
+        .map(|(_, name)| name.to_owned())
+        .collect();
+    delete_refs(cwd, &refs).await;
 }
 
 /// Create a worktree for `branch` at `path` from the repository at `repo`'s
@@ -350,9 +372,24 @@ pub async fn remove_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove a worktree only when it has no uncommitted changes or untracked
-/// files (git refuses otherwise); its branch stays either way.
-pub async fn remove_clean_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
+/// Remove a worktree only when nothing in it would be lost: no
+/// uncommitted change, no untracked file and no ignored file (`git worktree
+/// remove` alone deletes ignored files such as `.env`). Returns why it was
+/// kept otherwise; its branch stays either way.
+pub async fn remove_pristine_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
+    let status = git(path, &["status", "--porcelain", "--ignored"]).await?;
+    if !status.is_empty() {
+        let first = status.lines().next().unwrap_or_default();
+        bail!(
+            "it has uncommitted, untracked or ignored files ({} entr{}, e.g. `{first}`)",
+            status.lines().count(),
+            if status.lines().count() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+    }
     git(repo, &["worktree", "remove", &path.to_string_lossy()]).await?;
     Ok(())
 }
