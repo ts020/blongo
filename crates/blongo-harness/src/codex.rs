@@ -10,6 +10,13 @@
 //! `item/commandExecution/requestApproval` and
 //! `item/fileChange/requestApproval`; interrupt is `turn/interrupt`.
 //!
+//! Continuing: `thread/resume` (with `excludeTurns`), native fork
+//! `thread/fork {threadId, lastTurnId}`, native rewind `thread/revert
+//! {threadId, beforeTurnId}` right after resuming; steering is
+//! `turn/steer {threadId, expectedTurnId, input}`; plans arrive as
+//! `turn/plan/updated`; models come from `model/list`. Method and field
+//! names match t3code's recordings of codex-cli 0.156.1.
+//!
 //! The npm `codex` command is a Node shim that spawns the native binary
 //! (≈48 MB of extra RSS for an idle `node`). [`native_executable`] finds the
 //! vendored native binary next to the shim so Blongo can skip Node.
@@ -19,7 +26,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use blongo_protocol::{AgentEvent, TurnStatus};
+use blongo_protocol::{AgentEvent, ModelInfo, PlanStatus, PlanStep, TurnStatus};
 use serde_json::{Value, json};
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
@@ -46,6 +53,13 @@ pub struct CodexOptions {
     /// new one. Falls back to `thread/start` when Codex cannot resume it;
     /// `SessionStarted` then carries a different id.
     pub resume_thread_id: Option<String>,
+    /// Branch this Codex thread (keeping turns up to the given turn id)
+    /// instead of starting a new one.
+    pub fork: Option<(String, Option<String>)>,
+    /// After resuming, drop this turn and everything after it.
+    pub revert_before_turn: Option<String>,
+    /// Ask `model/list` for the models to offer.
+    pub list_models: bool,
 }
 
 impl Default for CodexOptions {
@@ -56,6 +70,9 @@ impl Default for CodexOptions {
             prefer_native: true,
             kill_grace: Duration::from_secs(3),
             resume_thread_id: None,
+            fork: None,
+            revert_before_turn: None,
+            list_models: true,
         }
     }
 }
@@ -134,6 +151,8 @@ pub(crate) fn initialize_params() -> Value {
 enum Pending {
     TurnStart,
     Interrupt,
+    Steer,
+    Revert,
 }
 
 /// Turn/notification state machine (no I/O except through `RpcOut`).
@@ -144,6 +163,8 @@ pub(crate) struct Driver {
     turn_id: Option<String>,
     interrupt_requested: bool,
     queued_prompts: VecDeque<String>,
+    /// Steers sent before the turn id was known.
+    pending_steers: Vec<String>,
     /// JSON-RPC ids of approval requests awaiting the user, by event id.
     approvals: HashMap<String, Value>,
     /// agentMessage items that streamed deltas (completed-item fallback).
@@ -162,6 +183,7 @@ impl Driver {
             turn_id: None,
             interrupt_requested: false,
             queued_prompts: VecDeque::new(),
+            pending_steers: Vec::new(),
             approvals: HashMap::new(),
             streamed: HashSet::new(),
             options,
@@ -177,6 +199,25 @@ impl Driver {
                     self.queued_prompts.push_back(text);
                 } else {
                     self.start_turn(rpc, &text);
+                }
+            }
+            Command::Rewind { before_turn } => {
+                // The core only rewinds an idle thread.
+                if !self.turn_active {
+                    let id = rpc.request(
+                        "thread/revert",
+                        json!({ "threadId": self.thread_id, "beforeTurnId": before_turn }),
+                    );
+                    self.pending.insert(id, Pending::Revert);
+                }
+            }
+            Command::Steer(text) => {
+                if !self.turn_active {
+                    self.start_turn(rpc, &text);
+                } else if self.turn_id.is_some() {
+                    self.send_steer(rpc, &text);
+                } else {
+                    self.pending_steers.push(text);
                 }
             }
             Command::Approve {
@@ -224,6 +265,21 @@ impl Driver {
         self.interrupt_requested = false;
     }
 
+    fn send_steer(&mut self, rpc: &mut RpcOut, text: &str) {
+        let Some(turn_id) = &self.turn_id else {
+            return;
+        };
+        let id = rpc.request(
+            "turn/steer",
+            json!({
+                "threadId": self.thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{ "type": "text", "text": text }],
+            }),
+        );
+        self.pending.insert(id, Pending::Steer);
+    }
+
     fn send_interrupt(&mut self, rpc: &mut RpcOut) {
         // Without a turn id yet, `turn/started` (or the turn/start response)
         // sends it once the id is known.
@@ -236,13 +292,20 @@ impl Driver {
         }
     }
 
-    fn note_turn_id(&mut self, rpc: &mut RpcOut, turn_id: Option<&str>) {
+    fn note_turn_id(&mut self, rpc: &mut RpcOut, turn_id: Option<&str>, out: &mut Vec<AgentEvent>) {
         if self.turn_id.is_none()
             && let Some(turn_id) = turn_id.filter(|t| !t.is_empty())
         {
             self.turn_id = Some(turn_id.to_owned());
+            out.push(AgentEvent::ProviderTurnId {
+                id: turn_id.to_owned(),
+            });
             if self.interrupt_requested {
                 self.send_interrupt(rpc);
+            } else {
+                for text in std::mem::take(&mut self.pending_steers) {
+                    self.send_steer(rpc, &text);
+                }
             }
         }
     }
@@ -259,6 +322,10 @@ impl Driver {
         self.interrupt_requested = false;
         self.streamed.clear();
         self.approvals.clear();
+        // A steer that never reached the turn becomes the next one.
+        for text in std::mem::take(&mut self.pending_steers) {
+            self.queued_prompts.push_back(text);
+        }
         if let Some(next) = self.queued_prompts.pop_front() {
             self.start_turn(rpc, &next);
         }
@@ -268,8 +335,17 @@ impl Driver {
         match msg {
             Incoming::Response { id, result } => match (self.pending.remove(&id), result) {
                 (Some(Pending::TurnStart), Ok(result)) => {
-                    self.note_turn_id(rpc, result.pointer("/turn/id").and_then(Value::as_str));
+                    self.note_turn_id(rpc, result.pointer("/turn/id").and_then(Value::as_str), out);
                 }
+                (Some(Pending::Steer), Err(e)) => out.push(AgentEvent::Error {
+                    message: format!("turn/steer: {e}"),
+                }),
+                (Some(Pending::Revert), Err(e)) => out.push(AgentEvent::Error {
+                    message: format!(
+                        "Codex could not roll back its conversation ({e}); it may still \
+                         remember the rolled-back turns."
+                    ),
+                }),
                 (Some(Pending::TurnStart), Err(e)) => {
                     out.push(AgentEvent::Error {
                         message: format!("turn/start: {e}"),
@@ -311,7 +387,26 @@ impl Driver {
         }
         match method {
             "turn/started" => {
-                self.note_turn_id(rpc, params.pointer("/turn/id").and_then(Value::as_str));
+                self.note_turn_id(rpc, params.pointer("/turn/id").and_then(Value::as_str), out);
+            }
+            "turn/plan/updated" => {
+                let steps = params
+                    .get("plan")
+                    .and_then(Value::as_array)
+                    .map(|plan| {
+                        plan.iter()
+                            .filter_map(|step| {
+                                Some(PlanStep {
+                                    text: step.get("step").and_then(Value::as_str)?.to_owned(),
+                                    status: PlanStatus::parse(
+                                        step.get("status").and_then(Value::as_str).unwrap_or(""),
+                                    ),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(AgentEvent::Plan { steps });
             }
             "item/agentMessage/delta" => {
                 if let Some(item) = params.get("itemId").and_then(Value::as_str)
@@ -534,13 +629,43 @@ async fn setup(
             })
             .await;
     }
+    if options.list_models
+        && let Some(models) = list_models(peer).await
+    {
+        let _ = events.send(AgentEvent::Models { models }).await;
+    }
     let mut params = json!({
         "cwd": config.cwd.to_string_lossy(),
         "approvalPolicy": options.approval_policy,
         "sandbox": options.sandbox,
+        "config": { "tools.update_plan.enabled": true },
     });
     if let Some(model) = &config.model {
         params["model"] = json!(model);
+    }
+    if let Some((source, last_turn)) = &options.fork {
+        let mut fork_params = params.clone();
+        fork_params["threadId"] = json!(source);
+        if let Some(turn) = last_turn {
+            fork_params["lastTurnId"] = json!(turn);
+        }
+        match peer.call("thread/fork", fork_params, SETUP_TIMEOUT).await {
+            Ok(thread) => {
+                if let Some(id) = thread.pointer("/thread/id").and_then(Value::as_str) {
+                    return Ok(id.to_owned());
+                }
+            }
+            Err(e) => {
+                let _ = events
+                    .send(AgentEvent::Error {
+                        message: format!(
+                            "Codex could not fork the conversation ({e}); this thread \
+                             continues in a new Codex thread without its context."
+                        ),
+                    })
+                    .await;
+            }
+        }
     }
     if let Some(resume) = &options.resume_thread_id {
         let mut resume_params = params.clone();
@@ -555,6 +680,24 @@ async fn setup(
             .await
             && let Some(id) = thread.pointer("/thread/id").and_then(Value::as_str)
         {
+            if let Some(before) = &options.revert_before_turn
+                && let Err(e) = peer
+                    .call(
+                        "thread/revert",
+                        json!({ "threadId": id, "beforeTurnId": before }),
+                        SETUP_TIMEOUT,
+                    )
+                    .await
+            {
+                let _ = events
+                    .send(AgentEvent::Error {
+                        message: format!(
+                            "Codex could not roll back its conversation ({e}); it may \
+                             still remember the rolled-back turns."
+                        ),
+                    })
+                    .await;
+            }
             return Ok(id.to_owned());
         }
     }
@@ -567,6 +710,51 @@ async fn setup(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "thread/start returned no thread id".to_owned())
+}
+
+/// `model/list` (a few pages at most); `None` when unsupported.
+async fn list_models(peer: &mut RpcPeer<ChildStdout>) -> Option<Vec<ModelInfo>> {
+    let mut models = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..5 {
+        let mut params = json!({ "limit": 50, "includeHidden": false });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = peer.call("model/list", params, SETUP_TIMEOUT).await.ok()?;
+        for item in page
+            .get("data")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            if item.get("hidden").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            let Some(id) = item
+                .get("model")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let label = item
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(id);
+            models.push(ModelInfo {
+                id: id.to_owned(),
+                label: label.to_owned(),
+            });
+        }
+        match page.get("nextCursor").and_then(Value::as_str) {
+            Some(next) if !next.is_empty() => cursor = Some(next.to_owned()),
+            _ => break,
+        }
+    }
+    (!models.is_empty()).then_some(models)
 }
 
 async fn drive(
@@ -762,6 +950,7 @@ mod tests {
         assert_eq!(
             out,
             vec![
+                AgentEvent::ProviderTurnId { id: "tu1".into() },
                 AgentEvent::TextDelta { text: "Hel".into() },
                 AgentEvent::ToolCall {
                     call_id: "c1".into(),

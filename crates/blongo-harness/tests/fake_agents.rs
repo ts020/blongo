@@ -125,8 +125,9 @@ async fn codex_tool_approval_and_interrupt() {
     session.prompt("list files").unwrap();
     let events = run_turn(&mut session, ApprovalDecision::AllowForSession).await;
     assert!(matches!(events[0], AgentEvent::AuthRequired { .. }));
+    assert!(matches!(&events[1], AgentEvent::Models { models } if models.len() == 2));
     assert_eq!(
-        events[1],
+        events[2],
         AgentEvent::SessionStarted {
             provider_session_id: "thread-fake-1".into()
         }
@@ -174,8 +175,9 @@ async fn antigravity_tool_permission_and_cancel() {
         .unwrap();
     session.prompt("list files").unwrap();
     let events = run_turn(&mut session, ApprovalDecision::AllowForSession).await;
+    assert!(matches!(&events[0], AgentEvent::Models { models } if models.len() == 2));
     assert_eq!(
-        events[0],
+        events[1],
         AgentEvent::SessionStarted {
             provider_session_id: "sess-fake-1".into()
         }
@@ -249,4 +251,71 @@ async fn crash_mid_turn_reports_failure() {
         }
     }
     assert!(saw_error);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_resume_loads_without_replaying_history() {
+    let agent = acp::AcpAgent {
+        resume_session: Some("sess-earlier".into()),
+        extra_paths: Vec::new(),
+        ..acp::antigravity()
+    };
+    let mut config = config("fake_acp.py");
+    config.model = Some("fake-model-b".into());
+    let mut session = acp::start(config, agent).await.unwrap();
+    session.prompt("model?").unwrap();
+    let events = run_turn(&mut session, ApprovalDecision::Allow).await;
+    assert!(events.contains(&AgentEvent::SessionStarted {
+        provider_session_id: "sess-earlier".into()
+    }));
+    // The history chunk `session/load` replays is not a new message, and
+    // the configured model was selected on the loaded session.
+    assert_eq!(text(&events), "model=fake-model-b");
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_login_waits_for_the_browser() {
+    let dir = std::env::temp_dir().join(format!("blongo-login-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let done = dir.join("done");
+    let _ = std::fs::remove_file(&done);
+    let (url_tx, mut url_rx) = tokio::sync::mpsc::channel(4);
+    let config = config("fake_acp.py")
+        .env("FAKE_ACP_SIGNED_OUT", "1")
+        .env("FAKE_ACP_LOGIN_FILE", &done);
+    let login = tokio::spawn(acp::login(
+        config,
+        acp::antigravity(),
+        url_tx,
+        Duration::from_secs(20),
+    ));
+    let url = tokio::time::timeout(Duration::from_secs(20), url_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(url.starts_with("https://accounts.google.com/"), "{url}");
+    assert!(!login.is_finished(), "login must wait for the browser");
+    // The user finishes signing in.
+    std::fs::write(&done, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), login)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_login_times_out() {
+    let (url_tx, _url_rx) = tokio::sync::mpsc::channel(4);
+    let err = acp::login(
+        config("fake_acp.py").env("FAKE_ACP_SIGNED_OUT", "1"),
+        acp::antigravity(),
+        url_tx,
+        Duration::from_millis(500),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
 }

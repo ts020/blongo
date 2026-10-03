@@ -199,6 +199,12 @@ impl<R: tokio::io::AsyncRead + Unpin> RpcPeer<R> {
         }
     }
 
+    /// Drop buffered notifications (e.g. history replayed by `session/load`).
+    pub fn drop_backlog_notifications(&mut self) {
+        self.backlog
+            .retain(|m| !matches!(m, Incoming::Notification { .. }));
+    }
+
     /// Next message: backlog first, then stdout. `Ok(None)` at EOF.
     pub async fn next(&mut self) -> std::io::Result<Option<Incoming>> {
         if let Some(msg) = self.backlog.pop_front() {

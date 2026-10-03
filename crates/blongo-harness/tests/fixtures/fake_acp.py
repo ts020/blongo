@@ -10,16 +10,31 @@ Antigravity quirks the harness must handle:
 - tool payloads spell the command `CommandLine` and the output
   `combinedOutput`, plus a duplicated `formattedOutput` and a huge field.
 
-Prompt "loop" streams chunks until `session/cancel`; others run a
-permission round trip.
+Prompt "loop" streams chunks until `session/cancel`; "markdown" answers
+with markdown and a fenced code block; "plan" sends plan updates; "model?"
+names the selected model; a prompt containing "echo:" is answered with the
+prompt; "slow" streams ticks and ends by itself; others run a permission round
+trip.
+
+Phase 2 additions:
+- `session/new` offers two models; `session/set_model` switches;
+- `session/load` (loadSession) replays a history chunk before answering,
+  which the client must drop;
+- FAKE_ACP_LOGIN_FILE with FAKE_ACP_SIGNED_OUT=1: `authenticate` prints the
+  URL, then answers once that file exists (the browser sign-in finished).
 """
 import json
 import os
 import queue
 import sys
 import threading
+import time
 
 SESSION = "sess-fake-1"
+MODELS = {"currentModelId": "fake-model-a", "availableModels": [
+    {"modelId": "fake-model-a", "name": "Fake Model A"},
+    {"modelId": "fake-model-b", "name": "Fake Model B"}]}
+current_model = "fake-model-a"
 inbox = queue.Queue()
 
 
@@ -92,11 +107,11 @@ def tool_turn(prompt_req):
     send({"id": prompt_req["id"], "result": {"stopReason": "end_turn"}})
 
 
-def loop_turn(prompt_req):
+def loop_turn(prompt_req, limit=None, delay=0.02):
     n = 0
     while True:
         try:
-            msg = inbox.get(timeout=0.02)
+            msg = inbox.get(timeout=delay)
         except queue.Empty:
             msg = {}
         if msg is None:
@@ -105,11 +120,44 @@ def loop_turn(prompt_req):
             assert msg["params"] == {"sessionId": SESSION}, msg
             send({"id": prompt_req["id"], "result": {"stopReason": "cancelled"}})
             return
+        if limit is not None and n >= limit:
+            send({"id": prompt_req["id"], "result": {"stopReason": "end_turn"}})
+            return
         n += 1
         chunk("agent_message_chunk", f"tick {n} ")
 
 
+MARKDOWN = """Here is **bold**, `inline`, and a list:
+
+- one
+- two
+
+```rust
+fn main() {
+    let answer = 42; // comment
+    println!("{answer}");
+}
+```
+"""
+
+
+def simple_turn(prompt_req, text):
+    chunk("agent_message_chunk", text)
+    send({"id": prompt_req["id"], "result": {"stopReason": "end_turn"}})
+
+
+def plan_turn(prompt_req):
+    entries = [{"content": "Read the code", "priority": "high", "status": "in_progress"},
+               {"content": "Write the fix", "priority": "high", "status": "pending"}]
+    update({"sessionUpdate": "plan", "entries": entries})
+    for e in entries:
+        e["status"] = "completed"
+    update({"sessionUpdate": "plan", "entries": entries})
+    simple_turn(prompt_req, "plan done")
+
+
 def main():
+    global SESSION, current_model
     threading.Thread(target=reader, daemon=True).start()
     print("agy_acp_server starting (non-JSON noise)", flush=True)
     while True:
@@ -128,14 +176,36 @@ def main():
             if os.environ.get("FAKE_ACP_SIGNED_OUT") == "1":
                 print("Open the following link to authenticate the ACP server: "
                       "https://accounts.google.com/o/oauth2/v2/auth?client_id=fake&state=s", flush=True)
-                continue  # waits for the browser forever
+                done = os.environ.get("FAKE_ACP_LOGIN_FILE")
+                if not done:
+                    continue  # waits for the browser forever
+                while not os.path.exists(done):
+                    time.sleep(0.02)
             send({"id": msg["id"], "result": {}})
         elif method == "session/new":
-            send({"id": msg["id"], "result": {"sessionId": SESSION}})
+            send({"id": msg["id"], "result": {"sessionId": SESSION, "models": MODELS}})
+        elif method == "session/load":
+            SESSION = msg["params"]["sessionId"]
+            # History replay: the client already has it.
+            chunk("agent_message_chunk", "REPLAYED HISTORY")
+            send({"id": msg["id"], "result": {"models": dict(MODELS, currentModelId=current_model)}})
+        elif method == "session/set_model":
+            current_model = msg["params"]["modelId"]
+            send({"id": msg["id"], "result": {}})
         elif method == "session/prompt":
             text = msg["params"]["prompt"][0]["text"]
             if text == "loop":
                 loop_turn(msg)
+            elif text == "markdown":
+                simple_turn(msg, MARKDOWN)
+            elif text == "plan":
+                plan_turn(msg)
+            elif text == "model?":
+                simple_turn(msg, f"model={current_model}")
+            elif "echo:" in text:
+                simple_turn(msg, text)
+            elif text == "slow":
+                loop_turn(msg, limit=60, delay=0.05)
             else:
                 tool_turn(msg)
         elif "id" in msg and method:

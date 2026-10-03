@@ -26,10 +26,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub mod acp;
+pub mod antigravity_install;
 pub mod claude;
 pub mod codex;
 pub(crate) mod jsonrpc;
 pub mod process;
+pub mod provider;
+
+pub use provider::{StartOptions, start};
 
 /// Capacity of the per-session event channel. Small on purpose: deltas are
 /// tiny and a full channel just pauses reading the child's stdout.
@@ -86,11 +90,18 @@ pub enum ApprovalDecision {
 #[derive(Debug)]
 pub(crate) enum Command {
     Prompt(String),
+    /// Add input to the running turn (see `SteerMode`); a prompt when idle.
+    Steer(String),
     Approve {
         request_id: String,
         decision: ApprovalDecision,
     },
     Interrupt,
+    /// Drop the provider's turn `before_turn` and everything after it
+    /// (only for providers with `live_rollback`; others ignore it).
+    Rewind {
+        before_turn: String,
+    },
 }
 
 /// A live agent session. Dropping it closes the command channel, which makes
@@ -122,6 +133,21 @@ impl Session {
     /// next turn (Claude folds it into the running turn itself).
     pub fn prompt(&self, text: impl Into<String>) -> anyhow::Result<()> {
         self.send(Command::Prompt(text.into()))
+    }
+
+    /// Add input to the running turn (the provider's steering). When no turn
+    /// runs it is an ordinary prompt. The turn still ends with one
+    /// `TurnCompleted`.
+    pub fn steer(&self, text: impl Into<String>) -> anyhow::Result<()> {
+        self.send(Command::Steer(text.into()))
+    }
+
+    /// Roll the provider conversation back to before `before_turn` (a
+    /// provider turn id). Only meaningful with `live_rollback`.
+    pub fn rewind(&self, before_turn: impl Into<String>) -> anyhow::Result<()> {
+        self.send(Command::Rewind {
+            before_turn: before_turn.into(),
+        })
     }
 
     /// Answer an approval request by the id from `ApprovalRequest`.

@@ -26,13 +26,30 @@ Env:
   CODEX_REPLAY_LOG         where to append the comparison log (optional)
   CODEX_REPLAY_STATE       counter file: the n-th launch plays the n-th
                            process segment (for restart/resume fixtures)
+  CODEX_REPLAY_SPLIT_AT    label of an expected frame where Blongo starts a
+                           new process although t3code kept one (a native
+                           fork runs in the fork thread's own process); the
+                           segment is split there and the second launch's
+                           handshake gets the recorded `initialize` answer
 """
 import json
 import os
 import sys
 
 # Requests t3code sends that Blongo deliberately does not.
-T3CODE_ONLY = {"thread/backgroundTerminals/terminate"}
+# (thread/read and thread/turns/list look up the turn to revert to; Blongo
+# keeps provider turn ids on its runs.)
+T3CODE_ONLY = {"thread/backgroundTerminals/terminate", "thread/read", "thread/turns/list"}
+
+# Canned `model/list` page for Blongo's model discovery.
+MODEL_LIST = {"data": [
+    {"id": "recorded-model", "model": "recorded-model", "displayName": "Recorded Model",
+     "hidden": False, "isDefault": True},
+    {"id": "hidden-model", "model": "hidden-model", "displayName": "Hidden",
+     "hidden": True, "isDefault": False},
+], "nextCursor": None}
+
+INIT_RESULT = None
 
 log_path = os.environ.get("CODEX_REPLAY_LOG")
 
@@ -49,6 +66,8 @@ def send(frame):
 
 
 def segments(path):
+    global INIT_RESULT
+    split_at = os.environ.get("CODEX_REPLAY_SPLIT_AT")
     segs, cur = [], []
     with open(path) as f:
         for line in f:
@@ -60,6 +79,13 @@ def segments(path):
                 segs.append(cur)
                 cur = []
             elif entry["type"] in ("expect_outbound", "emit_inbound"):
+                frame = entry["frame"]
+                if (INIT_RESULT is None and entry["type"] == "emit_inbound"
+                        and "result" in frame and frame.get("id") == 1):
+                    INIT_RESULT = frame["result"]
+                if split_at and entry["type"] == "expect_outbound" and entry["label"] == split_at:
+                    segs.append(cur)
+                    cur = []
                 cur.append(entry)
     if cur:
         segs.append(cur)
@@ -104,7 +130,11 @@ def matches(expected, actual):
 def answer_unexpected(frame):
     if not is_request(frame):
         return
-    if frame["method"] == "account/read":
+    if frame["method"] == "initialize" and INIT_RESULT is not None:
+        send({"id": frame["id"], "result": INIT_RESULT})
+    elif frame["method"] == "model/list":
+        send({"id": frame["id"], "result": MODEL_LIST})
+    elif frame["method"] == "account/read":
         send({"id": frame["id"], "result": {"account": {"type": "chatgpt"},
                                             "requiresOpenaiAuth": True}})
     else:

@@ -11,6 +11,14 @@ zeron-format journal named by FAKE_CODEX_REPLAY (reasoningDelta / textDelta
 lines) every FAKE_CODEX_DELAY_MS (default 40); any other prompt runs a
 command-execution approval round trip. FAKE_CODEX_SIGNED_OUT=1 makes
 `account/read` report no account.
+
+Phase 2: "slow" streams ticks for a while and ends by itself; "loop" and
+"slow" answer `turn/steer` by streaming "steered: <text>" and completing;
+"plan" sends two `turn/plan/updated`; "write <file> <text>" writes a file in
+the working directory (checkpoint tests); a prompt containing "echo:" is
+answered with the whole prompt text. `model/list`, `thread/fork` and
+`thread/revert` are answered. FAKE_CODEX_LOG appends every client frame
+(JSON per line).
 """
 import json
 import os
@@ -24,10 +32,17 @@ inbox = queue.Queue()
 turn_seq = 0
 
 
+fork_seq = 0
+
+
 def reader():
+    log = os.environ.get("FAKE_CODEX_LOG")
     for line in sys.stdin:
         line = line.strip()
         if line:
+            if log:
+                with open(log, "a") as f:
+                    f.write(line + "\n")
             inbox.put(json.loads(line))
     inbox.put(None)
 
@@ -54,6 +69,7 @@ def complete(turn_id, status):
 
 
 def handle_setup(msg):
+    global THREAD, fork_seq
     method = msg.get("method")
     if method == "initialize":
         respond(msg, {"userAgent": "fake/0.160.0", "codexHome": "/tmp/fake",
@@ -66,12 +82,26 @@ def handle_setup(msg):
         respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
                       "model": "fake-model", "approvalPolicy": msg["params"].get("approvalPolicy")})
         notify("thread/started", {"thread": {"id": THREAD}})
+    elif method == "model/list":
+        respond(msg, {"data": [
+            {"id": "fake-model", "model": "fake-model", "displayName": "Fake Model",
+             "hidden": False, "isDefault": True},
+            {"id": "fake-model-b", "model": "fake-model-b", "displayName": "Fake Model B",
+             "hidden": False, "isDefault": False}], "nextCursor": None})
+    elif method == "thread/fork":
+        fork_seq += 1
+        THREAD = f"thread-fork-{fork_seq}"
+        respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
+                      "model": "fake-model"})
+    elif method == "thread/revert":
+        respond(msg, {"thread": {"id": msg["params"]["threadId"]}})
     elif method == "thread/resume":
         if msg["params"].get("excludeTurns") is not True:
             # Real Codex would hydrate the whole history into one line.
             send({"id": msg["id"], "error": {"code": -32602,
                                              "message": "fake: resume without excludeTurns"}})
-        elif msg["params"].get("threadId") == THREAD:
+        elif msg["params"].get("threadId", "").startswith("thread-"):
+            THREAD = msg["params"]["threadId"]
             respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
                           "model": "fake-model"})
         else:
@@ -132,11 +162,11 @@ def tool_turn(turn_id):
     complete(turn_id, "completed")
 
 
-def loop_turn(turn_id):
+def loop_turn(turn_id, limit=None, delay=0.02):
     n = 0
     while True:
         try:
-            msg = inbox.get(timeout=0.02)
+            msg = inbox.get(timeout=delay)
         except queue.Empty:
             msg = {}
         if msg is None:
@@ -145,6 +175,17 @@ def loop_turn(turn_id):
             assert msg["params"] == {"threadId": THREAD, "turnId": turn_id}, msg
             respond(msg, {})
             complete(turn_id, "interrupted")
+            return
+        if msg.get("method") == "turn/steer":
+            assert msg["params"]["expectedTurnId"] == turn_id, msg
+            respond(msg, {"turnId": turn_id})
+            text = msg["params"]["input"][0]["text"]
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m2", "delta": f"steered: {text}"})
+            complete(turn_id, "completed")
+            return
+        if limit is not None and n >= limit:
+            complete(turn_id, "completed")
             return
         n += 1
         notify("item/agentMessage/delta",
@@ -246,7 +287,29 @@ def main():
         respond(msg, {"turn": turn_obj(turn_id, "inProgress")})
         notify("turn/started", {"threadId": THREAD, "turn": turn_obj(turn_id, "inProgress")})
         text = msg["params"]["input"][0]["text"]
-        if text == "loop":
+        if "echo:" in text:
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": text})
+            complete(turn_id, "completed")
+        elif text == "slow":
+            loop_turn(turn_id, limit=60, delay=0.05)
+        elif text == "plan":
+            plan = [{"step": "Read the code", "status": "inProgress"},
+                    {"step": "Write the fix", "status": "pending"}]
+            notify("turn/plan/updated", {"threadId": THREAD, "turnId": turn_id, "plan": plan})
+            plan = [dict(p, status="completed") for p in plan]
+            notify("turn/plan/updated", {"threadId": THREAD, "turnId": turn_id, "plan": plan})
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "planned"})
+            complete(turn_id, "completed")
+        elif text.startswith("write "):
+            _, name, body = text.split(" ", 2)
+            with open(name, "w") as f:
+                f.write(body)
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": f"wrote {name}"})
+            complete(turn_id, "completed")
+        elif text == "loop":
             loop_turn(turn_id)
         elif text.startswith("markdown"):
             markdown_turn(turn_id)

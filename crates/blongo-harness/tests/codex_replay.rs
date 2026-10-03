@@ -4,15 +4,30 @@
 //! the harness under test drives it like a real Codex. The tests check the
 //! normalized events and that the frames Blongo sends carry what the real
 //! server needed (thread/turn ids, input text, approval decision,
-//! `excludeTurns` on resume).
+//! `excludeTurns` on resume, `expectedTurnId` on steer, `lastTurnId` on
+//! fork, `beforeTurnId` on revert).
+//!
+//! Frames Blongo sends that t3code did not (`account/read`, `model/list`)
+//! get canned answers from the replay and are checked by
+//! [`BLONGO_ONLY`].
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use blongo_harness::codex::{self, CodexOptions};
 use blongo_harness::{ApprovalDecision, Session, SessionConfig};
-use blongo_protocol::{AgentEvent, TurnStatus};
+use blongo_protocol::{AgentEvent, PlanStatus, TurnStatus};
 use serde_json::Value;
+
+/// Setup requests Blongo adds per process: its sign-in check and model
+/// discovery.
+const BLONGO_ONLY: [&str; 2] = ["account/read", "model/list"];
+
+fn blongo_only(processes: usize) -> Vec<String> {
+    (0..processes)
+        .flat_map(|_| BLONGO_ONLY.map(str::to_owned))
+        .collect()
+}
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -23,6 +38,7 @@ struct Replay {
     transcript: PathBuf,
     log: PathBuf,
     state: PathBuf,
+    split: Option<String>,
 }
 
 impl Replay {
@@ -40,11 +56,22 @@ impl Replay {
             transcript: fixtures().join(format!("t3code/{scenario}.ndjson")),
             log: dir.join("log.ndjson"),
             state: dir.join("state"),
+            split: None,
         }
     }
 
+    fn split_at(mut self, label: &str) -> Self {
+        self.split = Some(label.to_owned());
+        self
+    }
+
     fn config(&self) -> SessionConfig {
-        SessionConfig::new(std::env::temp_dir())
+        let config = SessionConfig::new(std::env::temp_dir());
+        let config = match &self.split {
+            Some(label) => config.env("CODEX_REPLAY_SPLIT_AT", label),
+            None => config,
+        };
+        config
             .executable(fixtures().join("replay_codex.py"))
             .env("CODEX_REPLAY_TRANSCRIPT", &self.transcript)
             .env("CODEX_REPLAY_LOG", &self.log)
@@ -56,6 +83,10 @@ impl Replay {
             resume_thread_id: resume.map(str::to_owned),
             ..CodexOptions::default()
         };
+        codex::start_with(self.config(), options).await.unwrap()
+    }
+
+    async fn start_with(&self, options: CodexOptions) -> Session {
         codex::start_with(self.config(), options).await.unwrap()
     }
 
@@ -90,10 +121,15 @@ impl Replay {
 
     /// The recorded prompt of the n-th turn/start.
     fn prompt(&self, n: usize) -> String {
+        self.recorded_text(|label| label.starts_with("turn/start"), n)
+    }
+
+    /// The input text of the n-th expected frame whose label passes.
+    fn recorded_text(&self, label: impl Fn(&str) -> bool, n: usize) -> String {
         let text = std::fs::read_to_string(&self.transcript).unwrap();
         text.lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .filter(|e| e["type"] == "expect_outbound" && e["label"] == "turn/start")
+            .filter(|e| e["type"] == "expect_outbound" && label(e["label"].as_str().unwrap_or("")))
             .nth(n)
             .and_then(|e| {
                 e.pointer("/frame/params/input/0/text")?
@@ -145,18 +181,41 @@ fn status(events: &[AgentEvent]) -> TurnStatus {
     }
 }
 
+/// Skips setup events (`Models`) up to `SessionStarted`.
 async fn session_started(session: &mut Session) -> String {
-    match next(session).await {
-        AgentEvent::SessionStarted {
-            provider_session_id,
-        } => provider_session_id,
-        other => panic!("expected SessionStarted, got {other:?}"),
+    loop {
+        match next(session).await {
+            AgentEvent::SessionStarted {
+                provider_session_id,
+            } => return provider_session_id,
+            AgentEvent::Models { models } => {
+                // The replay's canned page: hidden models are dropped.
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0].id, "recorded-model");
+                assert_eq!(models[0].label, "Recorded Model");
+            }
+            other => panic!("expected SessionStarted, got {other:?}"),
+        }
     }
+}
+
+fn provider_turn_ids(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProviderTurnId { id } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The recorded thread id; turn/start must address it and carry the prompt.
 fn check_turn_start(replay: &Replay, n: usize, thread: &str) {
-    let (expected, actual) = replay.pairs("turn/start").swap_remove(n);
+    check_turn_start_labeled(replay, "turn/start", n, thread);
+}
+
+fn check_turn_start_labeled(replay: &Replay, label: &str, n: usize, thread: &str) {
+    let (expected, actual) = replay.pairs(label).swap_remove(n);
     assert_eq!(actual["params"]["threadId"], expected["params"]["threadId"]);
     assert_eq!(actual["params"]["threadId"], thread);
     assert_eq!(
@@ -186,7 +245,7 @@ async fn simple_text_turn() {
     shutdown(session).await;
     assert!(replay.segment_ended(0), "{:#?}", replay.log());
     // Blongo's own sign-in check is the only frame the recording lacks.
-    assert_eq!(replay.unexpected_methods(), vec!["account/read"]);
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
 }
 
 #[tokio::test]
@@ -257,7 +316,7 @@ async fn approval_round_trip_on_request() {
     );
     shutdown(session).await;
     assert!(replay.segment_ended(0));
-    assert_eq!(replay.unexpected_methods(), vec!["account/read"]);
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
 }
 
 /// Interrupt right after the prompt: the harness holds `turn/interrupt`
@@ -285,7 +344,7 @@ async fn turn_interrupt() {
     let (replay, events, _) = interrupted_turn("turn_interrupt").await;
     assert_eq!(status(&events), TurnStatus::Interrupted);
     assert_eq!(text(&events), "");
-    assert_eq!(replay.unexpected_methods(), vec!["account/read"]);
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
 }
 
 #[tokio::test]
@@ -310,7 +369,7 @@ async fn turn_interrupt_mid_tool() {
             .iter()
             .any(|e| e["skipped"] == "thread/backgroundTerminals/terminate")
     );
-    assert_eq!(replay.unexpected_methods(), vec!["account/read"]);
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
 }
 
 #[tokio::test]
@@ -343,8 +402,153 @@ async fn provider_thread_resume_after_restart() {
     check_turn_start(&replay, 1, &thread);
     shutdown(session).await;
     assert!(replay.segment_ended(1));
-    assert_eq!(
-        replay.unexpected_methods(),
-        vec!["account/read", "account/read"]
+    assert_eq!(replay.unexpected_methods(), blongo_only(2));
+}
+
+#[tokio::test]
+async fn message_steering_uses_turn_steer() {
+    let replay = Replay::new("message_steering");
+    let mut session = replay.start(None).await;
+    let thread = session_started(&mut session).await;
+    session.prompt(replay.prompt(0)).unwrap();
+    // Sent before the turn id is known: the harness holds it until then.
+    let steer = replay.recorded_text(|l| l == "turn/steer", 0);
+    session.steer(steer.clone()).unwrap();
+    let events = turn(&mut session, |_, _| {}).await;
+    assert_eq!(status(&events), TurnStatus::Completed);
+    assert!(
+        text(&events).ends_with("steering fixture observed"),
+        "{}",
+        text(&events)
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .count(),
+        1
+    );
+    check_turn_start(&replay, 0, &thread);
+    let (expected, actual) = replay.pairs("turn/steer").swap_remove(0);
+    assert_eq!(actual["params"]["threadId"], expected["params"]["threadId"]);
+    assert_eq!(
+        actual["params"]["expectedTurnId"],
+        expected["params"]["expectedTurnId"]
+    );
+    assert_eq!(
+        provider_turn_ids(&events),
+        vec![
+            expected["params"]["expectedTurnId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        ]
+    );
+    assert_eq!(actual["params"]["input"][0]["text"], steer.as_str());
+    shutdown(session).await;
+    assert!(replay.segment_ended(0), "{:#?}", replay.log());
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
+}
+
+#[tokio::test]
+async fn thread_rollback_reverts_live() {
+    let replay = Replay::new("thread_rollback");
+    let mut session = replay.start(None).await;
+    let thread = session_started(&mut session).await;
+    session.prompt(replay.prompt(0)).unwrap();
+    let first = turn(&mut session, |_, _| {}).await;
+    assert_eq!(text(&first), "rollback fixture first turn complete");
+    session.prompt(replay.prompt(1)).unwrap();
+    let second = turn(&mut session, |_, _| {}).await;
+    assert_eq!(text(&second), "rollback fixture second turn complete");
+    // Roll back the second turn by its provider turn id, then continue.
+    let second_turn = provider_turn_ids(&second).swap_remove(0);
+    session.rewind(second_turn.clone()).unwrap();
+    session.prompt(replay.prompt(2)).unwrap();
+    let third = turn(&mut session, |_, _| {}).await;
+    assert_eq!(status(&third), TurnStatus::Completed);
+    let (expected, actual) = replay.pairs("thread/revert").swap_remove(0);
+    assert_eq!(actual["params"], expected["params"]);
+    assert_eq!(actual["params"]["beforeTurnId"], second_turn.as_str());
+    check_turn_start(&replay, 2, &thread);
+    shutdown(session).await;
+    assert!(replay.segment_ended(0), "{:#?}", replay.log());
+    let skipped: Vec<_> = replay
+        .log()
+        .iter()
+        .filter_map(|e| e["skipped"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(skipped, vec!["thread/read", "thread/turns/list"]);
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
+}
+
+#[tokio::test]
+async fn thread_fork_native_in_its_own_process() {
+    // t3code forks inside one app-server; Blongo's fork thread starts its
+    // own process, so the replay splits the recording at `thread/fork`.
+    let replay = Replay::new("thread_fork_native").split_at("thread/fork");
+    let mut source = replay.start(None).await;
+    let source_thread = session_started(&mut source).await;
+    assert_eq!(source_thread, "native-source-thread");
+    source.prompt(replay.prompt(0)).unwrap();
+    let events = turn(&mut source, |_, _| {}).await;
+    assert_eq!(status(&events), TurnStatus::Completed);
+    let source_turn = provider_turn_ids(&events).swap_remove(0);
+    assert_eq!(source_turn, "native-source-turn");
+    check_turn_start_labeled(&replay, "turn/start/source", 0, &source_thread);
+    shutdown(source).await;
+    assert!(replay.segment_ended(0), "{:#?}", replay.log());
+
+    let mut fork = replay
+        .start_with(CodexOptions {
+            fork: Some((source_thread.clone(), Some(source_turn.clone()))),
+            ..CodexOptions::default()
+        })
+        .await;
+    let fork_thread = session_started(&mut fork).await;
+    assert_eq!(fork_thread, "native-fork-thread");
+    fork.prompt(replay.prompt(1)).unwrap();
+    let events = turn(&mut fork, |_, _| {}).await;
+    assert_eq!(status(&events), TurnStatus::Completed);
+    let (expected, actual) = replay.pairs("thread/fork").swap_remove(0);
+    assert_eq!(actual["params"]["threadId"], expected["params"]["threadId"]);
+    assert_eq!(
+        actual["params"]["lastTurnId"],
+        expected["params"]["lastTurnId"]
+    );
+    check_turn_start_labeled(&replay, "turn/start/fork", 0, &fork_thread);
+    shutdown(fork).await;
+    assert!(replay.segment_ended(1), "{:#?}", replay.log());
+    // The second process's handshake is Blongo's addition too.
+    let mut unexpected = blongo_only(1);
+    unexpected.extend(["initialize", "initialized"].map(str::to_owned));
+    unexpected.extend(blongo_only(1));
+    assert_eq!(replay.unexpected_methods(), unexpected);
+}
+
+#[tokio::test]
+async fn todo_list_becomes_plan_events() {
+    let replay = Replay::new("todo_list");
+    let mut session = replay.start(None).await;
+    let thread = session_started(&mut session).await;
+    session.prompt(replay.prompt(0)).unwrap();
+    let events = turn(&mut session, |_, _| {}).await;
+    assert_eq!(status(&events), TurnStatus::Completed);
+    let plans: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Plan { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0].len(), 3);
+    assert_eq!(plans[0][0].text, "Inspect package.json");
+    assert_eq!(plans[0][0].status, PlanStatus::InProgress);
+    assert_eq!(plans[0][1].status, PlanStatus::Pending);
+    assert!(plans[1].iter().all(|s| s.status == PlanStatus::Completed));
+    check_turn_start(&replay, 0, &thread);
+    shutdown(session).await;
+    assert!(replay.segment_ended(0), "{:#?}", replay.log());
+    assert_eq!(replay.unexpected_methods(), blongo_only(1));
 }

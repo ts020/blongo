@@ -22,13 +22,20 @@
 //!   updates are bounded/sanitized before they become events.
 //! - Native questions reuse `session/request_permission` with a
 //!   `toolCallId` starting `interaction_`.
+//!
+//! Phase 2: `session/load` resumes a session when the agent advertises
+//! `loadSession` (replayed history is dropped); steering has no native
+//! method, so it is `session/cancel` followed by a new `session/prompt`
+//! (the ACP registry's `message_steering` recording), folded into a single
+//! turn; `plan` updates become [`AgentEvent::Plan`]; `session/new` models
+//! become [`AgentEvent::Models`] and `session/set_model` selects one.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use blongo_protocol::{AgentEvent, TurnStatus};
+use blongo_protocol::{AgentEvent, ModelInfo, PlanStatus, PlanStep, TurnStatus};
 use serde_json::{Map, Value, json};
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
@@ -63,6 +70,8 @@ pub struct AcpAgent {
     /// 1.9 GB Antigravity `.par` are slow).
     pub setup_timeout: Duration,
     pub kill_grace: Duration,
+    /// Session to continue with `session/load` (when advertised).
+    pub resume_session: Option<String>,
 }
 
 pub const ANTIGRAVITY_AUTH_PREFIX: &str =
@@ -113,6 +122,7 @@ pub fn antigravity() -> AcpAgent {
         sanitize_updates: true,
         setup_timeout: Duration::from_secs(120),
         kill_grace: Duration::from_secs(3),
+        resume_session: None,
     }
 }
 
@@ -238,6 +248,8 @@ pub(crate) struct Driver {
     sanitize: bool,
     prompt_request: Option<i64>,
     cancel_sent: bool,
+    /// Text to send once the cancelled prompt answers (a steer).
+    steer: Option<String>,
     queued: VecDeque<String>,
     permissions: HashMap<String, PendingPermission>,
     permission_seq: u64,
@@ -250,6 +262,7 @@ impl Driver {
             sanitize,
             prompt_request: None,
             cancel_sent: false,
+            steer: None,
             queued: VecDeque::new(),
             permissions: HashMap::new(),
             permission_seq: 0,
@@ -293,23 +306,42 @@ impl Driver {
                     rpc.respond(&pending.id, json!({ "outcome": outcome }));
                 }
             }
-            Command::Interrupt => {
-                if self.turn_active() && !self.cancel_sent {
-                    self.cancel_sent = true;
-                    // ACP: the client must answer open permission requests
-                    // with `cancelled` once it cancels the turn.
-                    for (_, pending) in self.permissions.drain() {
-                        rpc.respond(
-                            &pending.id,
-                            json!({ "outcome": { "outcome": "cancelled" } }),
-                        );
-                    }
-                    rpc.notify(
-                        "session/cancel",
-                        Some(json!({ "sessionId": self.session_id })),
-                    );
+            Command::Steer(text) => {
+                if !self.turn_active() {
+                    self.send_prompt(rpc, &text);
+                } else {
+                    // Several steers before the cancel lands are joined.
+                    self.steer = Some(match self.steer.take() {
+                        Some(prev) => format!("{prev}\n\n{text}"),
+                        None => text,
+                    });
+                    self.cancel(rpc);
                 }
             }
+            Command::Interrupt => {
+                self.steer = None;
+                self.cancel(rpc);
+            }
+            // ACP v1 has no rewind.
+            Command::Rewind { .. } => {}
+        }
+    }
+
+    fn cancel(&mut self, rpc: &mut RpcOut) {
+        if self.turn_active() && !self.cancel_sent {
+            self.cancel_sent = true;
+            // ACP: the client must answer open permission requests with
+            // `cancelled` once it cancels the turn.
+            for (_, pending) in self.permissions.drain() {
+                rpc.respond(
+                    &pending.id,
+                    json!({ "outcome": { "outcome": "cancelled" } }),
+                );
+            }
+            rpc.notify(
+                "session/cancel",
+                Some(json!({ "sessionId": self.session_id })),
+            );
         }
     }
 
@@ -317,6 +349,13 @@ impl Driver {
         match msg {
             Incoming::Response { id, result } if Some(id) == self.prompt_request => {
                 self.prompt_request = None;
+                if let Some(text) = self.steer.take() {
+                    // The cancelled half of a steer: the turn continues
+                    // with the new prompt.
+                    self.permissions.clear();
+                    self.send_prompt(rpc, &text);
+                    return;
+                }
                 let status = match result {
                     Ok(result) => match result.get("stopReason").and_then(Value::as_str) {
                         Some("cancelled") => TurnStatus::Interrupted,
@@ -499,7 +538,27 @@ pub(crate) fn map_update(update: &Value, out: &mut Vec<AgentEvent>) {
             tool_result(update, call_id, out);
         }
         "tool_call_update" => tool_result(update, str_of(update, "toolCallId"), out),
-        // plan, available_commands_update, current_mode_update,
+        "plan" => {
+            let steps = update
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| {
+                            Some(PlanStep {
+                                text: e.get("content").and_then(Value::as_str)?.to_owned(),
+                                status: PlanStatus::parse(
+                                    e.get("status").and_then(Value::as_str).unwrap_or(""),
+                                ),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(AgentEvent::Plan { steps });
+        }
+        // available_commands_update, current_mode_update,
         // user_message_chunk, …: not surfaced by the spike.
         _ => {}
     }
@@ -700,6 +759,30 @@ async fn setup(
             return Err(describe("authenticate", e));
         }
     }
+    let can_load = init
+        .pointer("/agentCapabilities/loadSession")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if let Some(resume) = agent.resume_session.as_deref().filter(|_| can_load) {
+        let loaded = peer
+            .call(
+                "session/load",
+                json!({
+                    "sessionId": resume,
+                    "cwd": config.cwd.to_string_lossy(),
+                    "mcpServers": [],
+                }),
+                timeout,
+            )
+            .await;
+        // The agent replays the conversation as updates; Blongo already
+        // has it.
+        peer.drop_backlog_notifications();
+        if let Ok(session) = loaded {
+            select_model(peer, resume, &session, config, events, timeout).await;
+            return Ok(resume.to_owned());
+        }
+    }
     let session = peer
         .call(
             "session/new",
@@ -721,11 +804,157 @@ async fn setup(
         }
         Err(e) => return Err(describe("session/new", e)),
     };
-    session
+    let id = session
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "session/new returned no sessionId".into())
+        .ok_or_else(|| "session/new returned no sessionId".to_owned())?;
+    select_model(peer, &id, &session, config, events, timeout).await;
+    Ok(id)
+}
+
+/// The models a `session/new`/`session/load` result offers.
+pub(crate) fn session_models(session: &Value) -> Vec<ModelInfo> {
+    session
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("modelId").and_then(Value::as_str)?;
+                    let label = m.get("name").and_then(Value::as_str).unwrap_or(id);
+                    Some(ModelInfo {
+                        id: id.to_owned(),
+                        label: label.to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Report the offered models and switch to the configured one.
+async fn select_model(
+    peer: &mut RpcPeer<ChildStdout>,
+    session_id: &str,
+    session: &Value,
+    config: &SessionConfig,
+    events: &mpsc::Sender<AgentEvent>,
+    timeout: Duration,
+) {
+    let models = session_models(session);
+    let current = session
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str);
+    if let Some(model) = &config.model
+        && current != Some(model.as_str())
+        && models.iter().any(|m| &m.id == model)
+        && let Err(e) = peer
+            .call(
+                "session/set_model",
+                json!({ "sessionId": session_id, "modelId": model }),
+                timeout,
+            )
+            .await
+    {
+        let _ = events
+            .send(AgentEvent::Error {
+                message: format!("session/set_model: {e}"),
+            })
+            .await;
+    }
+    if !models.is_empty() {
+        let _ = events.send(AgentEvent::Models { models }).await;
+    }
+}
+
+/// Interactive sign-in: start the agent, call `authenticate`, report the
+/// sign-in URL it prints through `on_url`, and wait (up to `wait`) for the
+/// user to finish in the browser. The process is ours and is terminated
+/// before returning.
+pub async fn login(
+    config: SessionConfig,
+    agent: AcpAgent,
+    on_url: mpsc::Sender<String>,
+    wait: Duration,
+) -> anyhow::Result<()> {
+    let method = agent
+        .auth_method
+        .ok_or_else(|| anyhow::anyhow!("{} has no sign-in method", agent.display_name))?;
+    let exe = resolve(&config, &agent)?;
+    let args: Vec<&OsStr> = agent.args.iter().map(OsStr::new).collect();
+    let mut config = config;
+    config
+        .env_remove
+        .extend(agent.env_remove.iter().map(Into::into));
+    let proc = process::spawn(&exe, &args, &config, &agent.env)?;
+    let AgentProcess {
+        mut child,
+        stdin,
+        stdout,
+        stderr,
+    } = proc;
+    let mut peer = RpcPeer::new(RpcOut::new(stdin), stdout);
+    let result = async {
+        let init = peer
+            .call("initialize", initialize_params(), agent.setup_timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("initialize: {e}"))?;
+        let advertised = init
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .is_some_and(|m| {
+                m.iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(method))
+            });
+        if !advertised {
+            anyhow::bail!("{} does not offer {method} sign-in", agent.display_name);
+        }
+        let id = peer
+            .out
+            .request("authenticate", json!({ "methodId": method }));
+        let wait_for_auth = async {
+            loop {
+                match peer.next().await {
+                    Ok(Some(Incoming::Text(line))) => {
+                        if let Some(url) = agent
+                            .auth_url_prefix
+                            .and_then(|prefix| auth_url(prefix, &line))
+                        {
+                            let _ = on_url.send(url).await;
+                        }
+                    }
+                    Ok(Some(Incoming::Response { id: got, result })) if got == id => {
+                        return result.map(|_| ()).map_err(|e| anyhow::anyhow!("{e}"));
+                    }
+                    Ok(Some(Incoming::Request { id, method, .. })) => {
+                        peer.out.respond_error(
+                            &id,
+                            -32601,
+                            &format!("unsupported by blongo: {method}"),
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => anyhow::bail!("the agent exited during sign-in"),
+                }
+            }
+        };
+        tokio::time::timeout(wait, wait_for_auth)
+            .await
+            .map_err(|_| anyhow::anyhow!("sign-in timed out"))?
+    }
+    .await;
+    peer.out.close();
+    process::terminate(&mut child, agent.kill_grace).await;
+    result.map_err(|e| {
+        let tail = stderr.snapshot();
+        if tail.is_empty() {
+            e
+        } else {
+            anyhow::anyhow!("{e}\n{tail}")
+        }
+    })
 }
 
 async fn drive(
