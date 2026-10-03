@@ -15,7 +15,7 @@
    - Effect RPC の再現が不要になるので、ワイヤ形式は Blongo 側で自由に最適化できる。
    - クライアントは `Backend` トレイトの裏で「プロセス内コア（LocalBackend）」と「`blongo serve`（RemoteBackend、Phase 3）」を差し替えられる設計にする。
 3. **ドメインモデルはそのまま借りる**（Project → AppThread → Run → ExecutionNode、TurnItem、コマンド／イベント／プロジェクション／アウトボックス）。t3code が何度も作り直して到達した形なので、再発明しない。
-4. **プロバイダーの移植難易度に大きな差がある**。Codex と ACP 系（Grok, Antigravity, 任意の ACP エージェント）は公式 Rust クレートがあり容易。Claude は JS SDK を介さず CLI の stream-json を直接話す実装が必要。Cursor は JS SDK しかないので後回し（Node サイドカーか非対応）。
+4. **初期の対応エージェントは Codex、Claude Code、Antigravity の3つ（2026-10-03 決定）**。それ以外（Grok, OpenCode, Pi, Cursor, ACP レジストリ等）は後で検討する。Codex は公式 Rust クレートがあり容易。Antigravity は ACP なので `agent-client-protocol` クレートで話せるが、独自の出力補正と認証がある。Claude は JS SDK を介さず CLI の stream-json を直接話す実装が必要。
 5. **ライセンス注意**: GPUI 本体は Apache-2.0 だが、Zed の `editor` / `terminal` / `markdown` / `ui` / `acp_thread` などは **GPL-3.0**。Blongo は MIT なので、これらはコピーも依存もしない。参考に読むだけにする。
 
 ---
@@ -91,11 +91,12 @@ v1 は削除済みで、`apps/server/src/orchestration-v2/`（非テスト約7.9
 | プロバイダー | t3code の実装 | 通信方式 | Rust での方針 | 難易度 |
 |---|---|---|---|---|
 | Codex | `CodexAdapterV2.ts` 6.3k | `codex app-server` と stdio JSON-RPC | 上流 `codex-rs/app-server-protocol` を git 依存で使う | 低 |
-| ACP 系（Grok, Antigravity, Devin, レジストリ） | `AcpAdapterV2.ts` 7.9k + 薄いラッパー | ACP（stdio JSON-RPC） | `agent-client-protocol` 2.2.0（Zed が使用中、Apache-2.0）。v2 alpha の `providers/*`, `session/fork|resume` の対応状況を要確認 | 低〜中 |
-| Pi | `PiAdapterV2.ts` 3k | `pi --mode rpc` の行区切り JSON | 自前実装 | 低 |
+| Antigravity | `AntigravityAdapterV2.ts` + 汎用 `AcpAdapterV2.ts` 7.9k、`provider/acp/AntigravityAcpSupport.ts`, `AntigravityProtocol.ts`, `Drivers/AntigravityDriver.ts` | ACP（stdio JSON-RPC）。stdout の補正と session update の正規化が独自に入る。バイナリはリリースから zip をダウンロードして展開、認証は OAuth（`oauth-personal`） | `agent-client-protocol` 2.2.0（Zed が使用中、Apache-2.0）＋ Antigravity 固有の補正層。v2 alpha の `session/fork|resume` 対応状況を要確認 | 中 |
+| （後で検討）ACP 系の Grok / Devin / レジストリ | `AcpAdapterV2.ts` の薄いラッパー | ACP | Antigravity で作った ACP 層を再利用 | 低 |
+| （後で検討）Pi | `PiAdapterV2.ts` 3k | `pi --mode rpc` の行区切り JSON | 自前実装 | 低 |
 | Claude | `ClaudeAdapterV2.ts` 7.7k | JS の `@anthropic-ai/claude-agent-sdk` がプロセス内で `claude` CLI を stream-json で起動 | CLI の stream-json 入出力を直接話す実装。権限プロンプト、セッション再開、履歴読み込みを自前で | 中〜高 |
-| OpenCode 1.x / 2.x | 3.8k / 4.2k | `opencode serve` に HTTP + SSE | reqwest + SSE。スキーマは手書き | 中 |
-| Cursor | `CursorAdapterV2.ts` 2.7k | JS の `@cursor/sdk` がプロセス内で動く（CLI プロトコルなし） | Node サイドカーで SDK を包むか、当面非対応 | 高 |
+| （後で検討）OpenCode 1.x / 2.x | 3.8k / 4.2k | `opencode serve` に HTTP + SSE | reqwest + SSE。スキーマは手書き | 中 |
+| （後で検討）Cursor | `CursorAdapterV2.ts` 2.7k | JS の `@cursor/sdk` がプロセス内で動く（CLI プロトコルなし） | Node サイドカーで SDK を包むか、当面非対応 | 高 |
 
 t3code はプロバイダーのトランスクリプトを録って再生するリプレイテスト（`orchestration-v2/testkit/`）を持っている。**このフィクスチャを Rust 実装の適合テストとして再利用する**のが品質担保の近道。
 
@@ -132,7 +133,7 @@ blongo (単一バイナリ)
 │          └─ RemoteBackend ──(WebSocket, Blongo独自)─▶ `blongo serve` (Phase 3)
 └─ blongo-core
      ├─ event store (rusqlite, WAL) / orchestrator / projections / outbox worker
-     ├─ providers: codex, acp, claude, pi, opencode, (cursor-sidecar)
+     ├─ providers: codex, claude, antigravity (acp)  ※初期対応はこの3つ
      ├─ pty (portable-pty), git (git CLI → 将来 gix), workspace search
      └─ mcp server (エージェント向け)            ──spawn──▶ 各エージェント CLI
 `blongo serve` = 同じ blongo-core を UI なしで起動し WebSocket で公開（リモート用）
@@ -150,7 +151,7 @@ blongo (単一バイナリ)
 | `blongo-store` | SQLite イベントストア、プロジェクション、レシート、アウトボックス、マイグレーション | rusqlite (bundled), r2d2 か専用ライタースレッド |
 | `blongo-core` | オーケストレーター（スレッド単位直列化、CommandPolicy、EventSink、EffectWorker、Run 実行、チェックポイント、フォーク） | tokio, blongo-store |
 | `blongo-provider` | アダプタートレイトと共通部品（イベント結合、テキストデルタの合体、プロセス監督） | tokio::process |
-| `blongo-provider-codex` / `-acp` / `-claude` / `-pi` / `-opencode` | 各アダプター | codex-app-server-protocol, agent-client-protocol, reqwest |
+| `blongo-provider-codex` / `-claude` / `-acp`（Antigravity） | 各アダプター。ACP 層は Antigravity 固有の補正と汎用部分を分けておき、将来の ACP エージェント追加に流用する | codex-app-server-protocol, agent-client-protocol |
 | `blongo-pty` | PTY とヘッドレス端末状態 | portable-pty, alacritty_terminal |
 | `blongo-git` | worktree、ステータス、隠し ref によるチェックポイント、diff | git CLI（後で gix） |
 | `blongo-mcp` | エージェントに公開する MCP サーバー（thread/queue/project ツール） | rmcp |
@@ -197,8 +198,9 @@ blongo (単一バイナリ)
 - **スパイク1**: gpui-component を使うか自前か（入力、リスト、Markdown の3点で判断）
 - **スパイク2**: Codex（`codex app-server`）を Rust から起動し、1ターン往復＋承認を通す。Phase 1 の最初のプロバイダーになる
 - **スパイク3**: `claude` CLI を stream-json で直接起動し、1ターン往復＋権限要求を通す
+- **スパイク4**: Antigravity を `agent-client-protocol` クレートで起動し、t3code の補正（`AntigravityProtocol.ts`）を当てて1ターン往復を通す
 
-完了条件: ベースラインの数値表、空の GPUI アプリがビルドできる CI、3つのスパイクの結論。
+完了条件: ベースラインの数値表、空の GPUI アプリがビルドできる CI、4つのスパイクの結論。
 
 ### Phase 1: 縦に一本通す（コア＋UI、Codex のみ）
 
@@ -216,14 +218,14 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 
 ### Phase 2: プロバイダーとワークスペース機能
 
-- プロバイダー追加: **ACP（Grok ほか）→ Claude → Pi** の順。各プロバイダーのリプレイ適合テストつき
+- プロバイダー追加: **Claude → Antigravity** の順。各プロバイダーのリプレイ適合テストつき。Antigravity はバイナリのダウンロード・展開と OAuth ログインも含む
 - キュー／steer、フォーク、プロバイダー切替（ContextHandoff）
 - チェックポイント（git の隠し ref）とロールバック、worktree 作成
 - PTY とターミナルビュー
 - Markdown とコードブロックのハイライト、プラン表示、モデル選択
 - t3code の DB からのインポート（`statev2.sqlite` を読み取り専用で取り込む一方向の移行ツール。継続的な互換ではない）
 
-完了条件: Codex / Claude / ACP エージェントのスレッドが完走し、チェックポイントからロールバックできる。
+完了条件: Codex / Claude Code / Antigravity のスレッドが完走し、チェックポイントからロールバックできる。
 
 ### Phase 3: リモートとサーバーモード
 
@@ -239,7 +241,7 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 3. エージェント向け MCP サーバー（`t3_thread_*`、`delegate_task`、サブエージェント）
 4. ファイルブラウザ・ファジー検索、ブランチ／git 操作
 5. スケジュール実行、使用量表示
-6. OpenCode アダプター、Cursor（Node サイドカー）
+6. 追加エージェントの検討（Grok などの ACP 系、OpenCode、Pi、Cursor）
 7. PR 受信箱・レビュー（GitHub / GitLab ほか）
 8. 自動更新、ディープリンク、通知
 
@@ -257,7 +259,7 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 | gpui-component が古い GPUI スナップショットに固定 | 最新 GPUI の改善を取り込めない | Phase 0 で判断。採用しても部品単位で抜けるよう薄いラッパー越しに使う |
 | コア先行のため最初に動くものが出るまでが長い | 体感できる成果が遅れる | Phase 1 を Codex 1本・最小画面に絞り、縦に一本通すことを最優先にする |
 | Claude SDK 相当の機能（セッション履歴、スキル、使用量制限）の再実装 | Claude 対応が遅れる | Phase 0 でスパイク。足りなければ一時的に Node サイドカー |
-| Cursor は JS SDK のみ | Rust ネイティブ不可 | サイドカーか非対応。ユーザー判断 |
+| Antigravity の ACP 実装に独自の癖がある（stdout 補正、update 正規化） | 汎用 ACP クレートだけでは動かない | t3code の `AntigravityProtocol.ts` を読み、補正層を独立モジュールにする。Phase 0 で起動〜1ターンを確認 |
 | オーケストレーターの不変条件の取りこぼし | 二重実行、ターンが閉じない等 | リプレイ適合テスト、`docs/orchestration-v2` の不変条件をテスト化 |
 | Zed の GPL コードの混入 | ライセンス違反 | 依存チェック（cargo-deny で GPL を禁止）を CI に入れる |
 | リッチなコンポーザー、Markdown 選択コピー、アクセシビリティ | Web 版より体験が劣る | 段階的に。最初はプレーンテキストと基本選択に絞る |
@@ -267,7 +269,7 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 ## 5. 決めてほしいこと（推奨つき）
 
 1. ~~t3code とのワイヤ互換~~ → **互換なしに決定（2026-10-03）**
-2. **Cursor 対応**: 当面非対応 ← 推奨 / Node サイドカー
+2. ~~対応エージェント~~ → **Codex、Claude Code、Antigravity の3つに決定（2026-10-03）**。Cursor 等は後で検討
 3. **gpui-component の採用**: Phase 0 のスパイク結果で決める（初期採用を推奨）
 4. **対応 OS の優先順位**: macOS → Linux → Windows を推奨（GPUI の成熟度順）
 
@@ -279,6 +281,7 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 2. t3code のベースライン計測スクリプトと結果表（Phase 0）
 3. Rust から `codex app-server` を起動して1ターン往復するプロトタイプ（スパイク2）
 4. `claude` CLI stream-json 直結のプロトタイプ（スパイク3）
+5. Antigravity を ACP で1ターン往復するプロトタイプ（スパイク4）
 
 ## 付録: 参照すべき t3code のファイル
 
