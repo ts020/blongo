@@ -2001,6 +2001,17 @@ impl Shell {
                             }
                         }
                     }
+                    // A question already showing keeps its folder: a link
+                    // arriving under the user's cursor cannot swap the path
+                    // just before "Add project" is clicked.
+                    None if self.confirm_link_project.is_some() => {
+                        self.notice = Some(
+                            format!(
+                                "Ignored a blongo:// link to {path}: answer the open question first"
+                            )
+                            .into(),
+                        )
+                    }
                     None => self.confirm_link_project = Some(path),
                 }
             }

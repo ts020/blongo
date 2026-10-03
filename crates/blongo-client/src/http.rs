@@ -145,16 +145,19 @@ fn config(req: &Request) -> Result<String, String> {
         // Text only (JSON): a config value cannot carry NUL or other
         // control bytes, and `data-raw` never reads a file for `@`.
         let text = std::str::from_utf8(body).map_err(|_| "the request body is not text")?;
-        if text.len() > MAX_REQUEST_BODY {
-            return Err("the request body is too large".into());
-        }
         if text
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
         {
             return Err("the request body has control characters".into());
         }
-        c.push_str(&format!("data-raw = {}\n", quote(text)));
+        // The quoted value is what curl reads as one config line (its
+        // limit is 10 MiB), so the cap applies after escaping.
+        let quoted = quote(text);
+        if quoted.len() > MAX_REQUEST_BODY {
+            return Err("the request body is too large".into());
+        }
+        c.push_str(&format!("data-raw = {quoted}\n"));
     }
     // The status code on a line of its own after the body.
     c.push_str("write-out = \"\\n%{http_code}\"\n");
@@ -325,5 +328,15 @@ mod tests {
         let mut binary = Request::get("https://h/x");
         binary.body = Some(vec![b'a', 0, b'b']);
         assert!(config(&binary).is_err());
+        // The cap counts the escaped value: 5 MiB of quotes become 10 MiB.
+        let mut quotes = Request::get("https://h/x");
+        quotes.body = Some(vec![b'"'; 5 << 20]);
+        assert_eq!(
+            config(&quotes).unwrap_err(),
+            "the request body is too large"
+        );
+        let mut plain = Request::get("https://h/x");
+        plain.body = Some(vec![b'a'; 5 << 20]);
+        assert!(config(&plain).is_ok());
     }
 }
