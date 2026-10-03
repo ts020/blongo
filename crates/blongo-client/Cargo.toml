@@ -1,0 +1,25 @@
+[package]
+name = "blongo-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# LocalBackend over the in-process core.
+local = ["dep:blongo-core"]
+
+[dependencies]
+blongo-protocol.workspace = true
+blongo-core = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "io-std"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+ed25519-dalek.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true

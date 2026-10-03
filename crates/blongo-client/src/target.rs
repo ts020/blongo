@@ -1,0 +1,447 @@
+//! Where an environment lives and how to reach it.
+//!
+//! - `ws://HOST:PORT[/path]`: a `blongo serve` listening on loopback, on a
+//!   Tailscale address (WireGuard encrypts the link) or behind a proxy.
+//!   `wss://` is not built in (no TLS stack in Blongo); see the security
+//!   notes in `docs/phase3/report.md`.
+//! - `ssh://[USER@]HOST[:SSH_PORT]?port=PORT`: an SSH port forward to a
+//!   `blongo serve` that listens on the remote host's loopback.
+//! - `ssh+stdio://[USER@]HOST[:SSH_PORT][?command=CMD]`: run `blongo-serve
+//!   --stdio` (or `CMD`) over SSH and speak frames on its stdin/stdout. SSH
+//!   authenticates the user, so no pairing is needed.
+//!
+//! The SSH client is `ssh` on PATH or `$BLONGO_SSH`; it runs with
+//! `BatchMode=yes` (keys or an agent, never a password prompt).
+
+use std::io;
+use std::process::Stdio;
+use std::time::Duration;
+
+use blongo_protocol::wire::MAX_SERVER_FRAME;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
+
+use crate::transport::{Reader, Writer, stream_halves, ws_config, ws_halves};
+
+pub const DEFAULT_PORT: u16 = 7878;
+pub const DEFAULT_STDIO_COMMAND: &str = "blongo-serve --stdio";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    WebSocket {
+        host: String,
+        port: u16,
+        path: String,
+    },
+    SshTunnel {
+        host: String,
+        ssh_port: Option<u16>,
+        remote_port: u16,
+    },
+    SshStdio {
+        host: String,
+        ssh_port: Option<u16>,
+        command: String,
+    },
+}
+
+impl Target {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("ws://") {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], rest[i..].to_owned()),
+                None => (rest, "/ws".to_owned()),
+            };
+            let (host, port) = split_host_port(authority)?;
+            return Ok(Self::WebSocket {
+                host,
+                port: port.unwrap_or(DEFAULT_PORT),
+                path,
+            });
+        }
+        if s.starts_with("wss://") || s.starts_with("https://") {
+            return Err(
+                "wss:// is not built in: reach the server over an SSH tunnel \
+                 (ssh://host?port=N), Tailscale (ws://100.x.y.z:N) or a local TLS proxy"
+                    .into(),
+            );
+        }
+        let (stdio, rest) = if let Some(rest) = s.strip_prefix("ssh+stdio://") {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix("ssh://") {
+            (false, rest)
+        } else {
+            return Err(format!(
+                "unknown target {s:?} (use ws://, ssh:// or ssh+stdio://)"
+            ));
+        };
+        let (authority, query) = match rest.split_once('?') {
+            Some((a, q)) => (a, q),
+            None => (rest, ""),
+        };
+        let authority = authority.trim_end_matches('/');
+        let (host, ssh_port) = split_host_port(authority)?;
+        let param = |key: &str| {
+            query
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| percent_decode(v))
+        };
+        if stdio {
+            Ok(Self::SshStdio {
+                host,
+                ssh_port,
+                command: param("command").unwrap_or_else(|| DEFAULT_STDIO_COMMAND.into()),
+            })
+        } else {
+            let remote_port = match param("port") {
+                Some(p) => p.parse().map_err(|_| format!("bad port {p:?}"))?,
+                None => DEFAULT_PORT,
+            };
+            Ok(Self::SshTunnel {
+                host,
+                ssh_port,
+                remote_port,
+            })
+        }
+    }
+
+    /// Whether the transport itself authenticates the user (no pairing).
+    pub fn is_local_auth(&self) -> bool {
+        matches!(self, Self::SshStdio { .. })
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let port = |p: &Option<u16>| p.map(|p| format!(":{p}")).unwrap_or_default();
+        match self {
+            Self::WebSocket { host, port, path } => write!(f, "ws://{host}:{port}{path}"),
+            Self::SshTunnel {
+                host,
+                ssh_port,
+                remote_port,
+            } => write!(f, "ssh://{host}{}?port={remote_port}", port(ssh_port)),
+            Self::SshStdio {
+                host,
+                ssh_port,
+                command,
+            } => {
+                write!(f, "ssh+stdio://{host}{}", port(ssh_port))?;
+                if command != DEFAULT_STDIO_COMMAND {
+                    write!(f, "?command={}", command.replace(' ', "%20"))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn split_host_port(authority: &str) -> Result<(String, Option<u16>), String> {
+    if authority.is_empty() {
+        return Err("missing host".into());
+    }
+    // [v6]:port
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("bad host {authority:?}"))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p.parse().map_err(|_| format!("bad port {p:?}"))?),
+            None => None,
+        };
+        return Ok((format!("[{host}]"), port));
+    }
+    match authority.rsplit_once(':') {
+        Some(("", _)) => Err(format!("missing host in {authority:?}")),
+        Some((host, port)) if !host.contains(':') => Ok((
+            host.to_owned(),
+            Some(port.parse().map_err(|_| format!("bad port {port:?}"))?),
+        )),
+        _ => Ok((authority.to_owned(), None)),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// An open transport to a server. Drop it to close; an SSH child it
+/// started is killed with it (only that process).
+pub struct Link {
+    pub reader: Reader,
+    pub writer: Writer,
+    /// The transport authenticated the user (SSH stdio).
+    pub local_auth: bool,
+    _child: Option<Child>,
+}
+
+static SSH_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Use this SSH client instead of `$BLONGO_SSH` / `ssh` (tests).
+pub fn set_ssh_program(program: impl Into<String>) {
+    *SSH_OVERRIDE.lock().expect("ssh override") = Some(program.into());
+}
+
+fn ssh_program() -> String {
+    if let Some(p) = SSH_OVERRIDE.lock().expect("ssh override").clone() {
+        return p;
+    }
+    std::env::var("BLONGO_SSH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ssh".into())
+}
+
+fn ssh_command(ssh_port: Option<u16>) -> Command {
+    let mut cmd = Command::new(ssh_program());
+    cmd.arg("-o").arg("BatchMode=yes");
+    if let Some(p) = ssh_port {
+        cmd.arg("-p").arg(p.to_string());
+    }
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// Keep the last bytes of a child's stderr for error messages.
+fn drain_stderr(child: &mut Child) -> tokio::sync::watch::Receiver<String> {
+    let (tx, rx) = tokio::sync::watch::channel(String::new());
+    if let Some(mut err) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let mut tail = String::new();
+            while let Ok(n) = err.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                tail.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if tail.len() > 2048 {
+                    let cut = tail.len() - 2048;
+                    let cut = (cut..tail.len())
+                        .find(|&i| tail.is_char_boundary(i))
+                        .unwrap_or(tail.len());
+                    tail.drain(..cut);
+                }
+                let _ = tx.send(tail.clone());
+            }
+        });
+    }
+    rx
+}
+
+pub async fn open(target: &Target) -> io::Result<Link> {
+    tokio::time::timeout(CONNECT_TIMEOUT, open_inner(target))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))?
+}
+
+async fn open_inner(target: &Target) -> io::Result<Link> {
+    match target {
+        Target::WebSocket { host, port, path } => {
+            let (reader, writer) = websocket(host, *port, path).await?;
+            Ok(Link {
+                reader,
+                writer,
+                local_auth: false,
+                _child: None,
+            })
+        }
+        Target::SshTunnel {
+            host,
+            ssh_port,
+            remote_port,
+        } => {
+            // A free local port (released just before ssh binds it).
+            let local = std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port();
+            let mut cmd = ssh_command(*ssh_port);
+            cmd.arg("-N")
+                .arg("-o")
+                .arg("ExitOnForwardFailure=yes")
+                .arg("-o")
+                .arg("ServerAliveInterval=15")
+                .arg("-L")
+                .arg(format!("127.0.0.1:{local}:127.0.0.1:{remote_port}"))
+                .arg(host)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn()?;
+            let stderr = drain_stderr(&mut child);
+            // Wait for the forward to accept connections.
+            let mut waited = Duration::ZERO;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "ssh exited ({status}): {}",
+                        stderr.borrow().trim()
+                    )));
+                }
+                if let Ok((reader, writer)) = websocket("127.0.0.1", local, "/ws").await {
+                    return Ok(Link {
+                        reader,
+                        writer,
+                        local_auth: false,
+                        _child: Some(child),
+                    });
+                }
+                if waited > CONNECT_TIMEOUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the SSH tunnel did not come up",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                waited += Duration::from_millis(100);
+            }
+        }
+        Target::SshStdio {
+            host,
+            ssh_port,
+            command,
+        } => {
+            let mut cmd = ssh_command(*ssh_port);
+            cmd.arg("-T")
+                .arg(host)
+                .arg(command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn()?;
+            let _ = drain_stderr(&mut child);
+            let stdin = child.stdin.take().expect("piped");
+            let stdout = child.stdout.take().expect("piped");
+            let (reader, writer) = stream_halves(stdout, stdin, MAX_SERVER_FRAME);
+            Ok(Link {
+                reader,
+                writer,
+                local_auth: true,
+                _child: Some(child),
+            })
+        }
+    }
+}
+
+async fn websocket(host: &str, port: u16, path: &str) -> io::Result<(Reader, Writer)> {
+    let addr_host = host.trim_start_matches('[').trim_end_matches(']');
+    let stream = TcpStream::connect((addr_host, port)).await?;
+    stream.set_nodelay(true)?;
+    let url = format!("ws://{host}:{port}{path}");
+    let (ws, _) = tokio_tungstenite::client_async_with_config(
+        url.as_str(),
+        stream,
+        Some(ws_config(MAX_SERVER_FRAME)),
+    )
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(ws_halves(ws))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targets_parse_and_print() {
+        let cases = [
+            (
+                "ws://127.0.0.1:7900",
+                Target::WebSocket {
+                    host: "127.0.0.1".into(),
+                    port: 7900,
+                    path: "/ws".into(),
+                },
+            ),
+            (
+                "ws://100.101.102.103",
+                Target::WebSocket {
+                    host: "100.101.102.103".into(),
+                    port: DEFAULT_PORT,
+                    path: "/ws".into(),
+                },
+            ),
+            (
+                "ws://[::1]:9/x",
+                Target::WebSocket {
+                    host: "[::1]".into(),
+                    port: 9,
+                    path: "/x".into(),
+                },
+            ),
+            (
+                "ssh://me@devbox?port=7901",
+                Target::SshTunnel {
+                    host: "me@devbox".into(),
+                    ssh_port: None,
+                    remote_port: 7901,
+                },
+            ),
+            (
+                "ssh+stdio://devbox:2222",
+                Target::SshStdio {
+                    host: "devbox".into(),
+                    ssh_port: Some(2222),
+                    command: DEFAULT_STDIO_COMMAND.into(),
+                },
+            ),
+            (
+                "ssh+stdio://devbox?command=/opt/blongo-serve%20--stdio",
+                Target::SshStdio {
+                    host: "devbox".into(),
+                    ssh_port: None,
+                    command: "/opt/blongo-serve --stdio".into(),
+                },
+            ),
+        ];
+        for (text, target) in cases {
+            let parsed = Target::parse(text).unwrap();
+            assert_eq!(parsed, target, "{text}");
+            assert_eq!(Target::parse(&parsed.to_string()).unwrap(), target);
+        }
+        assert!(
+            Target::parse("wss://x")
+                .unwrap_err()
+                .contains("not built in")
+        );
+        assert!(Target::parse("ftp://x").is_err());
+        assert!(Target::parse("ws://:7").is_err());
+        assert!(Target::parse("ssh://h?port=x").is_err());
+        assert!(Target::parse("ssh+stdio://h").unwrap().is_local_auth());
+    }
+
+    #[test]
+    fn percent_decoding_is_lenient() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+    }
+}

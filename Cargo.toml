@@ -6,6 +6,8 @@ members = [
     "crates/blongo-store",
     "crates/blongo-core",
     "crates/blongo-git",
+    "crates/blongo-client",
+    "crates/blongo-server",
     "apps/blongo",
 ]
 
@@ -21,6 +23,8 @@ blongo-harness = { path = "crates/blongo-harness" }
 blongo-store = { path = "crates/blongo-store" }
 blongo-core = { path = "crates/blongo-core" }
 blongo-git = { path = "crates/blongo-git" }
+blongo-client = { path = "crates/blongo-client" }
+blongo-server = { path = "crates/blongo-server" }
 
 # GPUI: Zed's Apache-2.0 UI crates only, pinned to one rev.
 # Never depend on Zed's GPL-3.0 crates (editor, terminal, markdown, ui, ...).
@@ -53,6 +57,16 @@ tree-sitter-c = "0.24"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# Phase 3: wire protocol, auth, transports (all permissive).
+rmp-serde = "1"
+serde_bytes = "0.11"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+subtle = "2"
+getrandom = "0.3"
+base64 = "0.22"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+libc = "0.2"
 
 [profile.release]
 # Fat LTO + one codegen unit: ~6 MB smaller binary and ~4 MiB less resident
