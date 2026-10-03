@@ -21,6 +21,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
 
+use crate::{PlanStep, ProviderKind};
+
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -115,11 +117,87 @@ pub struct Thread {
     pub updated_at: Timestamp,
     /// The provider's own thread/session id (a reference, never the key).
     pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// `None`: the provider's default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The thread works in its own git worktree instead of the project
+    /// folder.
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
+    #[serde(default)]
+    pub forked_from: Option<ThreadId>,
+    /// How the provider gets this thread's context at its next session,
+    /// when it does not simply continue `provider_thread_id`.
+    #[serde(default)]
+    pub pending_context: Option<PendingContext>,
+}
+
+impl Thread {
+    /// An idle, unbound thread with no worktree.
+    pub fn new(
+        id: ThreadId,
+        project_id: ProjectId,
+        title: impl Into<String>,
+        now: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            project_id,
+            title: title.into(),
+            status: ThreadStatus::Idle,
+            archived: false,
+            created_at: now,
+            updated_at: now,
+            provider_thread_id: None,
+            provider: ProviderKind::default(),
+            model: None,
+            worktree: None,
+            forked_from: None,
+            pending_context: None,
+        }
+    }
+
+    /// Where the agent works: the thread's worktree or the project folder.
+    pub fn cwd<'a>(&'a self, project: &'a Project) -> &'a str {
+        self.worktree.as_ref().map_or(&project.path, |w| &w.path)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worktree {
+    pub path: String,
+    pub branch: String,
+}
+
+/// Context the next provider session must be given before the thread's
+/// next turn (fork, provider switch, rollback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PendingContext {
+    /// The provider has no copy of this conversation: the next prompt
+    /// carries a bounded transcript of it (t3code's context handoff).
+    Handoff,
+    /// Branch the provider's own conversation (native fork).
+    Fork {
+        provider_thread_id: String,
+        /// Last provider turn to keep (`None`: all of it).
+        up_to_turn: Option<String>,
+    },
+    /// Drop the provider's turns after `keep_through_turn` (native rollback).
+    /// `drop_from_turn` is the first provider turn removed.
+    Rewind {
+        keep_through_turn: Option<String>,
+        drop_from_turn: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    /// Sent while another run was active; starts when that one ends.
+    Queued,
     /// Accepted; the provider turn has not been started yet.
     Starting,
     Running,
@@ -128,20 +206,55 @@ pub enum RunStatus {
     Completed,
     Interrupted,
     Failed,
+    /// A queued run removed before it started.
+    Cancelled,
+    /// Undone by a rollback: its items are hidden and its file changes
+    /// reverted.
+    RolledBack,
 }
 
 impl RunStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Interrupted | Self::Failed)
+        matches!(
+            self,
+            Self::Completed | Self::Interrupted | Self::Failed | Self::Cancelled | Self::RolledBack
+        )
     }
 
-    /// The thread status implied by a root run in this status.
-    pub fn thread_status(self) -> ThreadStatus {
+    /// The thread status implied by a root run entering this status.
+    /// `None`: the transition does not move the thread (a queued run waits
+    /// behind an active one; cancel and rollback happen beside it).
+    pub fn thread_status(self) -> Option<ThreadStatus> {
         match self {
-            Self::Starting | Self::Running => ThreadStatus::Running,
-            Self::Waiting => ThreadStatus::Waiting,
-            Self::Completed | Self::Interrupted => ThreadStatus::Idle,
-            Self::Failed => ThreadStatus::Failed,
+            Self::Starting | Self::Running => Some(ThreadStatus::Running),
+            Self::Waiting => Some(ThreadStatus::Waiting),
+            Self::Completed | Self::Interrupted => Some(ThreadStatus::Idle),
+            Self::Failed => Some(ThreadStatus::Failed),
+            Self::Queued | Self::Cancelled | Self::RolledBack => None,
+        }
+    }
+}
+
+impl Run {
+    /// A root run with no provider references yet.
+    pub fn new(
+        id: RunId,
+        thread_id: ThreadId,
+        status: RunStatus,
+        provider: ProviderKind,
+        now: Timestamp,
+    ) -> Self {
+        Self {
+            id,
+            thread_id,
+            parent_run_id: None,
+            status,
+            created_at: now,
+            ended_at: None,
+            error: None,
+            provider,
+            provider_turn_id: None,
+            checkpoint: None,
         }
     }
 }
@@ -157,6 +270,15 @@ pub struct Run {
     pub created_at: Timestamp,
     pub ended_at: Option<Timestamp>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// The provider's id for this turn (see `AgentEvent::ProviderTurnId`).
+    #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    /// Commit (under `refs/blongo/checkpoints/…`) of the workspace as it was
+    /// just before this run started; rollback restores it.
+    #[serde(default)]
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -223,6 +345,10 @@ pub enum ItemKind {
         detail: String,
         state: ApprovalState,
     },
+    /// The agent's plan / todo list for a run, updated in place.
+    Plan {
+        steps: Vec<PlanStep>,
+    },
     SystemNotice {
         message: String,
     },
@@ -249,6 +375,7 @@ impl ItemKind {
             Self::FileChange { .. } => "file_change",
             Self::ToolCall { .. } => "tool_call",
             Self::ApprovalRequest { .. } => "approval_request",
+            Self::Plan { .. } => "plan",
             Self::SystemNotice { .. } => "system_notice",
             Self::Error { .. } => "error",
         }
@@ -301,7 +428,36 @@ pub enum Command {
         thread_id: ThreadId,
         project_id: ProjectId,
         title: String,
+        #[serde(default)]
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+        /// Work in a new git worktree (branch `blongo/<id>`) instead of the
+        /// project folder.
+        #[serde(default)]
+        worktree: bool,
     },
+    /// Copy a thread (up to and including `up_to_run_id`, default: all of
+    /// it) into a new one that continues independently.
+    #[serde(rename = "thread.fork")]
+    ThreadFork {
+        source_thread_id: ThreadId,
+        thread_id: ThreadId,
+        #[serde(default)]
+        up_to_run_id: Option<RunId>,
+    },
+    /// Change the thread's provider and/or model. Switching provider hands
+    /// the conversation so far to the new one.
+    #[serde(rename = "thread.set_provider")]
+    ThreadSetProvider {
+        thread_id: ThreadId,
+        provider: ProviderKind,
+        model: Option<String>,
+    },
+    /// Undo `run_id` and every later run: restore the workspace to the
+    /// checkpoint taken before it and drop the runs from the conversation.
+    #[serde(rename = "thread.rollback")]
+    ThreadRollback { thread_id: ThreadId, run_id: RunId },
     #[serde(rename = "thread.rename")]
     ThreadRename { thread_id: ThreadId, title: String },
     #[serde(rename = "thread.archive")]
@@ -313,9 +469,15 @@ pub enum Command {
         message_id: ItemId,
         run_id: RunId,
         text: String,
+        /// What to do when a run is already active.
+        #[serde(default)]
+        delivery: Delivery,
     },
     #[serde(rename = "run.interrupt")]
     RunInterrupt { thread_id: ThreadId },
+    /// Remove a queued run before it starts.
+    #[serde(rename = "run.cancel")]
+    RunCancel { thread_id: ThreadId, run_id: RunId },
     #[serde(rename = "runtime_request.respond")]
     RuntimeRequestRespond {
         thread_id: ThreadId,
@@ -324,15 +486,31 @@ pub enum Command {
     },
 }
 
+/// How a message sent while a run is active is delivered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// Start now when idle; otherwise queue behind the active run.
+    #[default]
+    Queue,
+    /// Add to the active run (the provider's steering); starts a run when
+    /// idle.
+    Steer,
+}
+
 impl Command {
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::ProjectCreate { .. } => None,
             Self::ThreadCreate { thread_id, .. }
+            | Self::ThreadFork { thread_id, .. }
+            | Self::ThreadSetProvider { thread_id, .. }
+            | Self::ThreadRollback { thread_id, .. }
             | Self::ThreadRename { thread_id, .. }
             | Self::ThreadArchive { thread_id }
             | Self::MessageDispatch { thread_id, .. }
             | Self::RunInterrupt { thread_id }
+            | Self::RunCancel { thread_id, .. }
             | Self::RuntimeRequestRespond { thread_id, .. } => Some(*thread_id),
         }
     }
@@ -358,10 +536,36 @@ pub enum EventKind {
     ThreadRenamed { thread_id: ThreadId, title: String },
     #[serde(rename = "thread.archived")]
     ThreadArchived { thread_id: ThreadId },
+    /// The provider's own thread id; clears `pending_context` (the new
+    /// session has the context).
     #[serde(rename = "thread.provider_bound")]
     ThreadProviderBound {
         thread_id: ThreadId,
         provider_thread_id: String,
+    },
+    /// Provider / model changed. `provider_thread_id` is reset when the
+    /// provider changes; `pending_context` says how the next session gets
+    /// the conversation.
+    #[serde(rename = "thread.provider_changed")]
+    ThreadProviderChanged {
+        thread_id: ThreadId,
+        provider: ProviderKind,
+        model: Option<String>,
+        provider_thread_id: Option<String>,
+        pending_context: Option<PendingContext>,
+    },
+    #[serde(rename = "run.provider_turn")]
+    RunProviderTurn {
+        thread_id: ThreadId,
+        run_id: RunId,
+        provider_turn_id: String,
+    },
+    /// The workspace was captured just before the run started.
+    #[serde(rename = "run.checkpointed")]
+    RunCheckpointed {
+        thread_id: ThreadId,
+        run_id: RunId,
+        commit: String,
     },
     #[serde(rename = "run.created")]
     RunCreated { run: Run },
@@ -405,6 +609,9 @@ impl EventKind {
             Self::ThreadRenamed { thread_id, .. }
             | Self::ThreadArchived { thread_id }
             | Self::ThreadProviderBound { thread_id, .. }
+            | Self::ThreadProviderChanged { thread_id, .. }
+            | Self::RunProviderTurn { thread_id, .. }
+            | Self::RunCheckpointed { thread_id, .. }
             | Self::RunStatusChanged { thread_id, .. }
             | Self::ItemTextAppended { thread_id, .. }
             | Self::ItemFinished { thread_id, .. } => Some(*thread_id),
@@ -419,6 +626,9 @@ impl EventKind {
             Self::ThreadRenamed { .. } => "thread.renamed",
             Self::ThreadArchived { .. } => "thread.archived",
             Self::ThreadProviderBound { .. } => "thread.provider_bound",
+            Self::ThreadProviderChanged { .. } => "thread.provider_changed",
+            Self::RunProviderTurn { .. } => "run.provider_turn",
+            Self::RunCheckpointed { .. } => "run.checkpointed",
             Self::RunCreated { .. } => "run.created",
             Self::RunStatusChanged { .. } => "run.status_changed",
             Self::ItemAdded { .. } => "item.added",
@@ -478,6 +688,7 @@ mod tests {
             message_id: ItemId::new(),
             run_id: RunId::new(),
             text: "hi".into(),
+            delivery: Delivery::Steer,
         });
         let json = serde_json::to_value(&cmd).unwrap();
         assert_eq!(json["command"]["type"], "message.dispatch");
@@ -548,8 +759,16 @@ mod tests {
 
     #[test]
     fn run_status_maps_to_thread_status() {
-        assert_eq!(RunStatus::Waiting.thread_status(), ThreadStatus::Waiting);
-        assert_eq!(RunStatus::Interrupted.thread_status(), ThreadStatus::Idle);
+        assert_eq!(
+            RunStatus::Waiting.thread_status(),
+            Some(ThreadStatus::Waiting)
+        );
+        assert_eq!(
+            RunStatus::Interrupted.thread_status(),
+            Some(ThreadStatus::Idle)
+        );
+        assert_eq!(RunStatus::Queued.thread_status(), None);
+        assert!(RunStatus::RolledBack.is_terminal());
         assert!(RunStatus::Failed.is_terminal());
         assert!(!RunStatus::Starting.is_terminal());
     }

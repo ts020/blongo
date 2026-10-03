@@ -4,9 +4,10 @@
 use anyhow::bail;
 use rusqlite::{Connection, params};
 
-const MIGRATIONS: &[(u32, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE events (
     sequence   INTEGER PRIMARY KEY,
     at         INTEGER NOT NULL,
@@ -80,7 +81,23 @@ CREATE TABLE effect_outbox (
 );
 CREATE INDEX effect_outbox_status ON effect_outbox (status, id);
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+ALTER TABLE threads ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';
+ALTER TABLE threads ADD COLUMN model TEXT;
+ALTER TABLE threads ADD COLUMN worktree_path TEXT;
+ALTER TABLE threads ADD COLUMN worktree_branch TEXT;
+ALTER TABLE threads ADD COLUMN forked_from TEXT;
+ALTER TABLE threads ADD COLUMN pending_context TEXT;
+
+ALTER TABLE runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';
+ALTER TABLE runs ADD COLUMN provider_turn_id TEXT;
+ALTER TABLE runs ADD COLUMN checkpoint TEXT;
+"#,
+    ),
+];
 
 pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
@@ -147,6 +164,33 @@ mod tests {
         // An older build refuses a newer database instead of corrupting it.
         let err = migrate_with(&conn, v1).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn v1_data_survives_the_provider_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects VALUES ('p', 'demo', '/tmp', 1);
+             INSERT INTO threads (id, project_id, title, status, archived, created_at,
+                                  updated_at, provider_thread_id)
+             VALUES ('t', 'p', 'old', 'idle', 0, 1, 1, 'codex-thread');
+             INSERT INTO runs (id, thread_id, status, created_at)
+             VALUES ('r', 't', 'completed', 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), LATEST_VERSION);
+        let (provider, model): (String, Option<String>) = conn
+            .query_row("SELECT provider, model FROM threads", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((provider.as_str(), model), ("codex", None));
+        let run_provider: String = conn
+            .query_row("SELECT provider FROM runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(run_provider, "codex");
     }
 
     #[test]

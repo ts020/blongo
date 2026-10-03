@@ -9,14 +9,8 @@ use serde::{Deserialize, Serialize};
 pub mod domain;
 pub use domain::*;
 
-/// Which agent CLI a harness drives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentKind {
-    Codex,
-    ClaudeCode,
-    Antigravity,
-}
+pub mod provider;
+pub use provider::*;
 
 /// One normalized event from an agent turn. Harnesses translate their
 /// provider's wire format into these at the edge; nothing above the harness
@@ -58,6 +52,22 @@ pub enum AgentEvent {
     AuthRequired {
         message: String,
         url: Option<String>,
+    },
+    /// The provider's own id for the current turn (Codex turn id, Claude
+    /// assistant message uuid at the end of the turn). Native fork and
+    /// rollback refer to turns by it.
+    ProviderTurnId {
+        id: String,
+    },
+    /// The agent's current plan / todo list for this turn (replaces the
+    /// previous one).
+    Plan {
+        steps: Vec<PlanStep>,
+    },
+    /// Models the provider offers (from its own handshake, never a list
+    /// compiled into Blongo).
+    Models {
+        models: Vec<ModelInfo>,
     },
     TurnCompleted {
         status: TurnStatus,

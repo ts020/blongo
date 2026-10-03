@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 use blongo_protocol::{
-    CommandId, DomainEvent, EventKind, ItemId, ItemKind, Project, ProjectId, Run, RunId, RunStatus,
-    Thread, ThreadId, ThreadStatus, Timestamp, TurnItem,
+    CommandId, DomainEvent, EventKind, ItemId, ItemKind, PendingContext, Project, ProjectId,
+    ProviderKind, Run, RunId, RunStatus, Thread, ThreadId, ThreadStatus, Timestamp, TurnItem,
+    Worktree,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,17 @@ pub enum Effect {
         provider_request_id: String,
         approve: bool,
     },
+    /// Deliver the body of `message_id` into the running provider turn.
+    ProviderSteer {
+        thread_id: ThreadId,
+        run_id: RunId,
+        message_id: ItemId,
+    },
+    /// Roll the live provider conversation back to before `before_turn`.
+    ProviderRewind {
+        thread_id: ThreadId,
+        before_turn: String,
+    },
 }
 
 impl Effect {
@@ -61,6 +73,8 @@ impl Effect {
             Self::ProviderTurnStart { .. } => "provider_turn_start",
             Self::ProviderInterrupt { .. } => "provider_interrupt",
             Self::RuntimeRequestRespond { .. } => "runtime_request_respond",
+            Self::ProviderSteer { .. } => "provider_steer",
+            Self::ProviderRewind { .. } => "provider_rewind",
         }
     }
 
@@ -68,7 +82,9 @@ impl Effect {
         match self {
             Self::ProviderTurnStart { thread_id, .. }
             | Self::ProviderInterrupt { thread_id, .. }
-            | Self::RuntimeRequestRespond { thread_id, .. } => *thread_id,
+            | Self::RuntimeRequestRespond { thread_id, .. }
+            | Self::ProviderSteer { thread_id, .. }
+            | Self::ProviderRewind { thread_id, .. } => *thread_id,
         }
     }
 }
@@ -314,6 +330,19 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// A run by id.
+    pub fn run(&self, id: RunId) -> anyhow::Result<Option<Run>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
+                    provider_turn_id, checkpoint
+                 FROM runs WHERE id = ?1",
+            )?
+            .query_row([id.to_string()], run_row)
+            .optional()?)
+    }
+
     pub fn project(&self, id: ProjectId) -> anyhow::Result<Option<Project>> {
         Ok(self.projects()?.into_iter().find(|p| p.id == id))
     }
@@ -322,7 +351,8 @@ impl Store {
     pub fn threads(&self, include_archived: bool) -> anyhow::Result<Vec<Thread>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, project_id, title, status, archived, created_at, updated_at,
-                    provider_thread_id
+                    provider_thread_id, provider, model, worktree_path, worktree_branch,
+                    forked_from, pending_context
              FROM threads WHERE archived = 0 OR ?1
              ORDER BY updated_at DESC, id DESC",
         )?;
@@ -335,7 +365,8 @@ impl Store {
             .conn
             .prepare_cached(
                 "SELECT id, project_id, title, status, archived, created_at, updated_at,
-                        provider_thread_id
+                    provider_thread_id, provider, model, worktree_path, worktree_branch,
+                    forked_from, pending_context
                  FROM threads WHERE id = ?1",
             )?
             .query_row([id.to_string()], thread_row)
@@ -344,7 +375,8 @@ impl Store {
 
     pub fn runs(&self, thread_id: ThreadId) -> anyhow::Result<Vec<Run>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error
+            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
+                    provider_turn_id, checkpoint
              FROM runs WHERE thread_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([thread_id.to_string()], run_row)?;
@@ -354,18 +386,24 @@ impl Store {
     /// Runs not in a terminal state (across all threads).
     pub fn unfinished_runs(&self) -> anyhow::Result<Vec<Run>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error
-             FROM runs WHERE status IN ('starting', 'running', 'waiting')
+            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
+                    provider_turn_id, checkpoint
+             FROM runs WHERE status IN ('queued', 'starting', 'running', 'waiting')
              ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], run_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The thread's visible items: those of rolled-back and cancelled runs
+    /// are left out.
     pub fn items(&self, thread_id: ThreadId) -> anyhow::Result<Vec<Arc<TurnItem>>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, thread_id, run_id, ordinal, created_at, data, body
-             FROM turn_items WHERE thread_id = ?1 ORDER BY ordinal",
+            "SELECT i.id, i.thread_id, i.run_id, i.ordinal, i.created_at, i.data, i.body
+             FROM turn_items i LEFT JOIN runs r ON r.id = i.run_id
+             WHERE i.thread_id = ?1
+               AND (r.status IS NULL OR r.status NOT IN ('rolled_back', 'cancelled'))
+             ORDER BY i.ordinal",
         )?;
         let rows = stmt.query_map([thread_id.to_string()], item_row)?;
         let mut out = Vec::new();
@@ -503,8 +541,10 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
         EventKind::ThreadCreated { thread } => {
             tx.prepare_cached(
                 "INSERT INTO threads (id, project_id, title, status, archived, created_at,
-                                      updated_at, provider_thread_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                      updated_at, provider_thread_id, provider, model,
+                                      worktree_path, worktree_branch, forked_from,
+                                      pending_context)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?
             .execute(params![
                 thread.id.to_string(),
@@ -515,6 +555,12 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 thread.created_at.0,
                 thread.updated_at.0,
                 thread.provider_thread_id,
+                thread.provider.id(),
+                thread.model,
+                thread.worktree.as_ref().map(|w| &w.path),
+                thread.worktree.as_ref().map(|w| &w.branch),
+                thread.forked_from.map(|t| t.to_string()),
+                context_json(thread.pending_context.as_ref())?,
             ])?;
         }
         EventKind::ThreadRenamed { thread_id, title } => {
@@ -536,16 +582,61 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
             provider_thread_id,
         } => {
             expect_one(
-                tx.prepare_cached("UPDATE threads SET provider_thread_id = ?2 WHERE id = ?1")?
-                    .execute(params![thread_id.to_string(), provider_thread_id])?,
+                tx.prepare_cached(
+                    "UPDATE threads SET provider_thread_id = ?2, pending_context = NULL
+                     WHERE id = ?1",
+                )?
+                .execute(params![thread_id.to_string(), provider_thread_id])?,
                 "thread",
+            )?;
+        }
+        EventKind::ThreadProviderChanged {
+            thread_id,
+            provider,
+            model,
+            provider_thread_id,
+            pending_context,
+        } => {
+            expect_one(
+                tx.prepare_cached(
+                    "UPDATE threads SET provider = ?2, model = ?3, provider_thread_id = ?4,
+                                        pending_context = ?5, updated_at = ?6
+                     WHERE id = ?1",
+                )?
+                .execute(params![
+                    thread_id.to_string(),
+                    provider.id(),
+                    model,
+                    provider_thread_id,
+                    context_json(pending_context.as_ref())?,
+                    at
+                ])?,
+                "thread",
+            )?;
+        }
+        EventKind::RunProviderTurn {
+            run_id,
+            provider_turn_id,
+            ..
+        } => {
+            expect_one(
+                tx.prepare_cached("UPDATE runs SET provider_turn_id = ?2 WHERE id = ?1")?
+                    .execute(params![run_id.to_string(), provider_turn_id])?,
+                "run",
+            )?;
+        }
+        EventKind::RunCheckpointed { run_id, commit, .. } => {
+            expect_one(
+                tx.prepare_cached("UPDATE runs SET checkpoint = ?2 WHERE id = ?1")?
+                    .execute(params![run_id.to_string(), commit])?,
+                "run",
             )?;
         }
         EventKind::RunCreated { run } => {
             tx.prepare_cached(
                 "INSERT INTO runs (id, thread_id, parent_run_id, status, created_at, ended_at,
-                                   error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                   error, provider, provider_turn_id, checkpoint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 run.id.to_string(),
@@ -555,9 +646,14 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 run.created_at.0,
                 run.ended_at.map(|t| t.0),
                 run.error,
+                run.provider.id(),
+                run.provider_turn_id,
+                run.checkpoint,
             ])?;
-            if run.parent_run_id.is_none() {
-                set_thread_status(tx, run.thread_id, run.status.thread_status(), at)?;
+            if run.parent_run_id.is_none()
+                && let Some(status) = run.status.thread_status()
+            {
+                set_thread_status(tx, run.thread_id, status, at)?;
             }
         }
         EventKind::RunStatusChanged {
@@ -585,8 +681,10 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 .prepare_cached("SELECT parent_run_id FROM runs WHERE id = ?1")?
                 .query_row([run_id.to_string()], |r| r.get(0))?;
             // Invariant: only a root run moves the thread (and ends a turn).
-            if parent.is_none() {
-                set_thread_status(tx, *thread_id, status.thread_status(), at)?;
+            if parent.is_none()
+                && let Some(status) = status.thread_status()
+            {
+                set_thread_status(tx, *thread_id, status, at)?;
             }
         }
         EventKind::ItemAdded { item } => {
@@ -609,13 +707,15 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
         EventKind::ItemUpdated { item } => {
             expect_one(
                 tx.prepare_cached(
-                    "UPDATE turn_items SET kind = ?2, data = ?3, updated_at = ?4 WHERE id = ?1",
+                    "UPDATE turn_items SET kind = ?2, data = ?3, updated_at = ?4, ordinal = ?5
+                     WHERE id = ?1",
                 )?
                 .execute(params![
                     item.id.to_string(),
                     item.kind.tag(),
                     serde_json::to_string(&item.kind)?,
-                    at
+                    at,
+                    item.ordinal,
                 ])?,
                 "item",
             )?;
@@ -695,14 +795,21 @@ fn parse_thread_status(s: &str) -> ThreadStatus {
     }
 }
 
+fn context_json(context: Option<&PendingContext>) -> anyhow::Result<Option<String>> {
+    Ok(context.map(serde_json::to_string).transpose()?)
+}
+
 fn run_status_str(status: RunStatus) -> &'static str {
     match status {
+        RunStatus::Queued => "queued",
         RunStatus::Starting => "starting",
         RunStatus::Running => "running",
         RunStatus::Waiting => "waiting",
         RunStatus::Completed => "completed",
         RunStatus::Interrupted => "interrupted",
         RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::RolledBack => "rolled_back",
     }
 }
 
@@ -713,6 +820,9 @@ fn parse_run_status(s: &str) -> RunStatus {
         "waiting" => RunStatus::Waiting,
         "completed" => RunStatus::Completed,
         "interrupted" => RunStatus::Interrupted,
+        "queued" => RunStatus::Queued,
+        "cancelled" => RunStatus::Cancelled,
+        "rolled_back" => RunStatus::RolledBack,
         _ => RunStatus::Failed,
     }
 }
@@ -732,6 +842,13 @@ fn opt_uuid_col(r: &Row<'_>, ix: usize) -> rusqlite::Result<Option<blongo_protoc
 }
 
 fn thread_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
+    let worktree = match (
+        r.get::<_, Option<String>>(10)?,
+        r.get::<_, Option<String>>(11)?,
+    ) {
+        (Some(path), Some(branch)) => Some(Worktree { path, branch }),
+        _ => None,
+    };
     Ok(Thread {
         id: ThreadId(uuid_col(r, 0)?),
         project_id: ProjectId(uuid_col(r, 1)?),
@@ -741,6 +858,14 @@ fn thread_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
         created_at: Timestamp(r.get(5)?),
         updated_at: Timestamp(r.get(6)?),
         provider_thread_id: r.get(7)?,
+        provider: ProviderKind::parse(&r.get::<_, String>(8)?).unwrap_or_default(),
+        model: r.get(9)?,
+        worktree,
+        forked_from: opt_uuid_col(r, 12)?.map(ThreadId),
+        // An unreadable context degrades to a text handoff, never an error.
+        pending_context: r
+            .get::<_, Option<String>>(13)?
+            .map(|json| serde_json::from_str(&json).unwrap_or(PendingContext::Handoff)),
     })
 }
 
@@ -753,6 +878,9 @@ fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
         created_at: Timestamp(r.get(4)?),
         ended_at: r.get::<_, Option<i64>>(5)?.map(Timestamp),
         error: r.get(6)?,
+        provider: ProviderKind::parse(&r.get::<_, String>(7)?).unwrap_or_default(),
+        provider_turn_id: r.get(8)?,
+        checkpoint: r.get(9)?,
     })
 }
 

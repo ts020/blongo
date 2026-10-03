@@ -13,16 +13,7 @@ fn fixture(store: &mut Store) -> Fixture {
         path: "/tmp/demo".into(),
         created_at: Timestamp(1),
     };
-    let thread = Thread {
-        id: ThreadId::new(),
-        project_id: project.id,
-        title: "New thread".into(),
-        status: ThreadStatus::Idle,
-        archived: false,
-        created_at: Timestamp(2),
-        updated_at: Timestamp(2),
-        provider_thread_id: None,
-    };
+    let thread = Thread::new(ThreadId::new(), project.id, "New thread", Timestamp(2));
     store
         .commit(Batch {
             command_id: Some(CommandId::new()),
@@ -53,15 +44,13 @@ fn item(thread: ThreadId, run: RunId, ordinal: u32, kind: ItemKind, text: &str) 
 }
 
 fn run(thread: ThreadId) -> Run {
-    Run {
-        id: RunId::new(),
-        thread_id: thread,
-        parent_run_id: None,
-        status: RunStatus::Starting,
-        created_at: Timestamp(3),
-        ended_at: None,
-        error: None,
-    }
+    Run::new(
+        RunId::new(),
+        thread,
+        RunStatus::Starting,
+        ProviderKind::Codex,
+        Timestamp(3),
+    )
 }
 
 fn committed(outcome: CommitOutcome) -> (Vec<DomainEvent>, Vec<OutboxRow>) {
@@ -235,16 +224,7 @@ fn failed_commit_writes_nothing() {
 #[test]
 fn foreign_keys_are_enforced() {
     let mut store = Store::open_in_memory().unwrap();
-    let thread = Thread {
-        id: ThreadId::new(),
-        project_id: ProjectId::new(),
-        title: "orphan".into(),
-        status: ThreadStatus::Idle,
-        archived: false,
-        created_at: Timestamp(1),
-        updated_at: Timestamp(1),
-        provider_thread_id: None,
-    };
+    let thread = Thread::new(ThreadId::new(), ProjectId::new(), "orphan", Timestamp(1));
     assert!(
         store
             .commit(Batch::default().event(EventKind::ThreadCreated { thread }))
@@ -433,4 +413,131 @@ fn reopen_file_database_keeps_state_and_sequence() {
     assert_eq!(store.threads(false).unwrap()[0].id, thread_id);
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_and_rolled_back_runs_and_provider_changes() {
+    let mut store = Store::open_in_memory().unwrap();
+    let f = fixture(&mut store);
+    let thread_id = f.thread.id;
+    let status = |store: &Store| store.thread(thread_id).unwrap().unwrap().status;
+
+    // First run running; a second one queued behind it leaves the thread
+    // running, and cancelling a queued run does not make it idle.
+    let first = run(thread_id);
+    let first_msg = item(thread_id, first.id, 0, ItemKind::UserMessage, "one");
+    store
+        .commit(
+            Batch::default()
+                .event(EventKind::RunCreated { run: first.clone() })
+                .event(EventKind::ItemAdded {
+                    item: Arc::new(first_msg),
+                }),
+        )
+        .unwrap();
+    let mut queued = run(thread_id);
+    queued.status = RunStatus::Queued;
+    store
+        .commit(Batch::default().event(EventKind::RunCreated {
+            run: queued.clone(),
+        }))
+        .unwrap();
+    assert_eq!(status(&store), ThreadStatus::Running);
+    store
+        .commit(Batch::default().event(EventKind::RunStatusChanged {
+            thread_id,
+            run_id: queued.id,
+            status: RunStatus::Cancelled,
+            error: None,
+        }))
+        .unwrap();
+    assert_eq!(status(&store), ThreadStatus::Running);
+
+    // Provider turn id and checkpoint are recorded on the run.
+    store
+        .commit(
+            Batch::default()
+                .event(EventKind::RunCheckpointed {
+                    thread_id,
+                    run_id: first.id,
+                    commit: "abc123".into(),
+                })
+                .event(EventKind::RunProviderTurn {
+                    thread_id,
+                    run_id: first.id,
+                    provider_turn_id: "turn-1".into(),
+                })
+                .event(EventKind::RunStatusChanged {
+                    thread_id,
+                    run_id: first.id,
+                    status: RunStatus::Completed,
+                    error: None,
+                }),
+        )
+        .unwrap();
+    let stored = store.run(first.id).unwrap().unwrap();
+    assert_eq!(stored.checkpoint.as_deref(), Some("abc123"));
+    assert_eq!(stored.provider_turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(status(&store), ThreadStatus::Idle);
+    assert_eq!(store.items(thread_id).unwrap().len(), 1);
+
+    // Rolling the run back hides its items without touching the thread.
+    store
+        .commit(Batch::default().event(EventKind::RunStatusChanged {
+            thread_id,
+            run_id: first.id,
+            status: RunStatus::RolledBack,
+            error: None,
+        }))
+        .unwrap();
+    assert!(store.items(thread_id).unwrap().is_empty());
+    assert_eq!(status(&store), ThreadStatus::Idle);
+
+    // Provider switch: new provider, unbound, handoff pending; binding a
+    // provider thread clears the pending context.
+    store
+        .commit(Batch::default().event(EventKind::ThreadProviderChanged {
+            thread_id,
+            provider: ProviderKind::ClaudeCode,
+            model: Some("m".into()),
+            provider_thread_id: None,
+            pending_context: Some(PendingContext::Handoff),
+        }))
+        .unwrap();
+    let t = store.thread(thread_id).unwrap().unwrap();
+    assert_eq!(t.provider, ProviderKind::ClaudeCode);
+    assert_eq!(t.model.as_deref(), Some("m"));
+    assert_eq!(t.pending_context, Some(PendingContext::Handoff));
+    store
+        .commit(Batch::default().event(EventKind::ThreadProviderBound {
+            thread_id,
+            provider_thread_id: "sess".into(),
+        }))
+        .unwrap();
+    let t = store.thread(thread_id).unwrap().unwrap();
+    assert_eq!(t.pending_context, None);
+    assert_eq!(t.provider_thread_id.as_deref(), Some("sess"));
+}
+
+#[test]
+fn thread_fields_round_trip() {
+    let mut store = Store::open_in_memory().unwrap();
+    let f = fixture(&mut store);
+    let mut thread = Thread::new(ThreadId::new(), f.project.id, "fork", Timestamp(9));
+    thread.provider = ProviderKind::Antigravity;
+    thread.worktree = Some(Worktree {
+        path: "/tmp/wt".into(),
+        branch: "blongo/x".into(),
+    });
+    thread.forked_from = Some(f.thread.id);
+    thread.pending_context = Some(PendingContext::Fork {
+        provider_thread_id: "p".into(),
+        up_to_turn: Some("t".into()),
+    });
+    store
+        .commit(Batch::default().event(EventKind::ThreadCreated {
+            thread: thread.clone(),
+        }))
+        .unwrap();
+    assert_eq!(store.thread(thread.id).unwrap().unwrap(), thread);
 }
