@@ -18,6 +18,12 @@ jobs:
         os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
+      # Git for Windows defaults to core.autocrlf=true, which would check
+      # the fixtures out with CRLF and rewrite files in the tests' scratch
+      # repositories on checkout.
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - name: Linux GPUI dependencies
         if: runner.os == 'Linux'
@@ -29,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
   license:
     name: no GPL dependencies
