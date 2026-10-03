@@ -367,6 +367,52 @@ mod tests {
         assert_eq!(reader.next_line().await.unwrap(), None);
     }
 
+    /// The agent dies with the thread that spawned it, even when nothing
+    /// reaps it (a `kill -9`-ed Blongo).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_dies_with_its_spawning_thread() {
+        let pid = std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let config = SessionConfig::new(std::env::temp_dir());
+                let proc = spawn(Path::new("sleep"), &[OsStr::new("30")], &config, &[]).unwrap();
+                let pid = proc.pid().unwrap();
+                // Skip kill_on_drop: only the death signal may stop it.
+                std::mem::forget(proc);
+                pid
+            })
+        })
+        .join()
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit(')')
+                        .next()?
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_owned)
+                });
+            match state.as_deref() {
+                None | Some("Z") | Some("X") => break,
+                Some(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Some(s) => panic!("agent {pid} still alive (state {s})"),
+            }
+        }
+        // Reap the zombie.
+        unsafe {
+            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG);
+        }
+    }
+
     #[test]
     fn stderr_tail_is_bounded() {
         let tail = StderrTail::default();

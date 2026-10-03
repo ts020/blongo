@@ -87,11 +87,26 @@ pub(crate) struct Orchestrator {
 }
 
 pub(crate) async fn run(
-    store: Store,
     config: CoreConfig,
     mut requests: mpsc::UnboundedReceiver<Request>,
     out: mpsc::UnboundedSender<CoreEvent>,
 ) {
+    let store = match Store::open(&config.database) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "blongo-core: cannot open {}: {err:#}",
+                config.database.display()
+            );
+            let _ = out.send(CoreEvent::Failed {
+                message: format!(
+                    "Blongo could not open its database {}: {err:#}",
+                    config.database.display()
+                ),
+            });
+            return;
+        }
+    };
     // Bounded: a core busy committing back-pressures the agents' stdout
     // instead of queueing their output in memory.
     let (session_tx, mut session_rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
@@ -108,6 +123,9 @@ pub(crate) async fn run(
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");
+        core.emit(CoreEvent::Failed {
+            message: format!("Blongo could not load its data: {err:#}"),
+        });
         return;
     }
     loop {

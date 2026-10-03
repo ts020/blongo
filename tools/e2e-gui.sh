@@ -40,6 +40,16 @@ quit() {
   echo "blongo did not quit" >&2
   kill "$PID"
 }
+# PIDs of live fake-Codex processes started by this run's blongo (they
+# inherit its BLONGO_DATA_DIR).
+ours() {
+  for p in /proc/[0-9]*; do
+    grep -q fake_codex.py "$p/cmdline" 2>/dev/null &&
+      tr '\0' '\n' <"$p/environ" 2>/dev/null | grep -qx "BLONGO_DATA_DIR=$WORK/data" &&
+      echo "${p#/proc/}"
+  done
+  return 0
+}
 trap '[ -n "$PID" ] && kill "$PID" 2>/dev/null || true' EXIT
 
 echo "1. empty state, add project"
@@ -82,6 +92,14 @@ shot 12-restored-markdown
 echo "6. crash mid-turn, relaunch recovers"
 typ "loop"; xdotool key Return; sleep 1.5
 kill -9 "$PID"; wait "$PID" 2>/dev/null || true
+sleep 0.5
+left=$(ours)
+if [ -n "$left" ]; then
+  echo "FAIL: agent processes outlived blongo: $left" >&2
+  ps -o pid,ppid,cmd -p "$(echo $left | tr ' ' ,)" >&2 || true
+  exit 1
+fi
+echo "  no orphaned agent after kill -9"
 launch
 shot 13-crash-recovered
 quit

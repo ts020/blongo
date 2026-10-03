@@ -105,6 +105,8 @@ pub enum CoreEvent {
     },
     /// The command id was already processed; nothing was written again.
     CommandDuplicate { command_id: CommandId },
+    /// The core could not start (or stopped) and accepts no more commands.
+    Failed { message: String },
     /// A root run ended (also visible as an event; convenient for tools).
     RunFinished {
         thread_id: ThreadId,
@@ -194,13 +196,13 @@ impl Drop for CoreHandle {
     }
 }
 
-/// Open the store, recover from an unclean previous exit, and start the
-/// core thread. The first event on the returned channel is
-/// [`CoreEvent::Shell`].
+/// Start the core thread, which opens the store and recovers from an
+/// unclean previous exit. The first event on the returned channel is
+/// [`CoreEvent::Shell`], or [`CoreEvent::Failed`] when the data cannot be
+/// opened (the window can then say so instead of staying blank).
 pub fn spawn(
     config: CoreConfig,
 ) -> anyhow::Result<(CoreHandle, mpsc::UnboundedReceiver<CoreEvent>)> {
-    let store = Store::open(&config.database)?;
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let thread = std::thread::Builder::new()
@@ -210,7 +212,7 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            rt.block_on(orchestrator::run(store, config, req_rx, event_tx));
+            rt.block_on(orchestrator::run(config, req_rx, event_tx));
         })?;
     Ok((
         CoreHandle {

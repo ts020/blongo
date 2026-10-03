@@ -299,17 +299,13 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
@@ -361,11 +357,19 @@ impl TextInput {
     }
 
     fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
+        self.clamp(if self.selection_reversed {
             self.selected_range.start
         } else {
             self.selected_range.end
-        }
+        })
+    }
+
+    /// The selected text; the range is re-validated so a stale selection can
+    /// never slice inside a char.
+    fn selected_text(&self) -> String {
+        let start = self.clamp(self.selected_range.start);
+        let end = self.clamp(self.selected_range.end).max(start);
+        self.content[start..end].to_string()
     }
 
     /// Offset one visual row above (-1) or below (+1) the cursor.
@@ -431,37 +435,22 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        utf16_to_utf8(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-        utf16_offset
+        utf8_to_utf16(&self.content, offset)
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
 
+    /// Byte range for an IME range, ordered and on char boundaries.
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+        let start = self.offset_from_utf16(range_utf16.start);
+        let end = self.offset_from_utf16(range_utf16.end);
+        start.min(end)..start.max(end)
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -565,12 +554,16 @@ impl EntityInputHandler for TextInput {
             .unwrap_or(self.selected_range.clone());
         let range = self.clamp(range.start)..self.clamp(range.end);
         let end = self.replace(range.clone(), new_text);
+        let inserted = &self.content[range.start..end];
         self.marked_range = (!new_text.is_empty()).then_some(range.start..end);
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
-            .unwrap_or_else(|| end..end);
+        // The IME's selection is relative to the marked text, not the buffer.
+        self.selected_range = match &new_selected_range_utf16 {
+            Some(selection) => {
+                let r = marked_selection(inserted, range.start, selection);
+                self.clamp(r.start)..self.clamp(r.end)
+            }
+            None => end..end,
+        };
         self.selection_reversed = false;
         cx.notify();
     }
@@ -607,6 +600,45 @@ impl EntityInputHandler for TextInput {
         let offset = self.clamp(layout.offset(point - layout.origin));
         Some(self.offset_to_utf16(offset))
     }
+}
+
+/// Byte offset of UTF-16 offset `offset` in `text`, clamped to the end. An
+/// offset inside a surrogate pair rounds up to the end of that char, so the
+/// result is always a char boundary.
+fn utf16_to_utf8(text: &str, offset: usize) -> usize {
+    let mut utf8 = 0;
+    let mut utf16 = 0;
+    for ch in text.chars() {
+        if utf16 >= offset {
+            break;
+        }
+        utf16 += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    utf8
+}
+
+/// UTF-16 offset of byte offset `offset` in `text` (a byte inside a char
+/// counts that whole char).
+fn utf8_to_utf16(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    let mut utf8 = 0;
+    for ch in text.chars() {
+        if utf8 >= offset {
+            break;
+        }
+        utf8 += ch.len_utf8();
+        utf16 += ch.len_utf16();
+    }
+    utf16
+}
+
+/// Buffer byte range of an IME selection given in UTF-16 relative to the
+/// marked text `marked`, which starts at byte `at` of the buffer.
+fn marked_selection(marked: &str, at: usize, selection_utf16: &Range<usize>) -> Range<usize> {
+    let start = utf16_to_utf8(marked, selection_utf16.start);
+    let end = utf16_to_utf8(marked, selection_utf16.end).max(start);
+    at + start..at + end
 }
 
 struct TextElement {
@@ -920,5 +952,45 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_conversions_stay_on_char_boundaries() {
+        let text = "aにb😀c";
+        // UTF-16 units: a=1 に=1 b=1 😀=2 c=1; bytes: 1 3 1 4 1.
+        assert_eq!(utf16_to_utf8(text, 0), 0);
+        assert_eq!(utf16_to_utf8(text, 2), 4);
+        assert_eq!(utf16_to_utf8(text, 4), 5 + 4, "inside the pair rounds up");
+        assert_eq!(utf16_to_utf8(text, 99), text.len());
+        assert_eq!(utf8_to_utf16(text, 4), 2);
+        assert_eq!(utf8_to_utf16(text, 9), 5);
+        assert_eq!(utf8_to_utf16(text, 2), 2, "inside に counts the char");
+        for units in 0..10 {
+            assert!(text.is_char_boundary(utf16_to_utf8(text, units)));
+        }
+    }
+
+    #[test]
+    fn ime_selection_is_relative_to_the_marked_text() {
+        // "ab" typed, then composing "にほ" with the caret at its end (2..2
+        // in UTF-16 units of the marked text).
+        let mut buffer = String::from("ab");
+        let at = buffer.len();
+        buffer.push_str("にほ");
+        let caret = marked_selection(&buffer[at..], at, &(2..2));
+        assert_eq!(caret, 8..8);
+        assert!(buffer.is_char_boundary(caret.start));
+        // Slicing like Home/End do must not panic.
+        let _ = &buffer[..caret.start];
+        // A selection of the first composed char, and one past the end.
+        assert_eq!(marked_selection("にほ", at, &(0..1)), 2..5);
+        assert_eq!(marked_selection("にほ", at, &(5..9)), 8..8);
+        // Emoji in the composition: offset 1 is inside the pair.
+        assert_eq!(marked_selection("😀x", 0, &(1..3)), 4..5);
     }
 }

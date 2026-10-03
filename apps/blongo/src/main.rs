@@ -42,7 +42,7 @@ fn main() {
     let (core, events) = match blongo_core::spawn(config.clone()) {
         Ok(core) => core,
         Err(err) => {
-            eprintln!("blongo: cannot open {}: {err:#}", config.database.display());
+            eprintln!("blongo: cannot start the core: {err:#}");
             std::process::exit(1);
         }
     };

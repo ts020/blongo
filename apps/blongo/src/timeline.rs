@@ -34,9 +34,11 @@ enum Body {
     /// Assistant messages: block-split Markdown plus a per-frame snapshot of
     /// the live tail.
     Markdown { doc: BlockSplitter, tail: Block },
-    /// User messages and reasoning.
+    /// User messages and reasoning. `snapshot` is what renders; a finished
+    /// body shares the core's `Arc<str>` (no copy). Only while text streams
+    /// in does `live` hold the growing buffer, snapshotted once per frame.
     Plain {
-        text: String,
+        live: Option<String>,
         snapshot: SharedString,
     },
 }
@@ -58,8 +60,8 @@ impl Entry {
                 Body::Markdown { doc, tail }
             }
             ItemKind::UserMessage | ItemKind::Reasoning { .. } => Body::Plain {
-                text: item.text.to_string(),
-                snapshot: SharedString::from(item.text.to_string()),
+                live: None,
+                snapshot: SharedString::from(&item.text),
             },
             _ => Body::None,
         };
@@ -86,7 +88,9 @@ impl Entry {
     fn append(&mut self, chunk: &str) {
         match &mut self.body {
             Body::Markdown { doc, .. } => doc.push(chunk),
-            Body::Plain { text, .. } => text.push_str(chunk),
+            Body::Plain { live, snapshot } => live
+                .get_or_insert_with(|| snapshot.to_string())
+                .push_str(chunk),
             Body::None => {}
         }
     }
@@ -95,18 +99,28 @@ impl Entry {
     fn snapshot(&mut self) {
         match &mut self.body {
             Body::Markdown { doc, tail } => *tail = Block::new(doc.tail_kind(), &doc.tail),
-            Body::Plain { text, snapshot } => {
+            Body::Plain {
+                live: Some(text),
+                snapshot,
+            } => {
                 if snapshot.len() != text.len() {
                     *snapshot = SharedString::from(text.clone());
                 }
             }
+            Body::Plain { live: None, .. } => {}
             Body::None => {}
         }
     }
 
     fn finish(&mut self) {
-        if let Body::Markdown { doc, .. } = &mut self.body {
-            doc.finish();
+        match &mut self.body {
+            Body::Markdown { doc, .. } => doc.finish(),
+            Body::Plain { live, snapshot } => {
+                if let Some(text) = live.take() {
+                    *snapshot = SharedString::from(text);
+                }
+            }
+            Body::None => {}
         }
         let mut item = (*self.item).clone();
         if let ItemKind::AssistantMessage { streaming } | ItemKind::Reasoning { streaming } =

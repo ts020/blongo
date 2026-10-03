@@ -812,3 +812,18 @@ async fn recorded_resume_after_restart() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn unopenable_database_is_reported_not_silent() {
+    let dir = temp_dir("baddb");
+    // A directory where the database file should be.
+    let db = dir.join("data/blongo.sqlite");
+    std::fs::create_dir_all(&db).unwrap();
+    let (handle, mut rx) = blongo_core::spawn(CoreConfig::new(&db)).unwrap();
+    match rx.blocking_recv_timeout() {
+        CoreEvent::Failed { message } => assert!(message.contains("database"), "{message}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    handle.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}

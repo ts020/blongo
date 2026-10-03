@@ -39,10 +39,15 @@ pub struct Shell {
     project_input: Entity<TextInput>,
     adding_project: bool,
     pending_project: Option<CommandId>,
+    /// A sent message the core has not accepted yet: its text comes back
+    /// into the composer if the command is rejected.
+    pending_message: Option<(CommandId, String)>,
     /// Select this thread when its creation event arrives.
     pending_select: Option<ThreadId>,
     /// Last rejected command's reason.
     notice: Option<SharedString>,
+    /// The core stopped; shown instead of the main area.
+    fatal: Option<SharedString>,
     auto_prompt: Option<AutoPrompt>,
     /// Focus to apply on the next render (set where no window is at hand).
     pending_focus: Option<FocusHandle>,
@@ -97,8 +102,10 @@ impl Shell {
             project_input,
             adding_project: false,
             pending_project: None,
+            pending_message: None,
             pending_select: None,
             notice: None,
+            fatal: None,
             auto_prompt,
             pending_focus: None,
             focus_handle: cx.focus_handle(),
@@ -179,15 +186,31 @@ impl Shell {
                     timeline.update(cx, |t, cx| t.append(item_id, &chunk, cx));
                 }
             }
-            CoreEvent::Event(event) => self.on_domain_event(&event.kind, event.command_id, cx),
+            CoreEvent::Event(event) => {
+                if event.command_id.is_some()
+                    && self.pending_message.as_ref().map(|(id, _)| *id) == event.command_id
+                {
+                    self.pending_message = None;
+                }
+                self.on_domain_event(&event.kind, event.command_id, cx)
+            }
             CoreEvent::CommandRejected { command_id, reason } => {
                 if self.pending_project == Some(command_id) {
                     self.pending_project = None;
+                }
+                if let Some((_, text)) = self.pending_message.take_if(|(id, _)| *id == command_id)
+                    && self.composer.read(cx).text().is_empty()
+                {
+                    self.composer.update(cx, |c, cx| c.set_text(&text, cx));
                 }
                 self.notice = Some(reason.into());
                 cx.notify();
             }
             CoreEvent::CommandDuplicate { .. } => {}
+            CoreEvent::Failed { message } => {
+                self.fatal = Some(message.into());
+                cx.notify();
+            }
             CoreEvent::RunFinished { .. } => {
                 if self.auto_prompt.is_some() {
                     // tools/profile.py waits for this line.
@@ -339,13 +362,14 @@ impl Shell {
         if text.trim().is_empty() {
             return;
         }
-        self.core
-            .dispatch(CommandEnvelope::new(Command::MessageDispatch {
-                thread_id,
-                message_id: ItemId::new(),
-                run_id: RunId::new(),
-                text,
-            }));
+        let envelope = CommandEnvelope::new(Command::MessageDispatch {
+            thread_id,
+            message_id: ItemId::new(),
+            run_id: RunId::new(),
+            text: text.clone(),
+        });
+        self.pending_message = Some((envelope.command_id, text));
+        self.core.dispatch(envelope);
         self.notice = None;
         self.composer.update(cx, |c, cx| c.set_text("", cx));
         window.focus(&self.composer.focus_handle(cx), cx);
@@ -595,6 +619,19 @@ impl Shell {
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(fatal) = self.fatal.clone() {
+            return div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_8()
+                .text_sm()
+                .text_color(theme::danger())
+                .child(fatal)
+                .into_any_element();
+        }
         let Some(thread) = self.selected.and_then(|id| self.thread(id)).cloned() else {
             let hint = if self.projects.is_empty() {
                 "Add a project folder to get started (+ Project, top left)."
