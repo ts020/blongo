@@ -978,8 +978,12 @@ impl Orchestrator {
         let caps = source.provider.capabilities();
         let pending_context = match runs.last() {
             None => None,
+            // A pending rewind does not matter: the fork names the last turn
+            // it keeps, which is never a rolled back one.
             Some(last) => match (&source.provider_thread_id, &source.pending_context) {
-                (Some(pid), None) if caps.native_fork && last.provider_turn_id.is_some() => {
+                (Some(pid), None | Some(PendingContext::Rewind { .. }))
+                    if caps.native_fork && last.provider_turn_id.is_some() =>
+                {
                     Some(PendingContext::Fork {
                         provider_thread_id: pid.clone(),
                         up_to_turn: last.provider_turn_id.clone(),

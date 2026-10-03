@@ -719,6 +719,48 @@ async fn claude_rollback_resumes_at_the_kept_turn() {
 }
 
 #[tokio::test]
+async fn claude_fork_after_rollback_is_still_native() {
+    let dir = temp_dir("rollback-fork-claude");
+    let log = dir.join("claude.log");
+    let mut core = start_tweaked(&dir, |c| {
+        c.agent_env
+            .push(("FAKE_CLAUDE_LOG".into(), log.to_string_lossy().into_owned()))
+    });
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::ClaudeCode, false).await;
+    core.turn(thread.id, "echo: one").await;
+    core.turn(thread.id, "echo: two").await;
+    let runs = core.snapshot(thread.id).await.runs.clone();
+    let kept = runs[0].provider_turn_id.clone().unwrap();
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: runs[1].id,
+    });
+    core.accepted(&c).await;
+    let fork_id = ThreadId::new();
+    let c = core.dispatch(Command::ThreadFork {
+        source_thread_id: thread.id,
+        thread_id: fork_id,
+        up_to_run_id: None,
+    });
+    core.accepted(&c).await;
+    core.turn(fork_id, "echo: forked").await;
+    let argv: Vec<String> = serde_json::from_value(
+        read_log(&log)
+            .iter()
+            .rev()
+            .find(|e| e.get("argv").is_some())
+            .unwrap()["argv"]
+            .clone(),
+    )
+    .unwrap();
+    // Branches at the kept turn: the rolled back one is not in the fork.
+    assert!(argv.contains(&"--fork-session".to_owned()));
+    assert!(argv.contains(&format!("--resume-session-at={kept}")));
+    core.shutdown();
+}
+
+#[tokio::test]
 async fn rollback_is_refused_while_running() {
     let dir = temp_dir("rollback-busy");
     let mut core = start(&dir);
