@@ -4,6 +4,7 @@
 - 対象: [pingdotgg/t3code](https://github.com/pingdotgg/t3code) `8ed276c246b624631e7d39241ebfd22d8314cb68`（2026-10-02 時点の main）
 - GPUI: [zed-industries/zed](https://github.com/zed-industries/zed) `crates/gpui`（調査時点の main `badfb8d`）
 - ゴール: t3code を GPUI ネイティブアプリとして作り直し、「世界一高速で低メモリなエージェントオーケストレーター」にする
+- **全フェーズ完了（2026-10-03）**: 最終の計測とまとめは [`docs/final/report.md`](final/report.md)
 
 ---
 
