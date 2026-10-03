@@ -259,8 +259,8 @@ stream 中の CPU は Phase 1 の 112〜115% から 121〜124% に上がった�
   1.2.1 のアーカイブの中身（エントリのパス）は zeron の記述からの推定。Antigravity 固有の出力補正（t3code の `AntigravityProtocol.ts`）も、実データでは確認していない
 - ACP のリプレイは Grok エージェントの録音で、Antigravity の録音ではない
 - フォークと切替での文脈の引き継ぎは書き起こしで行う（上限 24k 文字、古い方から落とす）。ツールの出力は要約しか渡さない
-- アーカイブすると、未コミットの変更も未追跡ファイルもない worktree は消す（ブランチ `blongo/<id>` は残る）。変更がある worktree は残す。手で消す UI はない
-- チェックポイントと pre-rollback の ref は、スレッドをアーカイブすると消す。64 MiB を超える未追跡ファイルがある（または合計 256 MiB を超える）フォルダではチェックポイントを取らず、スレッドに通知する
+- アーカイブすると、未コミットの変更も未追跡・無視ファイルもなく、他の生きているスレッド（フォークなど）が使っていない worktree は消す（ブランチ `blongo/<id>` は残る）。それ以外は残し、理由を通知する。手で消す UI はない
+- チェックポイントの ref は、スレッドをアーカイブすると消す（フォークのコピーした Run がまだ使う ref は残す）。pre-rollback の ref は消さない（`git update-ref -d` で手で消す）。64 MiB を超える未追跡ファイルがある（または合計 256 MiB を超える）フォルダではチェックポイントを取らず、スレッドに通知する
 - ロールバックは「その Run 以降をすべて」で、途中の1ターンだけを外すことはできない。そのスレッドか、同じフォルダの他のスレッドが実行中なら拒否する
 - ロールバックのやり直し（redo）の UI はない。置き換えたファイルは `refs/blongo/pre-rollback/<thread>/<run>` にあり、通知に出す `git restore` で戻す
 - ターミナル:
@@ -344,4 +344,17 @@ stream 中の CPU の約 6 割は、この環境のソフトウェアラスタ�
 - `cargo fmt --check`: 差分なし
 - `cargo deny check licenses`: licenses ok（依存の追加はなく、rusqlite の `backup` 機能を有効にしただけ）
 - GUI e2e（release）: 全15場面が通過。ロールバック（場面9、確認と pre-rollback の ref をスクリプトで検査）、steer（場面8）、ターミナル（場面14）を含む。スクリーンショットは29枚に更新した（18b を追加）
+
+### 5.5 再レビューの対応
+
+| # | 指摘 | 対応 | テスト |
+|---|---|---|---|
+| 1（ブロッキング） | アーカイブで、無視ファイル（`.env` など）ごと worktree を消す。フォークが使っている worktree も消す | `git status --porcelain --ignored` が空のときだけ消す。他の生きているスレッドの作業フォルダ（正規化）が worktree の中にあれば消さない。消さなかったときは `CoreEvent::Notice` で理由を出す（UI は通知欄に表示） | `archive_keeps_a_worktree_with_ignored_files`、`archive_keeps_a_worktree_a_fork_still_uses_and_its_checkpoints`、`worktrees_with_ignored_files_are_kept` |
+| 2 | アーカイブで、pre-rollback の ref と、フォークが参照するチェックポイントの ref を消す | 生きているスレッドの Run が参照するコミットの ref は残す（後でフォークもアーカイブしたときに、先にアーカイブしたスレッドの分も掃除する）。pre-rollback の ref は消さない | `thread_refs_still_used_are_kept`、上のフォークのテスト、`rollback_keeps_the_replaced_files` |
+| 3 | `git write-tree` が実際のインデックスを書き換える | インデックスを一時ファイルにコピーし、`GIT_INDEX_FILE` でそれを使う | `capture_leaves_the_users_index_file_alone` |
+| 4 | 復元の途中失敗や、復元後の decide / commit の失敗で、pre-rollback の ref が伝わらない | 拒否の理由に ref と `git restore` のコマンドを付ける | （失敗を起こすテストはない） |
+| 5 | セッション解放後に届いた `SteerNotDelivered` と、`steer` の送信エラーで、文が失われる | どちらもキューに戻す。重複の報告は、その文がすでに自分の Run の先頭なら無視する | `steer_that_misses_the_turn_is_queued`（既存）。解放と競合する場合のテストはない |
+| 6 | `acknowledged_sharers` が数だけ | スレッド ID の集合を送り、集合で比べる | `rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation`（別の集合では拒否） |
+
+`cargo test --workspace` は 154 件すべて通過。clippy と fmt も問題なし。GUI e2e は全15場面が通過した（ディスクの都合で debug ビルド）。
 
