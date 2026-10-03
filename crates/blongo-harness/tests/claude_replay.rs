@@ -246,6 +246,18 @@ async fn simple_text_turn() {
     );
     assert_eq!(models(&events), vec!["recorded-model"]);
     assert_eq!(turn_id(&events), "502cdf40-1af1-428c-87cb-a07cfc99dafd");
+    // The result frame's usage, cache reads and writes counted as input.
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Usage(u) => Some(*u),
+            _ => None,
+        })
+        .expect("usage reported");
+    assert_eq!(usage.input_tokens, 3 + 2338 + 9455);
+    assert_eq!(usage.cached_input_tokens, 9455);
+    assert_eq!(usage.output_tokens, 6);
+    assert!(usage.cost_micros.is_some());
     shutdown(session).await;
     replay.check_prompts();
     assert!(replay.ended(0), "{:#?}", replay.log());

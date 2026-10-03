@@ -30,6 +30,9 @@ struct Terminal {
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
     closed: Arc<AtomicBool>,
+    /// Write end of the reader's wake pipe: closing it stops the reader at
+    /// once (it blocks in `poll` without a timeout).
+    wake: Option<OwnedFd>,
 }
 
 #[derive(Default)]
@@ -73,8 +76,9 @@ impl Terminals {
         cmd.env("COLORTERM", "truecolor");
         let child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);
-        // Our own duplicate of the master, polled with a timeout so the
-        // reader stops on close even if a background job keeps the PTY open.
+        // Our own duplicate of the master, polled together with a wake pipe
+        // so the reader stops on close even if a background job keeps the
+        // PTY open, without waking up periodically.
         let fd = pty
             .master
             .as_raw_fd()
@@ -84,6 +88,7 @@ impl Terminals {
             return Err(std::io::Error::last_os_error().into());
         }
         let mut reader = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(dup) });
+        let (wake_read, wake_write) = pipe()?;
         let mut pty_writer = pty.master.take_writer()?;
         // Bounded: a shell that stops reading its input cannot make the
         // server buffer a client's keystrokes without limit.
@@ -111,8 +116,8 @@ impl Terminals {
                     if stop.load(Ordering::Relaxed) || !outbox.wait_room_blocking() {
                         return;
                     }
-                    if !readable(&reader) {
-                        continue;
+                    if !readable(&reader, &wake_read) {
+                        break;
                     }
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
@@ -135,16 +140,19 @@ impl Terminals {
                 master: pty.master,
                 child: Some(child),
                 closed,
+                wake: Some(wake_write),
             },
         );
         Ok(())
     }
 
     /// Queue input for the shell. When the shell has not read the last
-    /// [`crate::conn::TERMINAL_INPUT_QUEUE`] chunks, this one is dropped.
-    pub fn input(&mut self, id: u32, data: Vec<u8>) {
-        if let Some(t) = self.open.get(&id) {
-            let _ = t.writer.try_send(data);
+    /// [`crate::conn::TERMINAL_INPUT_QUEUE`] chunks, this one is dropped
+    /// (`false`; the client is told). Unknown terminals ignore input.
+    pub fn input(&mut self, id: u32, data: Vec<u8>) -> bool {
+        match self.open.get(&id) {
+            Some(t) => !matches!(t.writer.try_send(data), Err(mpsc::TrySendError::Full(_))),
+            None => true,
         }
     }
 
@@ -175,6 +183,7 @@ impl Drop for Terminals {
 
 fn hang_up(mut t: Terminal) {
     t.closed.store(true, Ordering::Relaxed);
+    drop(t.wake.take());
     let Some(mut child) = t.child.take() else {
         return;
     };
@@ -200,12 +209,41 @@ fn hang_up(mut t: Terminal) {
     });
 }
 
-/// Wait up to 100 ms for the PTY to have output (or hang up).
-fn readable(file: &std::fs::File) -> bool {
-    let mut fds = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut fds, 1, 100) > 0 }
+/// A close-on-exec pipe: (read end, write end).
+fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Block until the PTY has output or hung up (`true`: read it), or the
+/// terminal was closed (`false`: the wake pipe's write end is gone).
+fn readable(file: &std::fs::File, wake: &OwnedFd) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if fds[1].revents != 0 {
+            return false;
+        }
+        return fds[0].revents != 0;
+    }
 }

@@ -1083,3 +1083,68 @@ async fn a_link_lost_before_the_shell_starts_fresh() {
     }
     server.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queries_over_the_wire_and_agents_use_the_real_mcp_bridge() {
+    use blongo_protocol::workspace::{Query, QueryReply};
+    let dir = temp_dir("mcp");
+    std::fs::write(dir.join("project/hello_world.txt"), "hi\n").unwrap();
+    let mut config = config(&dir);
+    // Agents start this very binary as their MCP bridge.
+    config.core.mcp_bridge = Some((
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_blongo-serve")),
+        vec!["mcp-bridge".into()],
+    ));
+    let server = blongo_server::start(config).unwrap();
+    let env = pair(&dir, &ws_target(server.addr.unwrap())).await;
+    let (backend, mut rx) = connect_on(&rt(), env, fast_options());
+    wait_connected(&mut rx).await;
+    wait_for(&mut rx, |e| matches!(e, CoreEvent::Shell(_)).then_some(())).await;
+    let thread_id = project_and_thread(&backend, &mut rx, &dir).await;
+
+    // A workspace query answered to this connection.
+    backend.query(
+        7,
+        Query::SearchFiles {
+            thread_id,
+            pattern: "hellow".into(),
+            limit: 5,
+        },
+    );
+    let reply = wait_for(&mut rx, |e| match e {
+        CoreEvent::Reply { id: 7, result } => Some(result.clone()),
+        _ => None,
+    })
+    .await;
+    let Ok(QueryReply::Files(hits)) = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(hits[0].path, "hello_world.txt");
+
+    // The agent delegates through `blongo-serve mcp-bridge`.
+    send(
+        &backend,
+        thread_id,
+        "mcp: delegate_task {\"prompt\": \"echo: from the child\"}",
+    );
+    let mut text = String::new();
+    let mut finished = 0;
+    wait_for(&mut rx, |e| match e {
+        CoreEvent::TextDelta { chunk, .. } => {
+            text.push_str(chunk);
+            None
+        }
+        CoreEvent::RunFinished { thread_id: t, .. } if *t == thread_id => Some(()),
+        CoreEvent::RunFinished { .. } => {
+            finished += 1;
+            None
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(finished, 1, "the child ran");
+    assert!(text.contains("echo: from the child"), "{text}");
+    assert!(!text.starts_with("ERROR"), "{text}");
+    drop(backend);
+    server.stop();
+}

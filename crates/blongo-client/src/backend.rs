@@ -6,7 +6,8 @@
 
 use std::path::PathBuf;
 
-use blongo_protocol::client::CoreEvent;
+use blongo_protocol::client::{CoreEvent, CoreSettings};
+use blongo_protocol::workspace::{Query, QueryId};
 use blongo_protocol::{CommandEnvelope, ProviderKind, ThreadId};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -31,6 +32,14 @@ pub trait Backend: Send + Sync + 'static {
     fn terminal_input(&self, _id: u32, _data: Vec<u8>) {}
     fn terminal_resize(&self, _id: u32, _columns: u16, _lines: u16) {}
     fn terminal_close(&self, _id: u32) {}
+
+    /// A workspace query (diffs, files, git); answered once with
+    /// [`CoreEvent::Reply`] carrying the same id.
+    fn query(&self, id: QueryId, query: Query);
+
+    /// Apply the settings screen's core settings (local core only; a
+    /// server keeps its own).
+    fn configure(&self, _settings: CoreSettings) {}
 }
 
 #[cfg(feature = "local")]
@@ -71,6 +80,14 @@ mod local {
 
         fn is_remote(&self) -> bool {
             false
+        }
+
+        fn query(&self, id: QueryId, query: Query) {
+            self.0.query(id, query);
+        }
+
+        fn configure(&self, settings: CoreSettings) {
+            self.0.configure(settings);
         }
     }
 }

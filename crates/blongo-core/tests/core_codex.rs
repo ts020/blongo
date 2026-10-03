@@ -342,6 +342,7 @@ async fn invalid_commands_are_rejected() {
         thread_id: ThreadId::new(),
         project_id: ProjectId::new(),
         title: String::new(),
+        parent_thread_id: None,
     });
     assert!(core.rejected(&c).await.contains("unknown project"));
 

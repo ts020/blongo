@@ -59,6 +59,7 @@ pub struct Outbox {
     state: Mutex<State>,
     wake: Notify,
     room: Notify,
+    room_blocking: std::sync::Condvar,
     closed: AtomicBool,
     closed_notify: Notify,
     limits: OutboxLimits,
@@ -86,6 +87,7 @@ impl Outbox {
             }),
             wake: Notify::new(),
             room: Notify::new(),
+            room_blocking: std::sync::Condvar::new(),
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
             limits,
@@ -100,6 +102,7 @@ impl Outbox {
         self.closed.store(true, Ordering::Release);
         self.wake.notify_one();
         self.room.notify_waiters();
+        self.room_blocking.notify_all();
         self.closed_notify.notify_waiters();
     }
 
@@ -228,16 +231,23 @@ impl Outbox {
         }
     }
 
-    /// Blocking form of [`Self::wait_room`] for reader threads.
+    /// Blocking form of [`Self::wait_room`] for reader threads: sleeps on
+    /// a condition variable the writer signals as it drains (with a
+    /// timeout so a close is noticed too).
     pub fn wait_room_blocking(&self) -> bool {
+        let mut st = self.state.lock().expect("outbox");
         loop {
             if self.is_closed() {
                 return false;
             }
-            if self.bytes() < self.limits.max_bytes / 2 {
+            if st.bytes < self.limits.max_bytes / 2 {
                 return true;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            st = self
+                .room_blocking
+                .wait_timeout(st, std::time::Duration::from_millis(100))
+                .expect("outbox")
+                .0;
         }
     }
 
@@ -279,6 +289,7 @@ impl Outbox {
                     }
                     drop(st);
                     self.room.notify_waiters();
+                    self.room_blocking.notify_all();
                     return Some(out);
                 }
             }

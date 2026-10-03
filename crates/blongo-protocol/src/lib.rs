@@ -80,6 +80,9 @@ pub enum AgentEvent {
     Models {
         models: Vec<ModelInfo>,
     },
+    /// Token usage of the current turn so far (replaces earlier reports
+    /// of the same turn).
+    Usage(Usage),
     TurnCompleted {
         status: TurnStatus,
     },

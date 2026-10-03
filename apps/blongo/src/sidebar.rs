@@ -561,5 +561,6 @@ fn provider_initial(thread: &Thread) -> &'static str {
         blongo_protocol::ProviderKind::Codex => "Cx",
         blongo_protocol::ProviderKind::ClaudeCode => "Cl",
         blongo_protocol::ProviderKind::Antigravity => "Ag",
+        blongo_protocol::ProviderKind::Acp => "Ac",
     }
 }

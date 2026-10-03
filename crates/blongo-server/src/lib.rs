@@ -526,15 +526,11 @@ async fn bind_unix(path: &Path) -> Result<UnixListener, String> {
             path.display()
         ));
     }
-    // Created owner-only from the start (no window with looser modes).
-    #[cfg(unix)]
-    let old_mask = unsafe { libc::umask(0o177) };
-    let bound = UnixListener::bind(path);
-    #[cfg(unix)]
-    unsafe {
-        libc::umask(old_mask);
-    }
-    let listener = bound.map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
+    // The folder is private (0700), so nobody else can reach the socket
+    // even before the chmod below. No process-wide umask change: it would
+    // also apply to files other threads create meanwhile.
+    let listener = UnixListener::bind(path)
+        .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

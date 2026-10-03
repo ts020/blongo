@@ -57,7 +57,7 @@ pub struct AcpAgent {
     pub executable_name: &'static str,
     /// Extra candidate locations checked before PATH (managed installs).
     pub extra_paths: Vec<PathBuf>,
-    pub args: Vec<&'static str>,
+    pub args: Vec<String>,
     pub env: Vec<(&'static str, &'static str)>,
     pub env_remove: Vec<&'static str>,
     /// `authenticate` method to call eagerly when the agent advertises it.
@@ -102,7 +102,7 @@ pub fn antigravity() -> AcpAgent {
             if !ipv6_available() {
                 args.push("--enforce_kernel_ipv6_support=false");
             }
-            args
+            args.into_iter().map(String::from).collect()
         } else {
             Vec::new()
         },
@@ -128,6 +128,31 @@ pub fn antigravity() -> AcpAgent {
         auth_url_prefix: Some(ANTIGRAVITY_AUTH_PREFIX),
         sanitize_updates: true,
         setup_timeout: Duration::from_secs(120),
+        kill_grace: Duration::from_secs(3),
+        resume_session: None,
+    }
+}
+
+/// Env var naming a generic ACP agent's executable.
+pub const ACP_EXECUTABLE_ENV: &str = "BLONGO_ACP_EXECUTABLE";
+
+/// Any other agent speaking ACP over stdio (Grok, OpenCode's `acp`
+/// subcommand, ...): its executable comes from the session config (or
+/// [`ACP_EXECUTABLE_ENV`]), with `args`. No Antigravity-specific fixes, no
+/// eager sign-in.
+pub fn generic(args: Vec<String>) -> AcpAgent {
+    AcpAgent {
+        display_name: "The ACP agent",
+        executable_env: ACP_EXECUTABLE_ENV,
+        executable_name: "acp-agent",
+        extra_paths: Vec::new(),
+        args,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        auth_method: None,
+        auth_url_prefix: None,
+        sanitize_updates: false,
+        setup_timeout: Duration::from_secs(60),
         kill_grace: Duration::from_secs(3),
         resume_session: None,
     }
@@ -541,6 +566,10 @@ fn option_id(option: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn mcp_servers(config: &SessionConfig) -> Value {
+    Value::Array(config.mcp.iter().map(|m| m.acp_json()).collect())
+}
+
 /// Map one (sanitized) `session/update` to events.
 pub(crate) fn map_update(update: &Value, out: &mut Vec<AgentEvent>) {
     let kind = update
@@ -588,6 +617,23 @@ pub(crate) fn map_update(update: &Value, out: &mut Vec<AgentEvent>) {
             tool_result(update, call_id, out);
         }
         "tool_call_update" => tool_result(update, str_of(update, "toolCallId"), out),
+        // ACP's (unstable) usage report: context tokens used and, when the
+        // agent knows it, the cost so far.
+        "usage_update" => {
+            let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
+            let cost = update
+                .pointer("/cost/amount")
+                .and_then(Value::as_f64)
+                .filter(|_| {
+                    update.pointer("/cost/currency").and_then(Value::as_str) == Some("USD")
+                });
+            out.push(AgentEvent::Usage(blongo_protocol::Usage {
+                input_tokens: used,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cost_micros: cost.map(|usd| (usd * 1e6).round() as u64),
+            }));
+        }
         "plan" => {
             let steps = update
                 .get("entries")
@@ -820,7 +866,7 @@ async fn setup(
                 json!({
                     "sessionId": resume,
                     "cwd": config.cwd.to_string_lossy(),
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers(config),
                 }),
                 timeout,
             )
@@ -836,7 +882,7 @@ async fn setup(
     let session = peer
         .call(
             "session/new",
-            json!({ "cwd": config.cwd.to_string_lossy(), "mcpServers": [] }),
+            json!({ "cwd": config.cwd.to_string_lossy(), "mcpServers": mcp_servers(config) }),
             timeout,
         )
         .await;

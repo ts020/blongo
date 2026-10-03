@@ -179,6 +179,7 @@ impl TestCore {
             provider: ProviderKind::Codex,
             model: None,
             worktree: false,
+            parent_thread_id: None,
         });
         self.until(|e| match e {
             CoreEvent::Event(ev) => match &ev.kind {

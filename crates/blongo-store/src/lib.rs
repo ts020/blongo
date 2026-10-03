@@ -23,10 +23,10 @@ use std::sync::Arc;
 use anyhow::{Context as _, bail};
 use blongo_protocol::{
     CommandId, DomainEvent, EventKind, ItemId, ItemKind, PendingContext, Project, ProjectId,
-    ProviderKind, Run, RunId, RunStatus, Thread, ThreadId, ThreadStatus, Timestamp, TurnItem,
-    Worktree,
+    ProviderKind, Run, RunId, RunStatus, Schedule, ScheduleId, Thread, ThreadId, ThreadStatus,
+    Timestamp, TurnItem, Worktree,
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 mod migrations;
@@ -182,6 +182,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // A second connection (the off-loop t3code import) may hold the
+        // write lock for a moment: wait instead of failing.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // Small page cache: the working set is a few open threads.
         conn.pragma_update(None, "cache_size", -1024)?;
         conn.set_prepared_statement_cache_capacity(32);
@@ -212,8 +215,16 @@ impl Store {
             return Ok(CommitOutcome::Duplicate(receipt));
         }
         let at = Timestamp::now();
-        let tx = self.conn.transaction()?;
-        let mut sequence = self.last_sequence;
+        // IMMEDIATE takes the write lock first, so the sequence read below
+        // cannot race another connection's commit (the t3code import runs
+        // on its own connection, off the core loop).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: i64 = tx
+            .prepare_cached("SELECT COALESCE(MAX(sequence), 0) FROM events")?
+            .query_row([], |r| r.get(0))?;
+        let mut sequence = self.last_sequence.max(stored as u64);
         let mut events = Vec::with_capacity(batch.events.len());
         for kind in batch.events {
             sequence += 1;
@@ -336,7 +347,7 @@ impl Store {
             .conn
             .prepare_cached(
                 "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
-                    provider_turn_id, checkpoint
+                    provider_turn_id, checkpoint, usage
                  FROM runs WHERE id = ?1",
             )?
             .query_row([id.to_string()], run_row)
@@ -352,7 +363,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, project_id, title, status, archived, created_at, updated_at,
                     provider_thread_id, provider, model, worktree_path, worktree_branch,
-                    forked_from, pending_context
+                    forked_from, pending_context, parent_thread_id
              FROM threads WHERE archived = 0 OR ?1
              ORDER BY updated_at DESC, id DESC",
         )?;
@@ -366,7 +377,7 @@ impl Store {
             .prepare_cached(
                 "SELECT id, project_id, title, status, archived, created_at, updated_at,
                     provider_thread_id, provider, model, worktree_path, worktree_branch,
-                    forked_from, pending_context
+                    forked_from, pending_context, parent_thread_id
                  FROM threads WHERE id = ?1",
             )?
             .query_row([id.to_string()], thread_row)
@@ -376,7 +387,7 @@ impl Store {
     pub fn runs(&self, thread_id: ThreadId) -> anyhow::Result<Vec<Run>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
-                    provider_turn_id, checkpoint
+                    provider_turn_id, checkpoint, usage
              FROM runs WHERE thread_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([thread_id.to_string()], run_row)?;
@@ -387,7 +398,7 @@ impl Store {
     pub fn unfinished_runs(&self) -> anyhow::Result<Vec<Run>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error, provider,
-                    provider_turn_id, checkpoint
+                    provider_turn_id, checkpoint, usage
              FROM runs WHERE status IN ('queued', 'starting', 'running', 'waiting')
              ORDER BY created_at, id",
         )?;
@@ -463,6 +474,42 @@ impl Store {
             .prepare_cached("SELECT MAX(ordinal) FROM turn_items WHERE thread_id = ?1")?
             .query_row([thread_id.to_string()], |r| r.get(0))?;
         Ok(max.map_or(0, |m| m as u32 + 1))
+    }
+
+    /// Every schedule, oldest first.
+    pub fn schedules(&self) -> anyhow::Result<Vec<Schedule>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, project_id, thread_id, cron, prompt, provider, enabled, created_at,
+                    next_run_at, last_run_at, last_thread_id
+             FROM schedules ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Schedule {
+                id: ScheduleId(uuid_col(r, 0)?),
+                project_id: ProjectId(uuid_col(r, 1)?),
+                thread_id: opt_uuid_col(r, 2)?.map(ThreadId),
+                cron: r.get(3)?,
+                prompt: r.get(4)?,
+                provider: ProviderKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                enabled: r.get(6)?,
+                created_at: Timestamp(r.get(7)?),
+                next_run_at: r.get::<_, Option<i64>>(8)?.map(Timestamp),
+                last_run_at: r.get::<_, Option<i64>>(9)?.map(Timestamp),
+                last_thread_id: opt_uuid_col(r, 10)?.map(ThreadId),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Re-read the newest sequence (after another connection committed).
+    pub fn refresh_last_sequence(&mut self) -> anyhow::Result<u64> {
+        let stored: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |r| {
+                    r.get(0)
+                })?;
+        self.last_sequence = self.last_sequence.max(stored as u64);
+        Ok(self.last_sequence)
     }
 
     pub fn pending_effects(&self) -> anyhow::Result<Vec<OutboxRow>> {
@@ -543,8 +590,8 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 "INSERT INTO threads (id, project_id, title, status, archived, created_at,
                                       updated_at, provider_thread_id, provider, model,
                                       worktree_path, worktree_branch, forked_from,
-                                      pending_context)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                      pending_context, parent_thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?
             .execute(params![
                 thread.id.to_string(),
@@ -561,6 +608,7 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 thread.worktree.as_ref().map(|w| &w.branch),
                 thread.forked_from.map(|t| t.to_string()),
                 context_json(thread.pending_context.as_ref())?,
+                thread.parent_thread_id.map(|t| t.to_string()),
             ])?;
         }
         EventKind::ThreadRenamed { thread_id, title } => {
@@ -635,8 +683,8 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
         EventKind::RunCreated { run } => {
             tx.prepare_cached(
                 "INSERT INTO runs (id, thread_id, parent_run_id, status, created_at, ended_at,
-                                   error, provider, provider_turn_id, checkpoint)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                   error, provider, provider_turn_id, checkpoint, usage)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(params![
                 run.id.to_string(),
@@ -649,6 +697,7 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 run.provider.id(),
                 run.provider_turn_id,
                 run.checkpoint,
+                run.usage.as_ref().map(serde_json::to_string).transpose()?,
             ])?;
             if run.parent_run_id.is_none()
                 && let Some(status) = run.status.thread_status()
@@ -728,6 +777,45 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 )?
                 .execute(params![item_id.to_string(), &**chunk, at])?,
                 "item",
+            )?;
+        }
+        EventKind::RunUsage { run_id, usage, .. } => {
+            expect_one(
+                tx.prepare_cached("UPDATE runs SET usage = ?2 WHERE id = ?1")?
+                    .execute(params![run_id.to_string(), serde_json::to_string(usage)?])?,
+                "run",
+            )?;
+        }
+        EventKind::ScheduleCreated { schedule } | EventKind::ScheduleUpdated { schedule } => {
+            tx.prepare_cached(
+                "INSERT INTO schedules (id, project_id, thread_id, cron, prompt, provider, enabled,
+                                        created_at, next_run_at, last_run_at, last_thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT (id) DO UPDATE SET
+                     thread_id = excluded.thread_id, cron = excluded.cron,
+                     prompt = excluded.prompt, provider = excluded.provider,
+                     enabled = excluded.enabled, next_run_at = excluded.next_run_at,
+                     last_run_at = excluded.last_run_at, last_thread_id = excluded.last_thread_id",
+            )?
+            .execute(params![
+                schedule.id.to_string(),
+                schedule.project_id.to_string(),
+                schedule.thread_id.map(|t| t.to_string()),
+                schedule.cron,
+                schedule.prompt,
+                schedule.provider.id(),
+                schedule.enabled,
+                schedule.created_at.0,
+                schedule.next_run_at.map(|t| t.0),
+                schedule.last_run_at.map(|t| t.0),
+                schedule.last_thread_id.map(|t| t.to_string()),
+            ])?;
+        }
+        EventKind::ScheduleDeleted { schedule_id } => {
+            expect_one(
+                tx.prepare_cached("DELETE FROM schedules WHERE id = ?1")?
+                    .execute([schedule_id.to_string()])?,
+                "schedule",
             )?;
         }
         EventKind::ItemFinished { item_id, .. } => {
@@ -867,6 +955,7 @@ fn thread_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
         pending_context: r
             .get::<_, Option<String>>(13)?
             .map(|json| serde_json::from_str(&json).unwrap_or(PendingContext::Handoff)),
+        parent_thread_id: opt_uuid_col(r, 14)?.map(ThreadId),
     })
 }
 
@@ -882,6 +971,9 @@ fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
         provider: ProviderKind::parse(&r.get::<_, String>(7)?).unwrap_or_default(),
         provider_turn_id: r.get(8)?,
         checkpoint: r.get(9)?,
+        usage: r
+            .get::<_, Option<String>>(10)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 

@@ -66,6 +66,10 @@ id_type!(
     /// Client-generated id that makes a command idempotent.
     CommandId
 );
+id_type!(
+    /// A scheduled (recurring) task.
+    ScheduleId
+);
 
 /// Milliseconds since the Unix epoch.
 #[derive(
@@ -128,6 +132,9 @@ pub struct Thread {
     pub worktree: Option<Worktree>,
     #[serde(default)]
     pub forked_from: Option<ThreadId>,
+    /// The thread that delegated this one (an agent's `delegate_task`).
+    #[serde(default)]
+    pub parent_thread_id: Option<ThreadId>,
     /// How the provider gets this thread's context at its next session,
     /// when it does not simply continue `provider_thread_id`.
     #[serde(default)]
@@ -155,6 +162,7 @@ impl Thread {
             model: None,
             worktree: None,
             forked_from: None,
+            parent_thread_id: None,
             pending_context: None,
         }
     }
@@ -255,6 +263,7 @@ impl Run {
             provider,
             provider_turn_id: None,
             checkpoint: None,
+            usage: None,
         }
     }
 }
@@ -279,6 +288,59 @@ pub struct Run {
     /// just before this run started; rollback restores it.
     #[serde(default)]
     pub checkpoint: Option<String>,
+    /// Tokens (and cost) the provider reported for this turn.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// What a turn cost, as the provider reported it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Part of `input_tokens` served from the provider's cache.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    /// Cost in millionths of a US dollar, when the provider reports one.
+    #[serde(default)]
+    pub cost_micros: Option<u64>,
+}
+
+impl Usage {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.cost_micros = match (self.cost_micros, other.cost_micros) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+    }
+}
+
+/// A recurring task: at every `cron` time, `prompt` is sent to
+/// `thread_id`, or to a new thread of `project_id` when there is none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: ScheduleId,
+    pub project_id: ProjectId,
+    pub thread_id: Option<ThreadId>,
+    /// Five-field cron (minute hour day-of-month month day-of-week), in
+    /// the machine's local time.
+    pub cron: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub provider: ProviderKind,
+    pub enabled: bool,
+    pub created_at: Timestamp,
+    pub next_run_at: Option<Timestamp>,
+    pub last_run_at: Option<Timestamp>,
+    /// Thread the last run went to.
+    pub last_thread_id: Option<ThreadId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -436,6 +498,9 @@ pub enum Command {
         /// project folder.
         #[serde(default)]
         worktree: bool,
+        /// The thread that delegated this one (agent-created child).
+        #[serde(default)]
+        parent_thread_id: Option<ThreadId>,
     },
     /// Copy a thread (up to and including `up_to_run_id`, default: all of
     /// it) into a new one that continues independently.
@@ -497,6 +562,30 @@ pub enum Command {
         item_id: ItemId,
         decision: ApprovalDecision,
     },
+    #[serde(rename = "schedule.create")]
+    ScheduleCreate {
+        schedule_id: ScheduleId,
+        project_id: ProjectId,
+        /// Post into this thread (`None`: a new thread per run).
+        thread_id: Option<ThreadId>,
+        cron: String,
+        prompt: String,
+        #[serde(default)]
+        provider: ProviderKind,
+    },
+    /// Change a schedule (`None` fields stay as they are).
+    #[serde(rename = "schedule.update")]
+    ScheduleUpdate {
+        schedule_id: ScheduleId,
+        enabled: Option<bool>,
+        cron: Option<String>,
+        prompt: Option<String>,
+    },
+    #[serde(rename = "schedule.delete")]
+    ScheduleDelete { schedule_id: ScheduleId },
+    /// Run a schedule now (its next time stays as it is).
+    #[serde(rename = "schedule.run_now")]
+    ScheduleRunNow { schedule_id: ScheduleId },
 }
 
 /// How a message sent while a run is active is delivered.
@@ -514,7 +603,11 @@ pub enum Delivery {
 impl Command {
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
-            Self::ProjectCreate { .. } => None,
+            Self::ProjectCreate { .. }
+            | Self::ScheduleCreate { .. }
+            | Self::ScheduleUpdate { .. }
+            | Self::ScheduleDelete { .. }
+            | Self::ScheduleRunNow { .. } => None,
             Self::ThreadCreate { thread_id, .. }
             | Self::ThreadFork { thread_id, .. }
             | Self::ThreadSetProvider { thread_id, .. }
@@ -610,12 +703,30 @@ pub enum EventKind {
         thread_id: ThreadId,
         item_id: ItemId,
     },
+    /// The provider reported the turn's token usage (replaces the previous
+    /// report of the same run).
+    #[serde(rename = "run.usage")]
+    RunUsage {
+        thread_id: ThreadId,
+        run_id: RunId,
+        usage: Usage,
+    },
+    #[serde(rename = "schedule.created")]
+    ScheduleCreated { schedule: Schedule },
+    /// Settings or run times changed (the whole schedule as it is now).
+    #[serde(rename = "schedule.updated")]
+    ScheduleUpdated { schedule: Schedule },
+    #[serde(rename = "schedule.deleted")]
+    ScheduleDeleted { schedule_id: ScheduleId },
 }
 
 impl EventKind {
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
-            Self::ProjectCreated { .. } => None,
+            Self::ProjectCreated { .. }
+            | Self::ScheduleCreated { .. }
+            | Self::ScheduleUpdated { .. }
+            | Self::ScheduleDeleted { .. } => None,
             Self::ThreadCreated { thread } => Some(thread.id),
             Self::RunCreated { run } => Some(run.thread_id),
             Self::ItemAdded { item } | Self::ItemUpdated { item } => Some(item.thread_id),
@@ -627,6 +738,7 @@ impl EventKind {
             | Self::RunCheckpointed { thread_id, .. }
             | Self::RunStatusChanged { thread_id, .. }
             | Self::ItemTextAppended { thread_id, .. }
+            | Self::RunUsage { thread_id, .. }
             | Self::ItemFinished { thread_id, .. } => Some(*thread_id),
         }
     }
@@ -648,6 +760,10 @@ impl EventKind {
             Self::ItemUpdated { .. } => "item.updated",
             Self::ItemTextAppended { .. } => "item.text_appended",
             Self::ItemFinished { .. } => "item.finished",
+            Self::RunUsage { .. } => "run.usage",
+            Self::ScheduleCreated { .. } => "schedule.created",
+            Self::ScheduleUpdated { .. } => "schedule.updated",
+            Self::ScheduleDeleted { .. } => "schedule.deleted",
         }
     }
 }
@@ -658,6 +774,8 @@ pub struct ShellSnapshot {
     pub sequence: u64,
     pub projects: Vec<Project>,
     pub threads: Vec<Thread>,
+    #[serde(default)]
+    pub schedules: Vec<Schedule>,
 }
 
 /// One thread's timeline as of `sequence`.

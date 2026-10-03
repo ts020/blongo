@@ -140,6 +140,7 @@ pub async fn project_and_thread(
         provider: Default::default(),
         model: None,
         worktree: false,
+        parent_thread_id: None,
     }));
     wait_for(rx, |e| match e {
         CoreEvent::Event(ev) => match &ev.kind {

@@ -21,13 +21,18 @@ use std::time::Duration;
 
 use blongo_harness::antigravity_install::ArchivePin;
 pub use blongo_protocol::client::{
-    ConnectionState, CoreEvent, ImportReport, InstallState, LoginState, TerminalEvent,
+    ApprovalPolicy, ConnectionState, CoreEvent, CoreSettings, ImportReport, InstallState,
+    LoginState, TerminalEvent,
 };
+use blongo_protocol::workspace::{Query, QueryId};
 use blongo_protocol::{CommandEnvelope, ProviderKind, ThreadId};
 use tokio::sync::mpsc;
 
+pub mod cron;
+pub mod mcp;
 mod orchestrator;
 pub mod t3_import;
+mod workspace;
 
 pub use blongo_store::Store;
 
@@ -61,6 +66,19 @@ pub struct CoreConfig {
     pub text_flush_interval: Duration,
     /// After an interrupt request, force-stop the agent after this long.
     pub interrupt_timeout: Duration,
+    /// Give agents Blongo's MCP server (`t3_thread_*`, `delegate_task`).
+    pub mcp: bool,
+    /// How an agent starts the MCP bridge: program and leading arguments
+    /// (the socket and token file are appended). Default: this executable
+    /// with `mcp-bridge`.
+    pub mcp_bridge: Option<(PathBuf, Vec<String>)>,
+    /// A generic ACP agent ([`ProviderKind::Acp`]): executable and its
+    /// arguments.
+    pub acp_executable: Option<PathBuf>,
+    pub acp_args: Vec<String>,
+    /// Settings at start (the app's settings file; changed later with
+    /// [`CoreClient::configure`]).
+    pub settings: CoreSettings,
 }
 
 impl CoreConfig {
@@ -83,12 +101,18 @@ impl CoreConfig {
             session_idle_timeout: Duration::from_secs(10 * 60),
             text_flush_interval: Duration::from_millis(200),
             interrupt_timeout: Duration::from_secs(10),
+            mcp: true,
+            mcp_bridge: None,
+            acp_executable: None,
+            acp_args: Vec::new(),
+            settings: CoreSettings::default(),
         }
     }
 
     /// `BLONGO_DATA_DIR` (default: the platform data dir + `blongo`),
     /// `BLONGO_CODEX_EXE`, `BLONGO_CLAUDE_EXE`, `BLONGO_ANTIGRAVITY_EXE`,
-    /// `BLONGO_SESSION_IDLE_SECS`.
+    /// `BLONGO_ACP_EXE` + `BLONGO_ACP_ARGS` (whitespace-separated),
+    /// `BLONGO_SESSION_IDLE_SECS`, `BLONGO_MCP=0` (no MCP server).
     pub fn from_env() -> Self {
         let dir = std::env::var_os("BLONGO_DATA_DIR")
             .filter(|d| !d.is_empty())
@@ -104,6 +128,11 @@ impl CoreConfig {
         config.codex_executable = exe("BLONGO_CODEX_EXE");
         config.claude_executable = exe("BLONGO_CLAUDE_EXE");
         config.antigravity_executable = exe("BLONGO_ANTIGRAVITY_EXE");
+        config.acp_executable = exe("BLONGO_ACP_EXE");
+        config.acp_args = std::env::var("BLONGO_ACP_ARGS")
+            .map(|a| a.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        config.mcp = std::env::var("BLONGO_MCP").map_or(true, |v| v != "0");
         if let Some(secs) = std::env::var("BLONGO_SESSION_IDLE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -118,6 +147,7 @@ impl CoreConfig {
             ProviderKind::Codex => self.codex_executable.as_ref(),
             ProviderKind::ClaudeCode => self.claude_executable.as_ref(),
             ProviderKind::Antigravity => self.antigravity_executable.as_ref(),
+            ProviderKind::Acp => self.acp_executable.as_ref(),
         }
     }
 }
@@ -149,6 +179,8 @@ pub(crate) enum Request {
     Login(ProviderKind),
     InstallAntigravity,
     ImportT3(PathBuf),
+    Query(QueryId, Query),
+    Configure(CoreSettings),
     Shutdown,
     /// Stop without finishing runs or flushing, like a crash (tests).
     Abort,
@@ -206,6 +238,16 @@ impl CoreClient {
     /// [`CoreEvent::Imported`]).
     pub fn import_t3(&self, source: PathBuf) {
         let _ = self.requests.send(Request::ImportT3(source));
+    }
+
+    /// A workspace query; answered with [`CoreEvent::Reply`] (same id).
+    pub fn query(&self, id: QueryId, query: Query) {
+        let _ = self.requests.send(Request::Query(id, query));
+    }
+
+    /// Apply new settings (approval policy, default models).
+    pub fn configure(&self, settings: CoreSettings) {
+        let _ = self.requests.send(Request::Configure(settings));
     }
 }
 
@@ -305,7 +347,9 @@ fn lock_database(database: &std::path::Path) -> Result<std::fs::File, String> {
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     // std opens files with O_CLOEXEC, so agents and terminals this core
-    // spawns never inherit (and keep) the lock. A core that just stopped
+    // spawns do not keep the lock: a forked child shares the open file
+    // description (and so the lock) only between fork and exec, where
+    // O_CLOEXEC closes it. A core that just stopped
     // may still be releasing it (its thread ends after `shutdown`
     // returns): retry briefly before calling it a second process.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

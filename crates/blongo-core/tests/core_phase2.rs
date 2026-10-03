@@ -77,6 +77,7 @@ impl TestCore {
             provider,
             model: None,
             worktree,
+            parent_thread_id: None,
         });
         self.until(|e| match e {
             CoreEvent::Event(ev) => match &ev.kind {
@@ -987,11 +988,7 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
         ItemKind::SystemNotice { message } if message.contains("1 other thread in this folder")
     )));
     // Archived with nothing uncommitted, its worktree goes (the branch stays).
-    let c = core.dispatch(Command::ThreadArchive {
-        thread_id: elsewhere.id,
-    });
-    core.accepted(&c).await;
-    core.snapshot(thread.id).await;
+    assert_eq!(archive(&mut core, elsewhere.id).await, None);
     assert!(!Path::new(&elsewhere.worktree.as_ref().unwrap().path).exists());
     core.shutdown();
 }
@@ -1001,7 +998,8 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
 async fn archive(core: &mut TestCore, thread_id: ThreadId) -> Option<String> {
     let c = core.dispatch(Command::ThreadArchive { thread_id });
     core.accepted(&c).await;
-    // The clean-up runs right after the commit, before the next request.
+    // The clean-up runs off the loop right after the commit; the next
+    // command waits for it.
     let probe = ThreadId::new();
     let c = core.dispatch(Command::ThreadArchive { thread_id: probe });
     let mut notice = None;
@@ -1121,6 +1119,7 @@ async fn worktree_threads_work_on_their_own_branch() {
         provider: ProviderKind::Codex,
         model: None,
         worktree: true,
+        parent_thread_id: None,
     });
     assert!(core.rejected(&c).await.contains("not in a git repository"));
     core.shutdown();

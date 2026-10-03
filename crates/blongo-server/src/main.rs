@@ -8,6 +8,7 @@
 //! blongo-serve pair [--ttl SECS] [--data-dir DIR]
 //! blongo-serve devices [--data-dir DIR]
 //! blongo-serve revoke DEVICE_ID_OR_NAME [--data-dir DIR]
+//! blongo-serve mcp-bridge SOCKET TOKEN_FILE   (started by agents: MCP tools)
 //! ```
 //!
 //! Environment: the core's (`BLONGO_DATA_DIR`, `BLONGO_CODEX_EXE`, …, see
@@ -104,6 +105,19 @@ fn core_config(args: &Args) -> CoreConfig {
 }
 
 fn main() {
+    // An agent's MCP bridge to this server's core: plain byte pump, no
+    // runtime, before anything else is set up.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("mcp-bridge") {
+        let (Some(socket), Some(token)) = (raw.get(1), raw.get(2)) else {
+            eprintln!("usage: blongo-serve mcp-bridge SOCKET TOKEN_FILE");
+            std::process::exit(2)
+        };
+        std::process::exit(blongo_core::mcp::run_bridge(
+            std::path::Path::new(socket),
+            std::path::Path::new(token),
+        ));
+    }
     let args = parse();
     let core = core_config(&args);
     let state_dir = core.data_dir.join("server");

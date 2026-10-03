@@ -411,6 +411,7 @@ impl Shell {
 
     fn on_core_event(&mut self, env: EnvId, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
+            CoreEvent::Reply { .. } => {}
             CoreEvent::Shell(shell) => {
                 let first = !self.envs[env].loaded;
                 self.envs[env].loaded = true;
@@ -655,6 +656,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match kind {
+            EventKind::RunUsage { .. }
+            | EventKind::ScheduleCreated { .. }
+            | EventKind::ScheduleUpdated { .. }
+            | EventKind::ScheduleDeleted { .. } => {}
             EventKind::ProjectCreated { project } => {
                 let ours = command_id.is_some()
                     && self.pending_project.map(|(e, id)| (e, Some(id))) == Some((env, command_id));
@@ -883,6 +888,7 @@ impl Shell {
                 provider: self.default_provider,
                 model: None,
                 worktree,
+                parent_thread_id: None,
             },
         );
         cx.notify();

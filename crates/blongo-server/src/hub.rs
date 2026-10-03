@@ -37,6 +37,12 @@ const MAX_OVERFLOWS: usize = 5;
 const OVERFLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_ROUTED_COMMANDS: usize = 4096;
 const MAX_SUBSCRIBED_THREADS: usize = 16;
+/// Queries in flight across connections (older ones are forgotten; their
+/// replies are dropped).
+const MAX_ROUTED_QUERIES: usize = 1024;
+/// Revoked devices remembered, so a connection that authenticated just
+/// before its device was revoked is refused when it joins.
+const MAX_REVOKED: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RingLimits {
@@ -57,6 +63,12 @@ pub enum HubMsg {
     Login(ProviderKind),
     InstallAntigravity,
     ImportT3(Option<String>),
+    /// A workspace query; the reply goes back to this connection only.
+    Query(
+        ConnId,
+        blongo_protocol::workspace::QueryId,
+        blongo_protocol::workspace::Query,
+    ),
     /// Where a thread works (for server-side terminals).
     Cwd(ThreadId, oneshot::Sender<Option<String>>),
     /// These devices were revoked: close their connections now.
@@ -102,6 +114,11 @@ pub struct Hub {
     thread_cwd: HashMap<ThreadId, (ProjectId, Option<String>)>,
     failed: Option<String>,
     stats: Arc<Stats>,
+    /// Core query id → (connection, the client's id).
+    queries: HashMap<u64, (ConnId, u64)>,
+    query_order: VecDeque<u64>,
+    next_query: u64,
+    revoked: VecDeque<String>,
 }
 
 impl Hub {
@@ -123,6 +140,10 @@ impl Hub {
             thread_cwd: HashMap::new(),
             failed: None,
             stats,
+            queries: HashMap::new(),
+            query_order: VecDeque::new(),
+            next_query: 0,
+            revoked: VecDeque::new(),
         }
     }
 
@@ -384,6 +405,17 @@ impl Hub {
                 self.failed = Some(message.clone());
                 self.broadcast(ServerMsg::Failed { message });
             }
+            CoreEvent::Reply { id, result } => {
+                if let Some((conn, client_id)) = self.queries.remove(&id) {
+                    self.push(
+                        conn,
+                        ServerMsg::Reply {
+                            id: client_id,
+                            result,
+                        },
+                    );
+                }
+            }
             CoreEvent::Connection(_) | CoreEvent::Terminal(_) => {}
         }
     }
@@ -412,6 +444,13 @@ impl Hub {
                 device_id,
                 issued,
             } => {
+                // Revoked between its handshake and now: never joins.
+                if device_id.as_ref().is_some_and(|d| self.revoked.contains(d)) {
+                    eprintln!("blongo-serve: connection {conn}: device revoked; closing it");
+                    outbox.push(ServerMsg::DeviceRevoked);
+                    outbox.close();
+                    return;
+                }
                 let resumed = resume.as_ref().is_some_and(|r| self.can_resume(r));
                 let device_id_for_conn = device_id.clone();
                 outbox.push(ServerMsg::Welcome(Welcome {
@@ -528,7 +567,30 @@ impl Hub {
                     .and_then(|(p, wt)| wt.clone().or_else(|| self.project_paths.get(p).cloned()));
                 let _ = reply.send(cwd);
             }
+            HubMsg::Query(conn, client_id, query) => {
+                if !self.conns.contains_key(&conn) {
+                    return;
+                }
+                self.next_query += 1;
+                let id = self.next_query;
+                self.queries.insert(id, (conn, client_id));
+                self.query_order.push_back(id);
+                while self.query_order.len() > MAX_ROUTED_QUERIES {
+                    if let Some(old) = self.query_order.pop_front() {
+                        self.queries.remove(&old);
+                    }
+                }
+                self.core.query(id, query);
+            }
             HubMsg::Revoke(devices) => {
+                for d in &devices {
+                    if !self.revoked.contains(d) {
+                        self.revoked.push_back(d.clone());
+                    }
+                }
+                while self.revoked.len() > MAX_REVOKED {
+                    self.revoked.pop_front();
+                }
                 let gone: Vec<ConnId> = self
                     .conns
                     .iter()
@@ -554,6 +616,7 @@ impl Hub {
                         .fetch_max(c.outbox.peak_bytes(), Ordering::Relaxed);
                 }
                 self.pending_shell.retain(|c| *c != conn);
+                self.queries.retain(|_, (c, _)| *c != conn);
                 for waiting in self.pending_threads.values_mut() {
                     waiting.retain(|c| *c != conn);
                 }

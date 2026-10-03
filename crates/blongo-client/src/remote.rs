@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use blongo_protocol::client::{ConnectionState, CoreEvent, TerminalEvent};
 use blongo_protocol::wire::{ClientMsg, Hello, Payload, Resume, ServerMsg};
+use blongo_protocol::workspace::{Query, QueryId};
 use blongo_protocol::{CommandEnvelope, CommandId, ProviderKind, ThreadId, ThreadSnapshot};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -54,6 +55,7 @@ enum Op {
     TerminalInput(u32, Vec<u8>),
     TerminalResize(u32, u16, u16),
     TerminalClose(u32),
+    Query(QueryId, Query),
 }
 
 /// Handle to a remote environment. Dropping every clone stops the
@@ -116,6 +118,10 @@ impl Backend for RemoteBackend {
     fn terminal_close(&self, id: u32) {
         self.send(Op::TerminalClose(id));
     }
+
+    fn query(&self, id: QueryId, query: Query) {
+        self.send(Op::Query(id, query));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +161,7 @@ pub fn connect_on(
         stream: StreamState::default(),
         pending: VecDeque::new(),
         terminals: HashMap::new(),
+        queries: HashSet::new(),
     };
     handle.spawn(supervisor.run());
     (RemoteBackend { ops: ops_tx }, events_rx)
@@ -305,6 +312,10 @@ impl StreamState {
             ServerMsg::TerminalFailed { id, message } => {
                 vec![CoreEvent::Terminal(TerminalEvent::Failed { id, message })]
             }
+            ServerMsg::TerminalInputDropped { id } => {
+                vec![CoreEvent::Terminal(TerminalEvent::InputDropped { id })]
+            }
+            ServerMsg::Reply { id, result } => vec![CoreEvent::Reply { id, result }],
             ServerMsg::Pong { .. }
             | ServerMsg::Revoked(_)
             | ServerMsg::Challenge(_)
@@ -327,6 +338,9 @@ struct Supervisor {
     pending: VecDeque<(Instant, CommandEnvelope)>,
     /// Open server-side terminals (they end with the connection).
     terminals: HashMap<u32, ThreadId>,
+    /// Queries sent and not answered (answered with an error when the
+    /// connection drops: the reply would never come).
+    queries: HashSet<QueryId>,
 }
 
 enum Outcome {
@@ -360,6 +374,12 @@ impl Supervisor {
             self.status(ConnectionState::Connecting);
             let outcome = self.run_once(&target).await;
             self.close_terminals();
+            for id in std::mem::take(&mut self.queries) {
+                self.emit(CoreEvent::Reply {
+                    id,
+                    result: Err(format!("lost the connection to {}", self.env.name)),
+                });
+            }
             match outcome {
                 Outcome::Shutdown => return,
                 Outcome::Permanent(message) => {
@@ -420,6 +440,10 @@ impl Supervisor {
                 id,
                 message: format!("{} is not connected", self.env.name),
             })),
+            Op::Query(id, _) => self.emit(CoreEvent::Reply {
+                id,
+                result: Err(format!("{} is not connected", self.env.name)),
+            }),
             Op::Login(_)
             | Op::InstallAntigravity
             | Op::ImportT3(_)
@@ -445,6 +469,9 @@ impl Supervisor {
             | ServerMsg::CommandDuplicate { command_id } = &msg
             {
                 self.acknowledge(*command_id);
+            }
+            if let ServerMsg::Reply { id, .. } = &msg {
+                self.queries.remove(id);
             }
             for event in self.stream.apply(msg) {
                 if let CoreEvent::Event(e) = &event
@@ -566,6 +593,10 @@ impl Supervisor {
                         Op::TerminalClose(id) => {
                             self.terminals.remove(&id);
                             ClientMsg::TerminalClose { id }
+                        }
+                        Op::Query(id, query) => {
+                            self.queries.insert(id);
+                            ClientMsg::Query { id, query }
                         }
                     };
                     if let Err(e) = send(&mut writer, &msg).await {

@@ -10,10 +10,41 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::workspace::{QueryId, QueryReply};
 use crate::{
     CommandId, DomainEvent, ItemId, ModelInfo, ProviderKind, RunStatus, ShellSnapshot, ThreadId,
     ThreadSnapshot,
 };
+
+/// How the core answers an agent's approval requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicy {
+    /// Ask the user every time (the default).
+    #[default]
+    Ask,
+    /// Approve every request without asking (the item still records it).
+    AutoApprove,
+}
+
+impl ApprovalPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "on-request approvals",
+            Self::AutoApprove => "auto-approve",
+        }
+    }
+}
+
+/// Settings the user can change while the core runs (the app's settings
+/// screen). Executables and data paths are fixed at start.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreSettings {
+    pub approval: ApprovalPolicy,
+    /// Model new threads of each provider start with (`None`: default).
+    #[serde(default)]
+    pub default_models: Vec<(ProviderKind, String)>,
+}
 
 /// Progress of an interactive provider sign-in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +119,10 @@ pub enum TerminalEvent {
         id: u32,
         message: String,
     },
+    /// Input was dropped: the shell is not reading it (its queue is full).
+    InputDropped {
+        id: u32,
+    },
 }
 
 /// What the core tells its client, in order.
@@ -148,4 +183,9 @@ pub enum CoreEvent {
     Connection(ConnectionState),
     /// Remote backends only: a server-side terminal.
     Terminal(TerminalEvent),
+    /// Answer to a workspace query (`Backend::query`).
+    Reply {
+        id: QueryId,
+        result: Result<QueryReply, String>,
+    },
 }

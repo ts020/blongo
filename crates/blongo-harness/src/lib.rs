@@ -55,6 +55,39 @@ pub struct SessionConfig {
     pub env_remove: Vec<OsString>,
     /// Model id, passed through as the agent spells it.
     pub model: Option<String>,
+    /// An MCP server (stdio) the agent should load for this session:
+    /// Blongo's own `t3_thread_*` / `delegate_task` tools.
+    pub mcp: Option<McpServer>,
+}
+
+/// A stdio MCP server to hand to the agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServer {
+    /// Name the agent shows (tools appear as `mcp__<name>__<tool>`).
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl McpServer {
+    /// `{"command": ..., "args": [...]}` (Codex / Claude config shape).
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "stdio",
+            "command": self.command.to_string_lossy(),
+            "args": self.args,
+        })
+    }
+
+    /// ACP `session/new` shape.
+    pub fn acp_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "command": self.command.to_string_lossy(),
+            "args": self.args,
+            "env": [],
+        })
+    }
 }
 
 impl SessionConfig {

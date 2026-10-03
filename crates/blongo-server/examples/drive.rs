@@ -58,6 +58,7 @@ fn main() {
                 provider: Default::default(),
                 model: None,
                 worktree: false,
+                parent_thread_id: None,
             },
         ] {
             backend.dispatch(CommandEnvelope::new(command));

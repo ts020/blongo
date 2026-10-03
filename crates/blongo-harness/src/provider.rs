@@ -18,6 +18,8 @@ pub struct StartOptions {
     /// Native fork or rewind to apply at start (`Handoff` is the caller's
     /// business: it changes the prompt, not the session).
     pub context: Option<PendingContext>,
+    /// Arguments of a generic ACP agent ([`ProviderKind::Acp`]).
+    pub acp_args: Vec<String>,
 }
 
 /// Spawn the agent for `kind`.
@@ -74,6 +76,11 @@ pub async fn start(
         }
         ProviderKind::Antigravity => {
             let mut agent = acp::antigravity();
+            agent.resume_session = options.resume;
+            acp::start(config, agent).await
+        }
+        ProviderKind::Acp => {
+            let mut agent = acp::generic(options.acp_args);
             agent.resume_session = options.resume;
             acp::start(config, agent).await
         }

@@ -286,6 +286,7 @@ pub async fn serve(
             ClientMsg::Login { provider } => Some(HubMsg::Login(provider)),
             ClientMsg::InstallAntigravity => Some(HubMsg::InstallAntigravity),
             ClientMsg::ImportT3 { path } => Some(HubMsg::ImportT3(path)),
+            ClientMsg::Query { id, query } => Some(HubMsg::Query(conn, id, query)),
             ClientMsg::Ping { at } => {
                 outbox.push(ServerMsg::Pong { at });
                 None
@@ -310,7 +311,11 @@ pub async fn serve(
                 None
             }
             ClientMsg::TerminalInput { id, data } => {
-                terminals.input(id, data);
+                if !terminals.input(id, data) {
+                    // The shell is not reading: say so instead of losing
+                    // keystrokes silently.
+                    outbox.push(ServerMsg::TerminalInputDropped { id });
+                }
                 None
             }
             ClientMsg::TerminalResize { id, columns, lines } => {

@@ -13,5 +13,7 @@ blongo-git.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 dirs.workspace = true
+getrandom.workspace = true
+libc.workspace = true

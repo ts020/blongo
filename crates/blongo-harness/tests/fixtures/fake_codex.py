@@ -20,6 +20,11 @@ the working directory (checkpoint tests); a prompt containing "echo:" is
 answered with the whole prompt text. `model/list`, `thread/fork` and
 `thread/revert` are answered. FAKE_CODEX_LOG appends every client frame
 (JSON per line).
+
+Phase 4: "mcp: TOOL JSON" calls one of Blongo's MCP tools through the bridge
+named in thread/start `config.mcp_servers.blongo` and streams its answer;
+"usage" reports token usage twice; "sleep N" answers after N seconds;
+FAKE_CODEX_DUMP_START appends every thread/start's params (JSON per line).
 """
 import json
 import os
@@ -80,6 +85,12 @@ def handle_setup(msg):
         respond(msg, {"account": None if signed_out else {"type": "apiKey"},
                       "requiresOpenaiAuth": True})
     elif method == "thread/start":
+        global MCP
+        MCP = ((msg["params"].get("config") or {}).get("mcp_servers") or {}).get("blongo")
+        dump = os.environ.get("FAKE_CODEX_DUMP_START")
+        if dump:
+            with open(dump, "a") as f:
+                f.write(json.dumps(msg["params"]) + "\n")
         respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
                       "model": "fake-model", "approvalPolicy": msg["params"].get("approvalPolicy")})
         notify("thread/started", {"thread": {"id": THREAD}})
@@ -280,6 +291,48 @@ def replay_turn(turn_id):
         complete(turn_id, "completed")
 
 
+MCP = None
+
+
+def mcp_turn(turn_id, text):
+    """`mcp: TOOL JSON-ARGS`: call one of Blongo's MCP tools through the
+    bridge named in thread/start (as a real agent would) and stream the
+    tool's text answer."""
+    import subprocess
+    _, rest = text.split(":", 1)
+    tool, _, args = rest.strip().partition(" ")
+    if MCP is None:
+        answer = "no MCP server configured"
+    else:
+        proc = subprocess.Popen([MCP["command"]] + MCP.get("args", []), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, text=True)
+        def call(obj):
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "fake-codex", "version": "0"}}})
+        proc.stdout.readline()
+        call({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": tool, "arguments": json.loads(args or "{}")}})
+        line = proc.stdout.readline()
+        proc.stdin.close()
+        proc.wait()
+        try:
+            result = json.loads(line)
+            if "result" in result:
+                r = result["result"]
+                answer = ("ERROR " if r.get("isError") else "") + r["content"][0]["text"]
+            else:
+                answer = "ERROR " + result["error"]["message"]
+        except Exception as e:  # noqa: BLE001
+            answer = f"bad answer {line!r}: {e}"
+    notify("item/agentMessage/delta",
+           {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": answer})
+    complete(turn_id, "completed")
+
+
 def main():
     global turn_seq
     threading.Thread(target=reader, daemon=True).start()
@@ -295,9 +348,24 @@ def main():
         respond(msg, {"turn": turn_obj(turn_id, "inProgress")})
         notify("turn/started", {"threadId": THREAD, "turn": turn_obj(turn_id, "inProgress")})
         text = msg["params"]["input"][0]["text"]
-        if "echo:" in text:
+        if text.startswith("mcp:"):
+            mcp_turn(turn_id, text)
+        elif "echo:" in text:
             notify("item/agentMessage/delta",
                    {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": text})
+            complete(turn_id, "completed")
+        elif text == "usage":
+            for n in (1, 2):
+                notify("thread/tokenUsage/updated", {"threadId": THREAD, "turnId": turn_id,
+                       "tokenUsage": {"last": {"inputTokens": 100 * n, "cachedInputTokens": 10,
+                                               "outputTokens": 7 * n}}})
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "counted"})
+            complete(turn_id, "completed")
+        elif text.startswith("sleep "):
+            interruptible_sleep(float(text.split()[1]))
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "slept"})
             complete(turn_id, "completed")
         elif text == "slow":
             loop_turn(turn_id, limit=60, delay=0.05)

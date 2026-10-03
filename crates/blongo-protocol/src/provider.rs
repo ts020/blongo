@@ -18,10 +18,14 @@ pub enum ProviderKind {
     Codex,
     ClaudeCode,
     Antigravity,
+    /// Any other agent that speaks the Agent Client Protocol (Grok,
+    /// OpenCode's ACP mode, ...), configured by command line.
+    Acp,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 3] = [Self::Codex, Self::ClaudeCode, Self::Antigravity];
+    pub const ALL: [ProviderKind; 4] =
+        [Self::Codex, Self::ClaudeCode, Self::Antigravity, Self::Acp];
 
     /// Display name.
     pub fn label(self) -> &'static str {
@@ -29,6 +33,7 @@ impl ProviderKind {
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
             Self::Antigravity => "Antigravity",
+            Self::Acp => "ACP agent",
         }
     }
 
@@ -38,6 +43,7 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Antigravity => "antigravity",
+            Self::Acp => "acp",
         }
     }
 
@@ -92,6 +98,20 @@ impl ProviderKind {
                 plans: true,
                 // OAuth through `authenticate` + a browser URL.
                 interactive_login: true,
+            },
+            // A generic ACP agent: what ACP v1 offers, sign-in with its own
+            // CLI.
+            Self::Acp => ProviderCapabilities {
+                version: CAPABILITIES_VERSION,
+                steer: SteerMode::CancelAndResend,
+                resume: true,
+                native_fork: false,
+                native_rollback: false,
+                live_rollback: false,
+                model_switch: ModelSwitch::RestartSession,
+                approval_for_session: true,
+                plans: true,
+                interactive_login: false,
             },
         }
     }

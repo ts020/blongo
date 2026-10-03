@@ -541,3 +541,119 @@ fn thread_fields_round_trip() {
         .unwrap();
     assert_eq!(store.thread(thread.id).unwrap().unwrap(), thread);
 }
+
+#[test]
+fn usage_parent_thread_and_schedules_round_trip() {
+    let mut store = Store::open_in_memory().unwrap();
+    let fx = fixture(&mut store);
+    let mut child = Thread::new(ThreadId::new(), fx.project.id, "child", Timestamp(5));
+    child.parent_thread_id = Some(fx.thread.id);
+    let r = run(child.id);
+    let usage = blongo_protocol::Usage {
+        input_tokens: 10,
+        output_tokens: 3,
+        cached_input_tokens: 2,
+        cost_micros: Some(1500),
+    };
+    let schedule = blongo_protocol::Schedule {
+        id: blongo_protocol::ScheduleId::new(),
+        project_id: fx.project.id,
+        thread_id: Some(fx.thread.id),
+        cron: "0 9 * * *".into(),
+        prompt: "check".into(),
+        provider: ProviderKind::Codex,
+        enabled: true,
+        created_at: Timestamp(6),
+        next_run_at: Some(Timestamp(7)),
+        last_run_at: None,
+        last_thread_id: None,
+    };
+    store
+        .commit(Batch {
+            command_id: None,
+            events: vec![
+                EventKind::ThreadCreated {
+                    thread: child.clone(),
+                },
+                EventKind::RunCreated { run: r.clone() },
+                EventKind::RunUsage {
+                    thread_id: child.id,
+                    run_id: r.id,
+                    usage,
+                },
+                EventKind::ScheduleCreated {
+                    schedule: schedule.clone(),
+                },
+            ],
+            effects: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        store.thread(child.id).unwrap().unwrap().parent_thread_id,
+        Some(fx.thread.id)
+    );
+    assert_eq!(store.run(r.id).unwrap().unwrap().usage, Some(usage));
+    assert_eq!(store.schedules().unwrap(), vec![schedule.clone()]);
+    let updated = blongo_protocol::Schedule {
+        enabled: false,
+        next_run_at: None,
+        last_run_at: Some(Timestamp(8)),
+        last_thread_id: Some(child.id),
+        ..schedule.clone()
+    };
+    store
+        .commit(Batch {
+            command_id: None,
+            events: vec![EventKind::ScheduleUpdated {
+                schedule: updated.clone(),
+            }],
+            effects: vec![],
+        })
+        .unwrap();
+    assert_eq!(store.schedules().unwrap(), vec![updated]);
+    store
+        .commit(Batch {
+            command_id: None,
+            events: vec![EventKind::ScheduleDeleted {
+                schedule_id: schedule.id,
+            }],
+            effects: vec![],
+        })
+        .unwrap();
+    assert!(store.schedules().unwrap().is_empty());
+}
+
+#[test]
+fn two_connections_interleave_with_increasing_sequences() {
+    let dir = std::env::temp_dir().join(format!("blongo-store-two-{}", ThreadId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.sqlite");
+    let mut a = Store::open(&path).unwrap();
+    let fx = fixture(&mut a);
+    let mut b = Store::open(&path).unwrap();
+    let mut last = 0;
+    for i in 0..10 {
+        let store = if i % 2 == 0 { &mut a } else { &mut b };
+        let (events, _) = committed(
+            store
+                .commit(Batch {
+                    command_id: None,
+                    events: vec![EventKind::ThreadRenamed {
+                        thread_id: fx.thread.id,
+                        title: format!("t{i}"),
+                    }],
+                    effects: vec![],
+                })
+                .unwrap(),
+        );
+        assert!(
+            events[0].sequence > last,
+            "{} after {last}",
+            events[0].sequence
+        );
+        last = events[0].sequence;
+    }
+    // A connection that only read learns the newest sequence.
+    assert_eq!(a.refresh_last_sequence().unwrap(), last);
+    let _ = std::fs::remove_dir_all(&dir);
+}

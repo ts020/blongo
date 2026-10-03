@@ -8,7 +8,11 @@
 //!   SHA-256 of the bearer token (the token itself is never stored).
 //! - `pairing.json`: outstanding pairing codes, hashed, with expiry. `blongo-
 //!   serve pair` adds one (even while a server runs); a successful pairing
-//!   consumes it.
+//!   consumes it. While a code is outstanding its stored hash is as good as
+//!   the code itself: the code space is small enough to search, so anyone
+//!   who can read the file can pair until the code expires or is used. The
+//!   file is owner-only (0600) for that reason; the hash only keeps the
+//!   code out of plain sight (backups, logs of file contents).
 //!
 //! Read-modify-write cycles take an exclusive lock on `auth.lock`, so the
 //! `pair` command and a running server never lose each other's writes.
@@ -207,7 +211,8 @@ impl AuthStore {
     }
 
     /// Create a one-time pairing code valid for `ttl_secs`. Only its hash
-    /// is stored; the returned text is shown once.
+    /// is stored (equivalent to the code while it is outstanding, see the
+    /// module docs); the returned text is shown once.
     pub fn add_pairing_code(&self, ttl_secs: u64) -> Result<String, AuthError> {
         // Rejection sampling: only bytes below the largest multiple of the
         // alphabet size, so every character is equally likely.

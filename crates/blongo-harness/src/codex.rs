@@ -173,6 +173,8 @@ pub(crate) struct Driver {
     options: CodexOptions,
     cwd: String,
     model: Option<String>,
+    /// Usage of the running turn (sum of its requests).
+    turn_usage: blongo_protocol::Usage,
 }
 
 impl Driver {
@@ -190,6 +192,7 @@ impl Driver {
             options,
             cwd: config.cwd.to_string_lossy().into_owned(),
             model: config.model.clone(),
+            turn_usage: Default::default(),
         }
     }
 
@@ -322,6 +325,7 @@ impl Driver {
             status
         };
         out.push(AgentEvent::TurnCompleted { status });
+        self.turn_usage = Default::default();
         self.turn_active = false;
         self.turn_id = None;
         self.interrupt_requested = false;
@@ -462,6 +466,16 @@ impl Driver {
                         .unwrap_or("Codex error")
                         .to_owned();
                     out.push(AgentEvent::Error { message });
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                // `last` is one model request; a turn is the sum of them.
+                if let Some(last) = params.pointer("/tokenUsage/last") {
+                    let n = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    self.turn_usage.input_tokens += n("inputTokens");
+                    self.turn_usage.cached_input_tokens += n("cachedInputTokens");
+                    self.turn_usage.output_tokens += n("outputTokens");
+                    out.push(AgentEvent::Usage(self.turn_usage));
                 }
             }
             "turn/completed" => {
@@ -647,6 +661,15 @@ async fn setup(
         "sandbox": options.sandbox,
         "config": { "tools.update_plan.enabled": true },
     });
+    if let Some(mcp) = &config.mcp {
+        // Per-thread config, layered over the user's config.toml (nothing
+        // on the command line).
+        let mut server = mcp.json();
+        if let Some(obj) = server.as_object_mut() {
+            obj.remove("type");
+        }
+        params["config"]["mcp_servers"] = json!({ mcp.name.clone(): server });
+    }
     if let Some(model) = &config.model {
         params["model"] = json!(model);
     }

@@ -89,6 +89,11 @@ pub fn args(config: &SessionConfig, options: &ClaudeOptions) -> Vec<String> {
         // One argument, so a value starting with `-` is never read as a flag.
         args.push(format!("--model={model}"));
     }
+    if let Some(mcp) = &config.mcp {
+        // `=`: the flag takes a list, a separate value could swallow more.
+        let servers = serde_json::json!({ "mcpServers": { mcp.name.clone(): mcp.json() } });
+        args.push(format!("--mcp-config={servers}"));
+    }
     if let Some(session) = &options.resume {
         args.push("--resume".into());
         args.push(session.clone());
@@ -116,6 +121,23 @@ pub async fn start_with(config: SessionConfig, options: ClaudeOptions) -> anyhow
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let driver = tokio::spawn(drive(proc, cmd_rx, event_tx, options));
     Ok(Session::new(event_rx, cmd_tx, pid, driver))
+}
+
+/// Token usage and cost of a `result` frame (input counts the cached and
+/// cache-creation tokens too).
+fn result_usage(frame: &Value) -> Option<blongo_protocol::Usage> {
+    let usage = frame.get("usage")?;
+    let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let cached = n("cache_read_input_tokens");
+    Some(blongo_protocol::Usage {
+        input_tokens: n("input_tokens") + n("cache_creation_input_tokens") + cached,
+        output_tokens: n("output_tokens"),
+        cached_input_tokens: cached,
+        cost_micros: frame
+            .get("total_cost_usd")
+            .and_then(Value::as_f64)
+            .map(|usd| (usd * 1e6).round() as u64),
+    })
 }
 
 /// Request id of the startup `initialize` control request.
@@ -395,6 +417,9 @@ impl Normalizer {
         if let Some(uuid) = self.last_assistant_uuid.take() {
             out.push(AgentEvent::ProviderTurnId { id: uuid });
         }
+        if let Some(usage) = result_usage(frame) {
+            out.push(AgentEvent::Usage(usage));
+        }
         let status = if std::mem::take(&mut self.interrupted) {
             TurnStatus::Interrupted
         } else if subtype == "success" && !is_error {
@@ -602,6 +627,24 @@ async fn drive(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mcp_server_goes_into_one_mcp_config_argument() {
+        let mut config = SessionConfig::new("/tmp");
+        config.mcp = Some(crate::McpServer {
+            name: "blongo".into(),
+            command: "/usr/bin/blongo".into(),
+            args: vec!["mcp-bridge".into(), "/s".into(), "/t.token".into()],
+        });
+        let args = args(&config, &ClaudeOptions::default());
+        let flag = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--mcp-config="))
+            .expect("--mcp-config");
+        let v: Value = serde_json::from_str(flag).unwrap();
+        assert_eq!(v["mcpServers"]["blongo"]["command"], "/usr/bin/blongo");
+        assert_eq!(v["mcpServers"]["blongo"]["args"][2], "/t.token");
+    }
+
     use super::*;
 
     fn run(lines: &[&str]) -> (Normalizer, Vec<AgentEvent>) {

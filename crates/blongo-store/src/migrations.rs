@@ -97,6 +97,27 @@ ALTER TABLE runs ADD COLUMN provider_turn_id TEXT;
 ALTER TABLE runs ADD COLUMN checkpoint TEXT;
 "#,
     ),
+    (
+        3,
+        r#"
+ALTER TABLE threads ADD COLUMN parent_thread_id TEXT;
+ALTER TABLE runs ADD COLUMN usage TEXT;
+
+CREATE TABLE schedules (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL REFERENCES projects (id),
+    thread_id      TEXT,
+    cron           TEXT NOT NULL,
+    prompt         TEXT NOT NULL,
+    provider       TEXT NOT NULL DEFAULT 'codex',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    created_at     INTEGER NOT NULL,
+    next_run_at    INTEGER,
+    last_run_at    INTEGER,
+    last_thread_id TEXT
+);
+"#,
+    ),
 ];
 
 pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;

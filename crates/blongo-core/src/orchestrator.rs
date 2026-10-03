@@ -11,18 +11,26 @@ use blongo_harness::{
     ApprovalDecision as HarnessDecision, Session, SessionConfig, StartOptions, acp,
     antigravity_install,
 };
+use blongo_protocol::workspace::{DiffScope, Query, QueryId, QueryReply};
 use blongo_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalState, Command, CommandEnvelope, Delivery, EventKind,
-    ItemId, ItemKind, PendingContext, PlanStep, Project, ProjectId, ProviderKind, Run, RunId,
-    RunStatus, ShellSnapshot, Thread, ThreadId, ThreadSnapshot, Timestamp, ToolStatus, TurnItem,
-    TurnStatus, Worktree,
+    AgentEvent, ApprovalDecision, ApprovalState, Command, CommandEnvelope, CommandId, Delivery,
+    EventKind, ItemId, ItemKind, PendingContext, PlanStep, Project, ProjectId, ProviderKind, Run,
+    RunId, RunStatus, Schedule, ScheduleId, ShellSnapshot, Thread, ThreadId, ThreadSnapshot,
+    Timestamp, ToolStatus, TurnItem, TurnStatus, Usage, Worktree,
 };
 use blongo_store::{Batch, CommitOutcome, Effect, EffectStatus, OutboxRow, Store};
-use serde_json::Value;
-use tokio::sync::mpsc;
+use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::{CoreConfig, CoreEvent, InstallState, LoginState, Request};
+use crate::cron::Cron;
+use crate::mcp::{self, McpCall, McpServer};
+use crate::workspace::{self, Plan};
+use crate::{
+    ApprovalPolicy, CoreConfig, CoreEvent, ImportReport, InstallState, LoginState, Request,
+};
+
+mod tools;
 
 /// Default title of a new thread; replaced by the first message.
 pub const DEFAULT_TITLE: &str = "New thread";
@@ -44,6 +52,8 @@ struct LiveSession {
     session: Session,
     generation: u64,
     provider: ProviderKind,
+    /// The session's access to Blongo's MCP server (revoked on drop).
+    _mcp: Option<mcp::Grant>,
     /// Task copying the session's events into the core loop. Aborted
     /// before the session is shut down: a forwarder blocked on a full core
     /// channel would otherwise keep the driver blocked on its own send, and
@@ -88,6 +98,7 @@ struct ActiveRun {
     /// The run's plan item (updated in place).
     plan: Option<Arc<TurnItem>>,
     provider_turn_id: Option<String>,
+    usage: Option<Usage>,
 }
 
 /// A message waiting behind the active run.
@@ -102,6 +113,114 @@ enum Post {
     Release(ThreadId),
     Enqueue(ThreadId, Queued),
     Dequeue(ThreadId, RunId),
+    /// Run a schedule now (`schedule.run_now`).
+    Fire(ScheduleId),
+}
+
+/// Who waits for a command's outcome.
+enum Reply {
+    /// A client: a refusal is a `CommandRejected`; success is the events.
+    Client,
+    /// The core itself (scheduled runs): a refusal becomes a notice.
+    Internal,
+    /// An agent's MCP tool call.
+    Mcp {
+        tx: oneshot::Sender<Result<Value, String>>,
+        then: Then,
+    },
+}
+
+/// What an MCP call does once its command committed.
+enum Then {
+    /// Answer with this.
+    Value(Value),
+    /// Answer once the thread's work is done.
+    Wait(ThreadId),
+    /// Run this command next (its reply carries the answer on).
+    Chain(Box<Pending>),
+}
+
+struct Pending {
+    command: CommandEnvelope,
+    reply: Reply,
+}
+
+impl Pending {
+    fn client(command: CommandEnvelope) -> Self {
+        Self {
+            command,
+            reply: Reply::Client,
+        }
+    }
+
+    fn new(command: Command, reply: Reply) -> Self {
+        Self {
+            command: CommandEnvelope {
+                command_id: CommandId::new(),
+                command,
+            },
+            reply,
+        }
+    }
+}
+
+/// Work waiting for its turn: everything for one thread runs in order, and
+/// nothing overtakes work that needs the whole core (`Key::Global`).
+enum Deferred {
+    Dispatch(Pending),
+    Query(QueryId, Query),
+    Import(PathBuf),
+}
+
+/// What a piece of work must have to itself while it runs off the loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Key {
+    /// Nothing (decided on the loop at once).
+    None,
+    Thread(ThreadId),
+    /// Every thread (rollback rewrites a shared folder, import rewrites
+    /// the caches, a branch switch changes a shared folder).
+    Global,
+}
+
+/// I/O a command needs before it can be decided, resolved on the loop and
+/// run as a job.
+enum PrepPlan {
+    Worktree {
+        project_path: PathBuf,
+        path: PathBuf,
+        branch: String,
+    },
+    Rollback {
+        cwd: PathBuf,
+        pre: String,
+        commit: String,
+        sharers: u32,
+    },
+}
+
+/// A job finished off the loop.
+enum JobDone {
+    Prepared {
+        pending: Pending,
+        key: Key,
+        result: Result<Prepared, String>,
+    },
+    Checkpoint {
+        thread_id: ThreadId,
+        run_id: RunId,
+        message_id: ItemId,
+        /// `Ok(None)`: not a git repository.
+        result: Result<Option<String>, String>,
+    },
+    Mutation {
+        id: QueryId,
+        key: Key,
+        result: Result<QueryReply, String>,
+    },
+    Imported(anyhow::Result<ImportReport>),
+    /// Background work that only held its key (archive clean-up).
+    Released(Key),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -140,6 +259,17 @@ pub(crate) struct Orchestrator {
     ready: Vec<ThreadId>,
     /// An Antigravity install is running (one at a time).
     installing: Arc<std::sync::atomic::AtomicBool>,
+    /// Work waiting behind a busy key, in arrival order.
+    deferred: VecDeque<Deferred>,
+    /// Threads with a job running off the loop.
+    busy: HashSet<ThreadId>,
+    /// A `Key::Global` job is running.
+    global_busy: bool,
+    jobs: mpsc::UnboundedSender<JobDone>,
+    schedules: HashMap<ScheduleId, Schedule>,
+    mcp: Option<McpServer>,
+    /// MCP calls waiting for a thread's work to end.
+    waiters: HashMap<ThreadId, Vec<oneshot::Sender<Result<Value, String>>>>,
 }
 
 pub(crate) async fn run(
@@ -167,6 +297,13 @@ pub(crate) async fn run(
     // Bounded: a core busy committing back-pressures the agents' stdout
     // instead of queueing their output in memory.
     let (session_tx, mut session_rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
+    let (jobs, mut jobs_rx) = mpsc::unbounded_channel();
+    let (mcp_tx, mut mcp_rx) = mpsc::unbounded_channel::<McpCall>();
+    let mcp = if config.mcp {
+        McpServer::start(&config.data_dir, mcp_tx)
+    } else {
+        None
+    };
     let mut core = Orchestrator {
         store,
         config,
@@ -180,6 +317,13 @@ pub(crate) async fn run(
         post: Vec::new(),
         ready: Vec::new(),
         installing: Default::default(),
+        deferred: VecDeque::new(),
+        busy: HashSet::new(),
+        global_busy: false,
+        jobs,
+        schedules: HashMap::new(),
+        mcp,
+        waiters: HashMap::new(),
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");
@@ -192,7 +336,14 @@ pub(crate) async fn run(
         let timer = core.next_timer();
         tokio::select! {
             request = requests.recv() => match request {
-                Some(Request::Dispatch(command)) => core.dispatch(command).await,
+                Some(Request::Dispatch(command)) => {
+                    core.deferred.push_back(Deferred::Dispatch(Pending::client(command)));
+                }
+                Some(Request::Query(id, query)) if query.is_mutation() => {
+                    core.deferred.push_back(Deferred::Query(id, query));
+                }
+                Some(Request::Query(id, query)) => core.query(id, query),
+                Some(Request::Configure(settings)) => core.config.settings = settings,
                 Some(Request::OpenThread(thread_id)) => core.open_thread(thread_id),
                 Some(Request::Shell) => match core.shell_snapshot() {
                     Ok(shell) => core.emit(CoreEvent::Shell(Arc::new(shell))),
@@ -200,7 +351,7 @@ pub(crate) async fn run(
                 },
                 Some(Request::Login(provider)) => core.login(provider),
                 Some(Request::InstallAntigravity) => core.install_antigravity(),
-                Some(Request::ImportT3(source)) => core.import_t3(&source),
+                Some(Request::ImportT3(source)) => core.deferred.push_back(Deferred::Import(source)),
                 Some(Request::Abort) => {
                     // No forwarder may block on a full channel now.
                     session_rx.close();
@@ -214,8 +365,11 @@ pub(crate) async fn run(
                 }
             },
             Some(msg) = session_rx.recv() => core.on_session_msg(msg).await,
+            Some(done) = jobs_rx.recv() => core.on_job_done(done).await,
+            Some(call) = mcp_rx.recv() => core.on_mcp(call),
             _ = sleep_until(timer), if timer.is_some() => core.on_timer().await,
         }
+        core.drain().await;
         core.start_queued().await;
     }
 }
@@ -234,6 +388,9 @@ impl Orchestrator {
         }
         for thread in self.store.threads(false)? {
             self.threads.insert(thread.id, thread);
+        }
+        for schedule in self.store.schedules()? {
+            self.schedules.insert(schedule.id, schedule);
         }
         let snapshot = self.shell_snapshot()?;
         let _ = self.out.send(CoreEvent::Shell(Arc::new(snapshot)));
@@ -390,15 +547,14 @@ impl Orchestrator {
                     t.status = status;
                 }
             }
+            EventKind::ScheduleCreated { schedule } | EventKind::ScheduleUpdated { schedule } => {
+                self.schedules.insert(schedule.id, schedule.clone());
+            }
+            EventKind::ScheduleDeleted { schedule_id } => {
+                self.schedules.remove(schedule_id);
+            }
             _ => {}
         }
-    }
-
-    fn reject(&self, command: &CommandEnvelope, reason: impl Into<String>) {
-        self.emit(CoreEvent::CommandRejected {
-            command_id: command.command_id,
-            reason: reason.into(),
-        });
     }
 
     fn rt(&mut self, thread_id: ThreadId) -> anyhow::Result<&mut ThreadRt> {
@@ -443,23 +599,223 @@ impl Orchestrator {
         self.rt.get_mut(&thread_id).and_then(|rt| rt.run.as_mut())
     }
 
-    // -------------------------------------------------------------- commands
+    // ------------------------------------------------------------ sequencing
 
-    async fn dispatch(&mut self, command: CommandEnvelope) {
-        match self.store.receipt(command.command_id) {
-            Ok(Some(_)) => {
-                self.emit(CoreEvent::CommandDuplicate {
-                    command_id: command.command_id,
-                });
+    /// What `item` must have to itself.
+    fn deferred_key(&self, item: &Deferred) -> Key {
+        match item {
+            Deferred::Dispatch(pending) => command_key(&pending.command.command),
+            Deferred::Query(_, Query::GitSwitch { .. }) => Key::Global,
+            Deferred::Query(_, query) => Key::Thread(query.thread_id()),
+            Deferred::Import(_) => Key::Global,
+        }
+    }
+
+    /// Run every deferred item whose key is free, oldest first. An item
+    /// that must wait blocks later items of its thread (all of them for a
+    /// global one), so per-thread order is the arrival order.
+    async fn drain(&mut self) {
+        'scan: loop {
+            if self.global_busy || self.deferred.is_empty() {
                 return;
             }
-            Ok(None) => {}
-            Err(err) => return self.reject(&command, format!("{err:#}")),
+            let mut blocked = HashSet::new();
+            for i in 0..self.deferred.len() {
+                let key = self.deferred_key(&self.deferred[i]);
+                let runnable = match key {
+                    Key::None => true,
+                    Key::Thread(t) => !self.busy.contains(&t) && !blocked.contains(&t),
+                    Key::Global => self.busy.is_empty() && blocked.is_empty(),
+                };
+                if runnable {
+                    let item = self.deferred.remove(i).expect("in range");
+                    self.run_deferred(item, key).await;
+                    continue 'scan;
+                }
+                match key {
+                    Key::Global => return,
+                    Key::Thread(t) => {
+                        blocked.insert(t);
+                    }
+                    Key::None => {}
+                }
+            }
+            return;
         }
-        let prepared = match self.prepare(&command.command).await {
-            Ok(prepared) => prepared,
-            Err(reason) => return self.reject(&command, reason),
+    }
+
+    async fn run_deferred(&mut self, item: Deferred, key: Key) {
+        match item {
+            Deferred::Dispatch(pending) => self.dispatch(pending, key).await,
+            Deferred::Query(id, query) => self.mutate(id, query, key),
+            Deferred::Import(source) => self.import_t3(source),
+        }
+    }
+
+    /// Spawn a job holding `key` until it reports to the loop.
+    fn spawn_job<F>(&mut self, key: Key, job: F)
+    where
+        F: std::future::Future<Output = JobDone> + Send + 'static,
+    {
+        match key {
+            Key::None => {}
+            Key::Thread(t) => {
+                self.busy.insert(t);
+            }
+            Key::Global => self.global_busy = true,
+        }
+        let jobs = self.jobs.clone();
+        tokio::spawn(async move {
+            let _ = jobs.send(job.await);
+        });
+    }
+
+    fn release_key(&mut self, key: Key) {
+        match key {
+            Key::None => {}
+            Key::Thread(t) => {
+                self.busy.remove(&t);
+                // A queued message may have waited for the job.
+                self.ready.push(t);
+            }
+            Key::Global => self.global_busy = false,
+        }
+    }
+
+    async fn on_job_done(&mut self, done: JobDone) {
+        match done {
+            JobDone::Prepared {
+                pending,
+                key,
+                result,
+            } => {
+                self.release_key(key);
+                match result {
+                    Ok(prepared) => self.decide_and_commit(pending, prepared).await,
+                    Err(reason) => self.refuse(pending, reason),
+                }
+            }
+            JobDone::Checkpoint {
+                thread_id,
+                run_id,
+                message_id,
+                result,
+            } => {
+                self.release_key(Key::Thread(thread_id));
+                // The run may have ended meanwhile (shutdown, a dead agent).
+                if self.active_run(thread_id).map(|r| r.run_id) != Some(run_id) {
+                    return;
+                }
+                match result {
+                    Ok(Some(commit)) => self.commit_events(vec![EventKind::RunCheckpointed {
+                        thread_id,
+                        run_id,
+                        commit,
+                    }]),
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!("blongo-core: checkpoint failed: {err}");
+                        self.add_item(
+                            thread_id,
+                            run_id,
+                            ItemKind::SystemNotice {
+                                message: format!(
+                                    "No checkpoint was taken for this turn, so rolling it back \
+                                     will not restore files: {err}"
+                                ),
+                            },
+                        );
+                    }
+                }
+                if let Err(err) = self.continue_turn(thread_id, run_id, message_id).await {
+                    eprintln!("blongo-core: turn failed to start: {err:#}");
+                }
+            }
+            JobDone::Mutation { id, key, result } => {
+                self.release_key(key);
+                self.emit(CoreEvent::Reply { id, result });
+            }
+            JobDone::Imported(result) => {
+                self.release_key(Key::Global);
+                self.after_import(result);
+            }
+            JobDone::Released(key) => self.release_key(key),
+        }
+    }
+
+    // -------------------------------------------------------------- commands
+
+    fn refuse(&mut self, pending: Pending, reason: String) {
+        match pending.reply {
+            Reply::Client => self.emit(CoreEvent::CommandRejected {
+                command_id: pending.command.command_id,
+                reason,
+            }),
+            Reply::Internal => {
+                eprintln!("blongo-core: scheduled command refused: {reason}");
+                self.emit(CoreEvent::Notice {
+                    message: format!("A scheduled task could not run: {reason}"),
+                });
+            }
+            Reply::Mcp { tx, .. } => {
+                let _ = tx.send(Err(reason));
+            }
+        }
+    }
+
+    /// The command committed (or was a duplicate): tell whoever waits.
+    fn succeed(&mut self, reply: Reply) {
+        let Reply::Mcp { tx, then } = reply else {
+            return;
         };
+        match then {
+            Then::Value(value) => {
+                let _ = tx.send(Ok(value));
+            }
+            Then::Wait(thread_id) => self.wait_for(thread_id, tx),
+            Then::Chain(mut next) => {
+                // The chained command answers the call.
+                if let Reply::Mcp { tx: slot, .. } = &mut next.reply {
+                    *slot = tx;
+                }
+                // Next in line for its key, ahead of later arrivals.
+                self.deferred.push_front(Deferred::Dispatch(*next));
+            }
+        }
+    }
+
+    async fn dispatch(&mut self, pending: Pending, key: Key) {
+        match self.store.receipt(pending.command.command_id) {
+            Ok(Some(_)) => {
+                self.emit(CoreEvent::CommandDuplicate {
+                    command_id: pending.command.command_id,
+                });
+                return self.succeed(pending.reply);
+            }
+            Ok(None) => {}
+            Err(err) => return self.refuse(pending, format!("{err:#}")),
+        }
+        match self.prepare(&pending.command.command) {
+            Err(reason) => self.refuse(pending, reason),
+            Ok(None) => self.decide_and_commit(pending, Prepared::default()).await,
+            Ok(Some(plan)) => {
+                // The worktree / restore runs off the loop; the command's
+                // thread (or the whole core, for a rollback) waits for it.
+                let key = if key == Key::None { Key::Global } else { key };
+                self.spawn_job(key, async move {
+                    let result = run_prep(plan).await;
+                    JobDone::Prepared {
+                        pending,
+                        key,
+                        result,
+                    }
+                });
+            }
+        }
+    }
+
+    async fn decide_and_commit(&mut self, pending: Pending, prepared: Prepared) {
+        let command = &pending.command;
         self.post.clear();
         let worktree = prepared.worktree.clone();
         // Files already restored by a rollback that is now refused: say
@@ -470,14 +826,13 @@ impl Orchestrator {
                  (`git restore --source={pre} --worktree -- .`)."
             )
         });
-        let batch = match self.decide(&command, prepared) {
+        let batch = match self.decide(command, prepared) {
             Ok(batch) => batch,
             Err(reason) => {
                 self.post.clear();
-                self.discard_worktree(&command.command, worktree.clone())
-                    .await;
+                self.discard_worktree(&command.command, worktree);
                 let reason = reason + restored_note.as_deref().unwrap_or_default();
-                return self.reject(&command, reason);
+                return self.refuse(pending, reason);
             }
         };
         match self.commit(batch) {
@@ -486,20 +841,20 @@ impl Orchestrator {
                     self.apply_post(post);
                 }
                 if let Command::ThreadArchive { thread_id } = &command.command {
-                    self.clean_up_archived(*thread_id).await;
+                    self.clean_up_archived(*thread_id);
                 }
                 for row in outbox {
                     self.run_effect(row).await;
                 }
+                self.succeed(pending.reply);
             }
             Err(err) => {
                 self.post.clear();
-                self.discard_worktree(&command.command, worktree.clone())
-                    .await;
+                self.discard_worktree(&command.command, worktree);
                 // Ordinals handed out for the failed batch are not reused,
                 // which is harmless (ordinals only need to be increasing).
                 let reason = format!("{err:#}") + restored_note.as_deref().unwrap_or_default();
-                self.reject(&command, reason);
+                self.refuse(pending, reason);
             }
         }
     }
@@ -525,14 +880,14 @@ impl Orchestrator {
                     rt.queue.retain(|q| q.run_id != run_id);
                 }
             }
+            Post::Fire(schedule_id) => self.fire_schedule(schedule_id, false),
         }
     }
 
-    /// The I/O a command needs before it can be decided: create a worktree,
-    /// restore a checkpoint. Validates just enough to not do that work for
-    /// a command that is going to be refused anyway.
-    async fn prepare(&mut self, command: &Command) -> Result<Prepared, String> {
-        let mut prepared = Prepared::default();
+    /// The I/O a command needs before it can be decided (create a
+    /// worktree, restore a checkpoint), validated just enough to not do
+    /// that work for a command that is going to be refused anyway.
+    fn prepare(&mut self, command: &Command) -> Result<Option<PrepPlan>, String> {
         match command {
             Command::ThreadCreate {
                 thread_id,
@@ -545,9 +900,6 @@ impl Orchestrator {
                     return Err("thread already exists".into());
                 }
                 let project_path = PathBuf::from(&project.path);
-                let root = blongo_git::work_tree_root(&project_path)
-                    .await
-                    .ok_or_else(|| format!("{} is not in a git repository", project.path))?;
                 let id = thread_id.0.simple().to_string();
                 let branch = format!("blongo/{}", &id[id.len() - 12..]);
                 let path = self
@@ -555,21 +907,11 @@ impl Orchestrator {
                     .data_dir
                     .join("worktrees")
                     .join(thread_id.to_string());
-                blongo_git::add_worktree(&root, &path, &branch)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                // A project inside a larger repository keeps its relative
-                // place in the worktree.
-                let rel = project_path
-                    .canonicalize()
-                    .ok()
-                    .zip(root.canonicalize().ok())
-                    .and_then(|(p, r)| p.strip_prefix(r).ok().map(Path::to_path_buf))
-                    .unwrap_or_default();
-                prepared.worktree = Some(Worktree {
-                    path: path.join(rel).to_string_lossy().into_owned(),
+                Ok(Some(PrepPlan::Worktree {
+                    project_path,
+                    path,
                     branch,
-                });
+                }))
             }
             Command::ThreadRollback {
                 thread_id,
@@ -590,65 +932,54 @@ impl Orchestrator {
                 ) {
                     return Err("this turn cannot be rolled back".into());
                 }
-                if let Some(commit) = &run.checkpoint {
-                    // The restore rewrites the whole folder: every other
-                    // thread working there must be idle, and the user must
-                    // know how many there are.
-                    let sharers = self.folder_sharers(*thread_id, &cwd);
-                    if let Some(busy) = sharers.iter().find(|t| self.is_busy(t.id)) {
-                        return Err(format!(
-                            "\"{}\" works in the same folder and is running; wait for it \
-                             to finish before rolling back",
-                            busy.title
-                        ));
-                    }
-                    let n = sharers.len() as u32;
-                    let ids: HashSet<ThreadId> = sharers.iter().map(|t| t.id).collect();
-                    let acked: HashSet<ThreadId> = acknowledged_sharers.iter().copied().collect();
-                    if ids != acked {
-                        return Err(format!(
-                            "{n} other thread{} work{} in this folder and will see its files \
-                             change; confirm the rollback for all of them",
-                            if n == 1 { "" } else { "s" },
-                            if n == 1 { "s" } else { "" }
-                        ));
-                    }
-                    // Keep what is about to be overwritten.
-                    let pre = format!(
+                let Some(commit) = &run.checkpoint else {
+                    return Ok(None);
+                };
+                // The restore rewrites the whole folder: every other thread
+                // working there must be idle, and the user must know how
+                // many there are.
+                let sharers = self.folder_sharers(*thread_id, &cwd);
+                if let Some(busy) = sharers.iter().find(|t| self.is_busy(t.id)) {
+                    return Err(format!(
+                        "\"{}\" works in the same folder and is running; wait for it \
+                         to finish before rolling back",
+                        busy.title
+                    ));
+                }
+                let n = sharers.len() as u32;
+                let ids: HashSet<ThreadId> = sharers.iter().map(|t| t.id).collect();
+                let acked: HashSet<ThreadId> = acknowledged_sharers.iter().copied().collect();
+                if ids != acked {
+                    return Err(format!(
+                        "{n} other thread{} work{} in this folder and will see its files \
+                         change; confirm the rollback for all of them",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "s" } else { "" }
+                    ));
+                }
+                Ok(Some(PrepPlan::Rollback {
+                    cwd: PathBuf::from(cwd),
+                    pre: format!(
                         "{}/{thread_id}/{run_id}",
                         blongo_git::PRE_ROLLBACK_REF_PREFIX
-                    );
-                    blongo_git::capture_checkpoint(Path::new(&cwd), &pre)
-                        .await
-                        .map_err(|e| {
-                            format!("could not save the current files before rolling back: {e:#}")
-                        })?;
-                    blongo_git::restore_checkpoint(Path::new(&cwd), commit)
-                        .await
-                        .map_err(|e| {
-                            format!(
-                                "could not restore the files: {e:#}. The files may be partly \
-                                 restored; how they were before is saved in {pre} \
-                                 (`git restore --source={pre} --worktree -- .`)"
-                            )
-                        })?;
-                    prepared.restored = Some(commit.clone());
-                    prepared.pre_rollback = Some(pre);
-                    prepared.sharers = n;
-                }
+                    ),
+                    commit: commit.clone(),
+                    sharers: n,
+                }))
             }
-            _ => {}
+            _ => Ok(None),
         }
-        Ok(prepared)
     }
 
     /// An archived thread's checkpoint refs go (and any left by threads
-    /// archived before), except those a live fork's copied runs still use; its pre-rollback refs stay (they hold files a
-    /// rollback replaced). Its worktree goes only when no other live thread
-    /// works in it and nothing in it would be lost, ignored files included
-    /// (the branch stays either way); otherwise the user is told why it
-    /// was kept.
-    async fn clean_up_archived(&mut self, thread_id: ThreadId) {
+    /// archived before), except those a live fork's copied runs still use;
+    /// its pre-rollback refs stay (they hold files a rollback replaced).
+    /// Its worktree goes only when no other live thread works in it and
+    /// nothing in it would be lost, ignored files included (the branch
+    /// stays either way); otherwise the user is told why it was kept. The
+    /// git work runs off the loop; later work waits for it (it may remove
+    /// a folder and refs other threads' work would touch).
+    fn clean_up_archived(&mut self, thread_id: ThreadId) {
         let Some(thread) = self.threads.get(&thread_id).cloned() else {
             return;
         };
@@ -656,9 +987,6 @@ impl Orchestrator {
             return;
         };
         let cwd = PathBuf::from(thread.cwd(&project));
-        if blongo_git::work_tree_root(&cwd).await.is_none() {
-            return;
-        }
         let live: Vec<Thread> = self
             .threads
             .values()
@@ -681,66 +1009,96 @@ impl Orchestrator {
             .map(|t| t.id)
             .chain([thread_id])
             .collect();
-        for id in archived {
-            blongo_git::delete_thread_refs(&cwd, &id.to_string(), &keep).await;
-        }
-        let Some(worktree) = &thread.worktree else {
-            return;
-        };
-        // A nested project works in a subfolder: the worktree is its top.
-        let top = match blongo_git::work_tree_root(Path::new(&worktree.path)).await {
-            Some(top) => canonical(&top.to_string_lossy()),
-            None => canonical(&worktree.path),
-        };
-        let users: Vec<&str> = live
+        // Folders of the other live threads, to tell whether one still
+        // works in the worktree.
+        let others: Vec<(String, String)> = live
             .iter()
-            .filter(|t| {
+            .filter_map(|t| {
                 self.projects
                     .get(&t.project_id)
-                    .is_some_and(|p| canonical(t.cwd(p)).starts_with(&top))
+                    .map(|p| (t.title.clone(), t.cwd(p).to_owned()))
             })
-            .map(|t| t.title.as_str())
             .collect();
-        let kept = if !users.is_empty() {
-            Some(format!(
-                "{} still work{} in it",
-                users.join(", "),
-                if users.len() == 1 { "s" } else { "" }
-            ))
-        } else {
-            blongo_git::remove_pristine_worktree(
-                Path::new(&project.path),
-                Path::new(&worktree.path),
-                &self.config.data_dir.join("worktrees"),
-            )
-            .await
-            .err()
-            .map(|e| format!("{e:#}"))
-        };
-        if let Some(why) = kept {
-            self.emit(CoreEvent::Notice {
-                message: format!(
-                    "Kept the worktree of \"{}\" at {}: {why}.",
-                    thread.title, worktree.path
-                ),
-            });
-        }
+        let worktrees = self.config.data_dir.join("worktrees");
+        let out = self.out.clone();
+        self.spawn_job(Key::Global, async move {
+            clean_up(cwd, archived, keep, thread, project, others, worktrees, out).await;
+            JobDone::Released(Key::Global)
+        });
     }
+}
 
+/// The git side of [`Orchestrator::clean_up_archived`].
+#[allow(clippy::too_many_arguments)]
+async fn clean_up(
+    cwd: PathBuf,
+    archived: Vec<ThreadId>,
+    keep: HashSet<String>,
+    thread: Thread,
+    project: Project,
+    others: Vec<(String, String)>,
+    worktrees: PathBuf,
+    out: mpsc::UnboundedSender<CoreEvent>,
+) {
+    if blongo_git::work_tree_root(&cwd).await.is_none() {
+        return;
+    }
+    for id in archived {
+        blongo_git::delete_thread_refs(&cwd, &id.to_string(), &keep).await;
+    }
+    let Some(worktree) = &thread.worktree else {
+        return;
+    };
+    // A nested project works in a subfolder: the worktree is its top.
+    let top = match blongo_git::work_tree_root(Path::new(&worktree.path)).await {
+        Some(top) => canonical(&top.to_string_lossy()),
+        None => canonical(&worktree.path),
+    };
+    let users: Vec<&str> = others
+        .iter()
+        .filter(|(_, cwd)| canonical(cwd).starts_with(&top))
+        .map(|(title, _)| title.as_str())
+        .collect();
+    let kept = if !users.is_empty() {
+        Some(format!(
+            "{} still work{} in it",
+            users.join(", "),
+            if users.len() == 1 { "s" } else { "" }
+        ))
+    } else {
+        blongo_git::remove_pristine_worktree(
+            Path::new(&project.path),
+            Path::new(&worktree.path),
+            &worktrees,
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+    };
+    if let Some(why) = kept {
+        let _ = out.send(CoreEvent::Notice {
+            message: format!(
+                "Kept the worktree of \"{}\" at {}: {why}.",
+                thread.title, worktree.path
+            ),
+        });
+    }
+}
+
+impl Orchestrator {
     /// Remove a worktree prepared for a command that was then refused.
-    async fn discard_worktree(&self, command: &Command, worktree: Option<Worktree>) {
+    fn discard_worktree(&self, command: &Command, worktree: Option<Worktree>) {
         let (Some(worktree), Command::ThreadCreate { project_id, .. }) = (worktree, command) else {
             return;
         };
         let Some(project) = self.projects.get(project_id) else {
             return;
         };
-        let _ = blongo_git::remove_worktree(
-            Path::new(&project.path),
-            Path::new(&worktree.path),
-            &self.config.data_dir.join("worktrees"),
-        )
-        .await;
+        let repo = PathBuf::from(&project.path);
+        let root = self.config.data_dir.join("worktrees");
+        tokio::spawn(async move {
+            let _ = blongo_git::remove_worktree(&repo, Path::new(&worktree.path), &root).await;
+        });
     }
 
     fn thread_cwd(&self, thread_id: ThreadId) -> Result<(Thread, String), String> {
@@ -853,6 +1211,7 @@ impl Orchestrator {
                 provider,
                 model,
                 worktree: _,
+                parent_thread_id,
             } => {
                 if !self.projects.contains_key(project_id) {
                     return Err("unknown project".into());
@@ -860,6 +1219,16 @@ impl Orchestrator {
                 if self.threads.contains_key(thread_id) {
                     return Err("thread already exists".into());
                 }
+                let parent = match parent_thread_id {
+                    Some(id) => {
+                        let parent = self.live_thread(*id)?;
+                        if parent.project_id != *project_id {
+                            return Err("the parent thread is in another project".into());
+                        }
+                        Some(parent.clone())
+                    }
+                    None => None,
+                };
                 let title = title.trim();
                 let mut thread = Thread::new(
                     *thread_id,
@@ -872,8 +1241,22 @@ impl Orchestrator {
                     now,
                 );
                 thread.provider = *provider;
-                thread.model = model.clone().filter(|m| !m.trim().is_empty());
+                thread.model = model.clone().filter(|m| !m.trim().is_empty()).or_else(|| {
+                    self.config
+                        .settings
+                        .default_models
+                        .iter()
+                        .find(|(p, _)| p == provider)
+                        .map(|(_, m)| m.clone())
+                });
                 thread.worktree = prepared.worktree;
+                if let Some(parent) = parent {
+                    // A delegated task works where its parent works.
+                    thread.parent_thread_id = Some(parent.id);
+                    if thread.worktree.is_none() {
+                        thread.worktree = parent.worktree.clone();
+                    }
+                }
                 batch.events.push(EventKind::ThreadCreated { thread });
             }
             Command::ThreadFork {
@@ -1120,6 +1503,94 @@ impl Orchestrator {
                         error: None,
                     });
                 }
+            }
+            Command::ScheduleCreate {
+                schedule_id,
+                project_id,
+                thread_id,
+                cron,
+                prompt,
+                provider,
+            } => {
+                if self.schedules.contains_key(schedule_id) {
+                    return Err("schedule already exists".into());
+                }
+                if !self.projects.contains_key(project_id) {
+                    return Err("unknown project".into());
+                }
+                if let Some(thread_id) = thread_id
+                    && self.live_thread(*thread_id)?.project_id != *project_id
+                {
+                    return Err("the thread is in another project".into());
+                }
+                let parsed = Cron::parse(cron)?;
+                if prompt.trim().is_empty() {
+                    return Err("the prompt is empty".into());
+                }
+                let next_run_at = parsed.next_after(now);
+                if next_run_at.is_none() {
+                    return Err(format!("`{cron}` never matches"));
+                }
+                batch.events.push(EventKind::ScheduleCreated {
+                    schedule: Schedule {
+                        id: *schedule_id,
+                        project_id: *project_id,
+                        thread_id: *thread_id,
+                        cron: cron.trim().to_owned(),
+                        prompt: prompt.trim().to_owned(),
+                        provider: *provider,
+                        enabled: true,
+                        created_at: now,
+                        next_run_at,
+                        last_run_at: None,
+                        last_thread_id: None,
+                    },
+                });
+            }
+            Command::ScheduleUpdate {
+                schedule_id,
+                enabled,
+                cron,
+                prompt,
+            } => {
+                let mut schedule = self
+                    .schedules
+                    .get(schedule_id)
+                    .cloned()
+                    .ok_or("unknown schedule")?;
+                if let Some(cron) = cron {
+                    Cron::parse(cron)?;
+                    schedule.cron = cron.trim().to_owned();
+                }
+                if let Some(prompt) = prompt {
+                    if prompt.trim().is_empty() {
+                        return Err("the prompt is empty".into());
+                    }
+                    schedule.prompt = prompt.trim().to_owned();
+                }
+                if let Some(enabled) = enabled {
+                    schedule.enabled = *enabled;
+                }
+                schedule.next_run_at = if schedule.enabled {
+                    Cron::parse(&schedule.cron)?.next_after(now)
+                } else {
+                    None
+                };
+                batch.events.push(EventKind::ScheduleUpdated { schedule });
+            }
+            Command::ScheduleDelete { schedule_id } => {
+                if !self.schedules.contains_key(schedule_id) {
+                    return Err("unknown schedule".into());
+                }
+                batch.events.push(EventKind::ScheduleDeleted {
+                    schedule_id: *schedule_id,
+                });
+            }
+            Command::ScheduleRunNow { schedule_id } => {
+                if !self.schedules.contains_key(schedule_id) {
+                    return Err("unknown schedule".into());
+                }
+                self.post.push(Post::Fire(*schedule_id));
             }
         }
         Ok(batch)
@@ -1437,7 +1908,49 @@ impl Orchestrator {
             interrupt_deadline: None,
             plan: None,
             provider_turn_id: None,
+            usage: None,
         });
+        let thread = self
+            .threads
+            .get(&thread_id)
+            .context("unknown thread")?
+            .clone();
+        if self.config.checkpoints
+            && let Some(project) = self.projects.get(&thread.project_id)
+        {
+            // Capture the workspace before the run changes it, off the
+            // loop; the thread's other work waits for it, the core does
+            // not. Not being in a git repository is normal (no checkpoint).
+            let cwd = PathBuf::from(thread.cwd(project));
+            let name = blongo_git::checkpoint_ref(&thread_id.to_string(), &run_id.to_string());
+            self.spawn_job(Key::Thread(thread_id), async move {
+                let result = if blongo_git::work_tree_root(&cwd).await.is_none() {
+                    Ok(None)
+                } else {
+                    blongo_git::capture_checkpoint(&cwd, &name)
+                        .await
+                        .map(Some)
+                        .map_err(|e| format!("{e:#}"))
+                };
+                JobDone::Checkpoint {
+                    thread_id,
+                    run_id,
+                    message_id,
+                    result,
+                }
+            });
+            return Ok(());
+        }
+        self.continue_turn(thread_id, run_id, message_id).await
+    }
+
+    /// Start (or reuse) the agent session and send the prompt.
+    async fn continue_turn(
+        &mut self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        message_id: ItemId,
+    ) -> anyhow::Result<()> {
         let text = self
             .store
             .item(message_id)?
@@ -1449,9 +1962,6 @@ impl Orchestrator {
             .context("unknown thread")?
             .clone();
         let label = thread.provider.label();
-        if self.config.checkpoints {
-            self.checkpoint(&thread, run_id).await;
-        }
         let fresh = !self
             .rt
             .get(&thread_id)
@@ -1482,39 +1992,6 @@ impl Orchestrator {
         }
         self.set_run_status(thread_id, RunStatus::Running);
         Ok(())
-    }
-
-    /// Capture the thread's workspace before `run_id` changes it. Not being
-    /// in a git repository is normal (no checkpoint); a failure is logged.
-    async fn checkpoint(&mut self, thread: &Thread, run_id: RunId) {
-        let Some(project) = self.projects.get(&thread.project_id) else {
-            return;
-        };
-        let cwd = PathBuf::from(thread.cwd(project));
-        if blongo_git::work_tree_root(&cwd).await.is_none() {
-            return;
-        }
-        let name = blongo_git::checkpoint_ref(&thread.id.to_string(), &run_id.to_string());
-        match blongo_git::capture_checkpoint(&cwd, &name).await {
-            Ok(commit) => self.commit_events(vec![EventKind::RunCheckpointed {
-                thread_id: thread.id,
-                run_id,
-                commit,
-            }]),
-            Err(err) => {
-                eprintln!("blongo-core: checkpoint failed: {err:#}");
-                self.add_item(
-                    thread.id,
-                    run_id,
-                    ItemKind::SystemNotice {
-                        message: format!(
-                            "No checkpoint was taken for this turn, so rolling it back will \
-                             not restore files: {err:#}"
-                        ),
-                    },
-                );
-            }
-        }
     }
 
     /// The prompt for the first turn of a provider conversation that takes
@@ -1673,7 +2150,11 @@ impl Orchestrator {
     async fn start_queued(&mut self) {
         while let Some(thread_id) = self.ready.pop() {
             let next = match self.rt.get_mut(&thread_id) {
-                Some(rt) if rt.run.is_none() => rt.queue.pop_front(),
+                // A job of the thread (a git commit) goes first; its end
+                // makes the thread ready again.
+                Some(rt) if rt.run.is_none() && !self.busy.contains(&thread_id) => {
+                    rt.queue.pop_front()
+                }
                 _ => None,
             };
             let Some(queued) = next else {
@@ -1741,10 +2222,31 @@ impl Orchestrator {
             .get(&thread.project_id)
             .context("unknown project")?;
         let provider = thread.provider;
-        let config = self.session_config(provider, thread.cwd(project), thread.model.clone());
+        let mut config = self.session_config(provider, thread.cwd(project), thread.model.clone());
         let options = StartOptions {
             resume: thread.provider_thread_id.clone(),
             context: thread.pending_context.clone(),
+            acp_args: self.config.acp_args.clone(),
+        };
+        // Blongo's own tools, as this thread.
+        let grant = match (&self.mcp, self.mcp_bridge()) {
+            (Some(server), Some((command, mut args))) => match server.register(thread_id) {
+                Ok(grant) => {
+                    args.push(server.socket.to_string_lossy().into_owned());
+                    args.push(grant.file.to_string_lossy().into_owned());
+                    config.mcp = Some(blongo_harness::McpServer {
+                        name: "blongo".into(),
+                        command,
+                        args,
+                    });
+                    Some(grant)
+                }
+                Err(err) => {
+                    eprintln!("blongo-core: no MCP access for this session: {err:#}");
+                    None
+                }
+            },
+            _ => None,
         };
         let mut session = blongo_harness::start(provider, config, options).await?;
         self.generation += 1;
@@ -1776,9 +2278,20 @@ impl Orchestrator {
             session,
             generation,
             provider,
+            _mcp: grant,
             forwarder,
         });
         Ok(())
+    }
+
+    /// How agents start the MCP bridge (program, leading arguments).
+    fn mcp_bridge(&self) -> Option<(PathBuf, Vec<String>)> {
+        if let Some(bridge) = &self.config.mcp_bridge {
+            return Some(bridge.clone());
+        }
+        std::env::current_exe()
+            .ok()
+            .map(|exe| (exe, vec!["mcp-bridge".to_owned()]))
     }
 
     // ------------------------------------------------------- sign-in, install
@@ -1790,6 +2303,7 @@ impl Orchestrator {
                 ProviderKind::Codex => "run `codex login` in a terminal",
                 ProviderKind::ClaudeCode => "run `claude` in a terminal and use /login",
                 ProviderKind::Antigravity => "sign in from Blongo",
+                ProviderKind::Acp => "sign in with the agent's own command",
             };
             let _ = out.send(CoreEvent::Login {
                 provider,
@@ -1823,19 +2337,44 @@ impl Orchestrator {
         });
     }
 
-    fn import_t3(&mut self, source: &Path) {
-        let busy: Vec<ThreadId> = self
+    /// Import t3code's history on its own database connection, off the
+    /// loop (it can take a while); the loop keeps committing meanwhile
+    /// (SQLite serializes the writes).
+    fn import_t3(&mut self, source: PathBuf) {
+        let busy: HashSet<ThreadId> = self
             .rt
             .iter()
             .filter(|(_, rt)| rt.run.is_some() || !rt.queue.is_empty())
             .map(|(id, _)| *id)
             .collect();
-        let result = crate::t3_import::import(&mut self.store, source, &|id| busy.contains(&id));
+        let database = self.config.database.clone();
+        self.spawn_job(Key::Global, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut store = Store::open(&database)?;
+                crate::t3_import::import(&mut store, &source, &|id| busy.contains(&id))
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("import stopped: {e}")));
+            JobDone::Imported(result)
+        });
+    }
+
+    fn after_import(&mut self, result: anyhow::Result<ImportReport>) {
+        if let Err(err) = self.store.refresh_last_sequence() {
+            eprintln!("blongo-core: {err:#}");
+        }
         // Threads that got turns the provider never saw start a fresh
-        // provider conversation.
+        // provider conversation, and their cached ordinals are stale.
         if let Ok(report) = &result {
             for thread_id in &report.updated_threads {
                 self.release_session(*thread_id);
+                if self
+                    .rt
+                    .get(thread_id)
+                    .is_some_and(|rt| rt.run.is_none() && rt.queue.is_empty())
+                {
+                    self.rt.remove(thread_id);
+                }
             }
         }
         let reload = (|| -> anyhow::Result<()> {
@@ -1872,6 +2411,7 @@ impl Orchestrator {
             sequence: self.store.last_sequence(),
             projects: self.store.projects()?,
             threads: self.store.threads(false)?,
+            schedules: self.store.schedules()?,
         })
     }
 
@@ -2062,6 +2602,19 @@ impl Orchestrator {
                 }
             }
             AgentEvent::Plan { steps } => self.on_plan(thread_id, run_id, steps),
+            AgentEvent::Usage(usage) => {
+                let Some(run) = self.active_run(thread_id) else {
+                    return;
+                };
+                if run.usage != Some(usage) {
+                    run.usage = Some(usage);
+                    self.commit_events(vec![EventKind::RunUsage {
+                        thread_id,
+                        run_id,
+                        usage,
+                    }]);
+                }
+            }
             AgentEvent::TextDelta { text } => self.on_text(thread_id, TextKind::Assistant, text),
             AgentEvent::ReasoningDelta { text } => {
                 self.on_text(thread_id, TextKind::Reasoning, text)
@@ -2105,6 +2658,25 @@ impl Orchestrator {
                 detail,
             } => {
                 let mut events = self.close_text(thread_id);
+                if self.config.settings.approval == ApprovalPolicy::AutoApprove {
+                    // Recorded as approved; the run never waits.
+                    let kind = ItemKind::ApprovalRequest {
+                        provider_request_id: request_id.clone(),
+                        title,
+                        detail,
+                        state: ApprovalState::Approved,
+                    };
+                    if let Ok(item) = self.new_item(thread_id, Some(run_id), kind, "") {
+                        events.push(EventKind::ItemAdded {
+                            item: Arc::new(item),
+                        });
+                    }
+                    self.commit_events(events);
+                    if let Some(live) = self.rt.get(&thread_id).and_then(|rt| rt.session.as_ref()) {
+                        let _ = live.session.approve(request_id, HarnessDecision::Allow);
+                    }
+                    return;
+                }
                 let kind = ItemKind::ApprovalRequest {
                     provider_request_id: request_id,
                     title,
@@ -2383,6 +2955,9 @@ impl Orchestrator {
         }
         eprintln!("blongo: run {} finished ({status:?})", run.run_id);
         self.emit(CoreEvent::RunFinished { thread_id, status });
+        if !self.is_busy(thread_id) {
+            self.resolve_waiters(thread_id);
+        }
     }
 
     // ---------------------------------------------------------------- timers
@@ -2392,6 +2967,18 @@ impl Orchestrator {
         let mut consider = |t: Instant| {
             next = Some(next.map_or(t, |n: Instant| n.min(t)));
         };
+        if let Some(due) = self
+            .schedules
+            .values()
+            .filter(|s| s.enabled)
+            .filter_map(|s| s.next_run_at)
+            .min()
+        {
+            // Wall-clock time: re-checked at least every minute, so a
+            // clock change or suspend does not leave it far off.
+            let ms = (due.0 - Timestamp::now().0).clamp(0, 60_000) as u64;
+            consider(Instant::now() + Duration::from_millis(ms));
+        }
         for rt in self.rt.values() {
             if let Some(deadline) = rt.run.as_ref().and_then(|r| r.interrupt_deadline) {
                 consider(deadline);
@@ -2407,6 +2994,17 @@ impl Orchestrator {
     }
 
     async fn on_timer(&mut self) {
+        let wall = Timestamp::now();
+        let due: Vec<ScheduleId> = self
+            .schedules
+            .values()
+            .filter(|s| s.enabled && s.next_run_at.is_some_and(|t| t <= wall))
+            .map(|s| s.id)
+            .collect();
+        for id in due {
+            // Missed while Blongo was not running: runs once now.
+            self.fire_schedule(id, true);
+        }
         let now = Instant::now();
         if self.flush_deadline.is_some_and(|d| d <= now) {
             self.flush_text(None);
@@ -2543,6 +3141,80 @@ impl Orchestrator {
             {
                 blongo_harness::process::kill_group(pid);
             }
+        }
+    }
+}
+
+/// The scheduling key of a command.
+fn command_key(command: &Command) -> Key {
+    match command {
+        Command::ThreadRollback { .. } => Key::Global,
+        Command::ProjectCreate { .. }
+        | Command::ScheduleCreate { .. }
+        | Command::ScheduleUpdate { .. }
+        | Command::ScheduleDelete { .. }
+        | Command::ScheduleRunNow { .. } => Key::None,
+        other => other.thread_id().map_or(Key::None, Key::Thread),
+    }
+}
+
+/// A command's I/O, off the loop.
+async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
+    match plan {
+        PrepPlan::Worktree {
+            project_path,
+            path,
+            branch,
+        } => {
+            let root = blongo_git::work_tree_root(&project_path)
+                .await
+                .ok_or_else(|| format!("{} is not in a git repository", project_path.display()))?;
+            blongo_git::add_worktree(&root, &path, &branch)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            // A project inside a larger repository keeps its relative place
+            // in the worktree.
+            let rel = project_path
+                .canonicalize()
+                .ok()
+                .zip(root.canonicalize().ok())
+                .and_then(|(p, r)| p.strip_prefix(r).ok().map(Path::to_path_buf))
+                .unwrap_or_default();
+            Ok(Prepared {
+                worktree: Some(Worktree {
+                    path: path.join(rel).to_string_lossy().into_owned(),
+                    branch,
+                }),
+                ..Prepared::default()
+            })
+        }
+        PrepPlan::Rollback {
+            cwd,
+            pre,
+            commit,
+            sharers,
+        } => {
+            // Keep what is about to be overwritten.
+            blongo_git::capture_checkpoint(&cwd, &pre)
+                .await
+                .map_err(|e| {
+                    format!("could not save the current files before rolling back: {e:#}")
+                })?;
+            blongo_git::restore_checkpoint(&cwd, &commit)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "could not restore the files: {e:#}. The files may be partly restored; \
+                         how they were before is saved in {pre} \
+                         (`git restore --source={pre} --worktree -- .`)"
+                    )
+                })?;
+            Ok(Prepared {
+                worktree: None,
+                restored: Some(commit),
+                pre_rollback: Some(pre),
+                sharers,
+            })
         }
     }
 }

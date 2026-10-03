@@ -109,8 +109,21 @@ fn snapshots_and_deltas_round_trip() {
     let thread = Thread::new(ThreadId::new(), project.id, "t", Timestamp(2));
     let shell = ShellSnapshot {
         sequence: 10,
-        projects: vec![project],
+        projects: vec![project.clone()],
         threads: vec![thread.clone()],
+        schedules: vec![crate::Schedule {
+            id: crate::ScheduleId::new(),
+            project_id: project.id,
+            thread_id: Some(thread.id),
+            cron: "*/5 * * * *".into(),
+            prompt: "check".into(),
+            provider: ProviderKind::Codex,
+            enabled: true,
+            created_at: Timestamp(4),
+            next_run_at: Some(Timestamp(5)),
+            last_run_at: None,
+            last_thread_id: None,
+        }],
     };
     let run = Run::new(
         RunId::new(),
@@ -470,4 +483,105 @@ fn timeline_routing() {
     })));
     // Run status drives the sidebar dot: everyone gets it.
     assert_eq!(status.timeline_thread(), None);
+}
+
+#[test]
+fn queries_and_every_reply_round_trip() {
+    use crate::workspace::*;
+    let thread_id = ThreadId::new();
+    let queries = vec![
+        Query::DiffSummary {
+            thread_id,
+            scope: DiffScope::Turn {
+                run_id: RunId::new(),
+            },
+        },
+        Query::DiffSummary {
+            thread_id,
+            scope: DiffScope::Thread,
+        },
+        Query::DiffFile {
+            thread_id,
+            from: "a".repeat(40),
+            to: "b".repeat(40),
+            path: "src/x.rs".into(),
+            max_lines: 100,
+        },
+        Query::SearchFiles {
+            thread_id,
+            pattern: "x".into(),
+            limit: 5,
+        },
+        Query::GitSwitch {
+            thread_id,
+            branch: "b".into(),
+            create: true,
+        },
+        Query::GitCommit {
+            thread_id,
+            message: "m".into(),
+        },
+    ];
+    for query in queries {
+        let msg = ClientMsg::Query { id: 9, query };
+        let bytes = encode(&msg, MAX_CLIENT_FRAME).unwrap();
+        let back: ClientMsg = decode(&bytes, MAX_CLIENT_FRAME).unwrap();
+        assert_eq!(back, msg);
+    }
+    let replies = vec![
+        Ok(QueryReply::DiffSummary(DiffSummary {
+            from: "a".into(),
+            to: "b".into(),
+            files: vec![DiffFileStat {
+                path: "x".into(),
+                old_path: Some("y".into()),
+                status: 'R',
+                added: 1,
+                removed: 2,
+                binary: false,
+            }],
+            truncated: false,
+            added: 1,
+            removed: 2,
+        })),
+        Ok(QueryReply::DiffFile(parse_unified_diff(
+            "x",
+            "@@ -1 +1 @@\n-a\n+b\n",
+            10,
+        ))),
+        Ok(QueryReply::Files(vec![FileMatch {
+            path: "x".into(),
+            score: 3,
+            positions: vec![0],
+        }])),
+        Ok(QueryReply::Dir(vec![DirEntry {
+            name: "src".into(),
+            is_dir: true,
+        }])),
+        Ok(QueryReply::File(FileContent {
+            path: "x".into(),
+            text: "hi".into(),
+            truncated: false,
+            binary: false,
+        })),
+        Ok(QueryReply::GitStatus(GitStatusInfo {
+            branch: Some("main".into()),
+            upstream: None,
+            ahead: 1,
+            behind: 0,
+            changes: vec![("??".into(), "x".into())],
+        })),
+        Ok(QueryReply::Branches(vec![BranchInfo {
+            name: "main".into(),
+            current: true,
+        }])),
+        Ok(QueryReply::Done("ok".into())),
+        Err("nope".into()),
+    ];
+    let msgs: Vec<ServerMsg> = replies
+        .into_iter()
+        .map(|result| ServerMsg::Reply { id: 1, result })
+        .chain([ServerMsg::TerminalInputDropped { id: 2 }])
+        .collect();
+    assert_eq!(round_trip_server(msgs.clone()), msgs);
 }

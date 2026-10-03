@@ -734,6 +734,8 @@ dependencies = [
  "blongo-protocol",
  "blongo-store",
  "dirs",
+ "getrandom 0.3.4",
+ "libc",
  "rusqlite",
  "serde_json",
  "tokio",

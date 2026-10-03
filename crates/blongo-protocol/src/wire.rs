@@ -25,15 +25,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::client::{ImportReport, InstallState, LoginState};
+use crate::workspace::{Query, QueryId, QueryReply};
 use crate::{
     CommandEnvelope, CommandId, DomainEvent, EventKind, ItemId, ModelInfo, ProviderKind, Run,
     RunStatus, ShellSnapshot, ThreadId, ThreadSnapshot, TurnItem,
 };
 
 /// Version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
-/// Oldest version this build still accepts.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+/// Oldest version this build still accepts (v2 added schedules, usage and
+/// workspace queries to the shared types, which a v1 peer cannot decode).
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame a client may send (commands carry user text).
 pub const MAX_CLIENT_FRAME: usize = 1 << 20;
@@ -49,8 +51,10 @@ pub mod caps {
     pub const PROVIDER_SETUP: &str = "provider-setup";
     /// t3code import on the server.
     pub const IMPORT: &str = "import";
+    /// Workspace queries (diffs, files, git; `Query` / `Reply`).
+    pub const QUERY: &str = "query";
 
-    pub const ALL: [&str; 3] = [TERMINAL, PROVIDER_SETUP, IMPORT];
+    pub const ALL: [&str; 4] = [TERMINAL, PROVIDER_SETUP, IMPORT, QUERY];
 }
 
 /// How long a server remembers a proof's `jti` (defence in depth: every
@@ -101,6 +105,11 @@ pub enum ClientMsg {
     },
     TerminalClose {
         id: u32,
+    },
+    /// A workspace query, answered with [`ServerMsg::Reply`] (same id).
+    Query {
+        id: QueryId,
+        query: Query,
     },
     /// Administration, accepted only on transports the operating system
     /// authenticated (the server's private Unix socket, SSH stdio): remove
@@ -290,6 +299,14 @@ pub enum ServerMsg {
     Revoked(Result<usize, String>),
     /// This connection's device was revoked; the server closes it.
     DeviceRevoked,
+    Reply {
+        id: QueryId,
+        result: Result<QueryReply, String>,
+    },
+    /// Terminal input was dropped (the shell is not reading it).
+    TerminalInputDropped {
+        id: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
