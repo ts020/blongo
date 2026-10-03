@@ -300,7 +300,9 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 
 完了条件: Codex / Claude Code / Antigravity のスレッドが完走し、チェックポイントからロールバックできる。
 
-### Phase 3: リモートとサーバーモード
+### Phase 3: リモートとサーバーモード（2026-10-03 完了、結果は `docs/phase3/report.md`）
+
+> 結果の要点: ヘッドレスの `blongo-serve`（idle PSS 13.5 / stream 16.5 MiB）と RemoteBackend を入れ、アプリは複数の環境を扱えるようになった。独自プロトコル（WebSocket 上の MessagePack、seq つきのスナップショットと resume、デルタの合体、上限つきの Outbox）を使い、認証はペアリング、bearer、Ed25519 の所持証明。SSH（トンネル / stdio）と Tailscale は偽物で確認し、サーバー側ターミナルも入れた。ローカルのアプリは idle PSS 156 MiB（+1.1 MiB、コードの常駐分）、stream 173〜176 MiB。TLS は内蔵しない。
 
 - `blongo serve`（ヘッドレス）と `RemoteBackend`。プロトコルは Blongo 独自（候補: WebSocket 上の長さ前置きバイナリ。型は `blongo-protocol` を共有し、スキーマのバージョンと機能フラグで交渉）
 - 認証（ペアリング、bearer、DPoP）、Tailscale、SSH 環境
