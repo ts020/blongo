@@ -77,6 +77,8 @@ pub struct Shell {
     core: CoreClient,
     sidebar: Entity<Sidebar>,
     timeline: Option<Entity<Timeline>>,
+    /// Turn actions of the open timeline (replaced with it).
+    timeline_events: Option<Subscription>,
     composer: Entity<TextInput>,
     pending_project: Option<CommandId>,
     /// A sent message the core has not accepted yet: its text comes back
@@ -143,6 +145,7 @@ impl Shell {
             core,
             sidebar,
             timeline: None,
+            timeline_events: None,
             composer,
             pending_project: None,
             pending_message: None,
@@ -381,7 +384,7 @@ impl Shell {
                 TimelineEvent::Rollback(run_id) => this.rollback(*run_id, cx),
             },
         );
-        self._subscriptions.push(sub);
+        self.timeline_events = Some(sub);
         self.timeline = Some(timeline);
         self.runs = snapshot.runs.iter().map(|r| (r.id, r.status)).collect();
         self.queued = snapshot

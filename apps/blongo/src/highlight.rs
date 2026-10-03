@@ -154,6 +154,11 @@ fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
 /// Empty when the language has no usable configuration or the code is too
 /// large.
 pub fn highlight(lang: Lang, code: &str) -> Spans {
+    // Profiling switch (tools/profile.py A/B runs): leave code plain.
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("BLONGO_NO_HIGHLIGHT").is_some()) {
+        return Vec::new();
+    }
     let Some(config) = config(lang).filter(|_| code.len() <= MAX_BYTES) else {
         return Vec::new();
     };
