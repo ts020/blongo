@@ -878,3 +878,116 @@ async fn agents_cannot_escape_the_spawn_limits() {
     );
     core.shutdown();
 }
+
+#[tokio::test]
+async fn agents_cannot_wake_more_threads_than_they_could_start() {
+    let dir = temp_dir("p4-mcp-wake");
+    std::fs::create_dir_all(dir.join("project")).unwrap();
+    let (mut core, _) = start_mcp(&dir);
+    let project = core.new_project(&dir.join("project")).await;
+    let caller = core.new_thread(project).await;
+
+    async fn field(core: &mut TestCore, thread: ThreadId, name: &str) -> Option<String> {
+        let answer = core.last_answer(thread).await;
+        serde_json::from_str::<serde_json::Value>(&answer)
+            .ok()
+            .and_then(|v| v[name].as_str().map(str::to_owned))
+    }
+    async fn wake(core: &mut TestCore, from: ThreadId, target: ThreadId) -> String {
+        send_to(core, from, target, "sleep 40").await
+    }
+    async fn send_to(core: &mut TestCore, from: ThreadId, target: ThreadId, text: &str) -> String {
+        let call = serde_json::json!({ "threadId": target.to_string(), "message": text });
+        core.turn(from, &format!("mcp: t3_thread_send {call}"))
+            .await;
+        core.last_answer(from).await
+    }
+
+    // 1. Idle children are no way around the limits: one thread makes at
+    // most 16 of them, working or not.
+    let mut kids = Vec::new();
+    for _ in 0..16 {
+        core.turn(caller, "mcp: t3_thread_create {}").await;
+        let id = field(&mut core, caller, "threadId").await.unwrap();
+        kids.push(ThreadId::parse(&id).unwrap());
+    }
+    core.turn(caller, "mcp: t3_thread_create {}").await;
+    let refused = core.last_answer(caller).await;
+    assert!(
+        refused.starts_with("ERROR this thread already started 16 threads"),
+        "{refused}"
+    );
+
+    // 2. Waking idle children one after another: only four work at once.
+    let mut answers = Vec::new();
+    for kid in &kids[..10] {
+        answers.push(wake(&mut core, caller, *kid).await);
+    }
+    let sent = answers.iter().filter(|a| a.contains("\"sent\"")).count();
+    let limited = answers
+        .iter()
+        .filter(|a| a.starts_with("ERROR 4 threads started by the same thread are already working"))
+        .count();
+    assert_eq!((sent, limited), (4, 6), "{answers:#?}");
+    // Messages to a child that is already working just wait in its line.
+    let queued = send_to(&mut core, caller, kids[0], "echo: queued").await;
+    assert!(queued.contains("\"sent\""), "{queued}");
+
+    // The project cap: a second parent fills it to eight, then even the
+    // user's own threads cannot be woken by an agent.
+    let caller2 = core.new_thread(project).await;
+    let mut kids2 = Vec::new();
+    for _ in 0..4 {
+        core.turn(caller2, "mcp: t3_thread_create {}").await;
+        let id = field(&mut core, caller2, "threadId").await.unwrap();
+        kids2.push(ThreadId::parse(&id).unwrap());
+    }
+    for kid in &kids2 {
+        let answer = wake(&mut core, caller2, *kid).await;
+        assert!(answer.contains("\"sent\""), "{answer}");
+    }
+    let caller3 = core.new_thread(project).await;
+    let users = core.new_thread(project).await;
+    let answer = wake(&mut core, caller3, users).await;
+    assert!(
+        answer.starts_with("ERROR 8 agent-started threads are already working in this project"),
+        "{answer}"
+    );
+    assert!(core.snapshot(users).await.items.is_empty());
+
+    // Stop the eight sleepers (waiting for each command's event could
+    // swallow the runs' ends, so only the ends are counted): eight
+    // interrupted runs plus the message queued on kids[0].
+    for kid in kids[..4].iter().chain(&kids2) {
+        core.dispatch(Command::RunInterrupt { thread_id: *kid });
+    }
+    for _ in 0..9 {
+        core.run_finished().await;
+    }
+
+    // 3. Finished delegate_task children cannot be woken past the limit
+    // either.
+    let boss = core.new_thread(project).await;
+    let delegate = "delegate_task {\"prompt\": \"echo: done\", \"mode\": \"async\"}";
+    core.send(boss, &format!("mcp*4: {delegate}"));
+    let mut done = threads_created_until_runs(&mut core, 5).await;
+    core.send(boss, &format!("mcp*2: {delegate}"));
+    done.extend(threads_created_until_runs(&mut core, 3).await);
+    assert_eq!(done.len(), 6);
+    assert!(done.iter().all(|t| t.parent_thread_id == Some(boss)));
+    let mut answers = Vec::new();
+    for child in &done {
+        answers.push(wake(&mut core, boss, child.id).await);
+    }
+    let sent = answers.iter().filter(|a| a.contains("\"sent\"")).count();
+    assert_eq!(sent, 4, "{answers:#?}");
+    for child in &done {
+        core.dispatch(Command::RunInterrupt {
+            thread_id: child.id,
+        });
+    }
+    for _ in 0..4 {
+        core.run_finished().await;
+    }
+    core.shutdown();
+}

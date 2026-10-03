@@ -270,6 +270,10 @@ pub(crate) struct Orchestrator {
     mcp: Option<McpServer>,
     /// MCP calls waiting for a thread's work to end.
     waiters: HashMap<ThreadId, Vec<oneshot::Sender<Result<Value, String>>>>,
+    /// Runs an agent asked for with `t3_thread_send` on a thread it did
+    /// not create: run → (thread, sender, project). They count toward the
+    /// spawn limits while the run is waiting or working.
+    agent_runs: HashMap<RunId, (ThreadId, ThreadId, ProjectId)>,
 }
 
 pub(crate) async fn run(
@@ -324,6 +328,7 @@ pub(crate) async fn run(
         schedules: HashMap::new(),
         mcp,
         waiters: HashMap::new(),
+        agent_runs: HashMap::new(),
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");

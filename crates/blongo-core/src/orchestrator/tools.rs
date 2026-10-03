@@ -12,6 +12,8 @@ const MAX_DELEGATION_DEPTH: usize = 2;
 const MAX_ACTIVE_CHILDREN: usize = 4;
 /// Agent-created threads live at once in one project, whoever made them.
 const MAX_PROJECT_AGENT_THREADS: usize = 8;
+/// Threads one thread may have created and not archived, working or not.
+const MAX_CHILDREN: usize = 16;
 /// Schedules agents may have waiting for approval in one project.
 const MAX_PROPOSALS: usize = 10;
 /// Shortest time between two runs of a schedule an agent proposes.
@@ -300,7 +302,70 @@ impl Orchestrator {
                 _ => {}
             }
         }
+        for (run_id, (thread_id, sender, project)) in &self.agent_runs {
+            if self.run_alive(*thread_id, *run_id) && seen.insert(*thread_id) {
+                out.push((*thread_id, *sender, *project));
+            }
+        }
         out
+    }
+
+    /// Is `run_id` working, queued on `thread_id`, or still waiting in line?
+    fn run_alive(&self, thread_id: ThreadId, run_id: RunId) -> bool {
+        let rt = self.rt.get(&thread_id);
+        rt.and_then(|rt| rt.run.as_ref())
+            .is_some_and(|r| r.run_id == run_id)
+            || rt.is_some_and(|rt| rt.queue.iter().any(|q| q.run_id == run_id))
+            || self.deferred.iter().any(|item| {
+                matches!(item, Deferred::Dispatch(p) if matches!(
+                    &p.command.command,
+                    Command::MessageDispatch { run_id: r, .. } if *r == run_id
+                ))
+            })
+    }
+
+    /// May `caller` wake `target` with a message? Waking a thread that is
+    /// not already working adds one more agent at work: an agent-created
+    /// target counts against its parent and the project, any other thread
+    /// against the sender and the project, the same limits as starting one.
+    fn check_wake(&mut self, caller: &Thread, target: &Thread) -> Result<(), String> {
+        let stale: Vec<RunId> = self
+            .agent_runs
+            .iter()
+            .filter(|(run, (thread, _, _))| !self.run_alive(*thread, **run))
+            .map(|(run, _)| *run)
+            .collect();
+        for run in stale {
+            self.agent_runs.remove(&run);
+        }
+        let live = self.live_agent_threads();
+        let working = live.iter().any(|(t, _, _)| *t == target.id)
+            || self.is_busy(target.id)
+            || self.busy.contains(&target.id);
+        if working {
+            // The message waits for the work already counted (or the
+            // user's own run) to finish: no extra agent at the same time.
+            return Ok(());
+        }
+        let parent = target.parent_thread_id.unwrap_or(caller.id);
+        if live.iter().filter(|(_, p, _)| *p == parent).count() >= MAX_ACTIVE_CHILDREN {
+            return Err(format!(
+                "{MAX_ACTIVE_CHILDREN} threads started by the same thread are already working; \
+                 wait for one (t3_thread_wait) before waking another"
+            ));
+        }
+        if live
+            .iter()
+            .filter(|(_, _, project)| *project == target.project_id)
+            .count()
+            >= MAX_PROJECT_AGENT_THREADS
+        {
+            return Err(format!(
+                "{MAX_PROJECT_AGENT_THREADS} agent-started threads are already working in this \
+                 project; wait for some to finish"
+            ));
+        }
+        Ok(())
     }
 
     /// May `caller` start one more thread? Depth, its own live children
@@ -310,6 +375,28 @@ impl Orchestrator {
             return Err(format!(
                 "threads started by agents are limited to {MAX_DELEGATION_DEPTH} levels; do \
                  this task yourself"
+            ));
+        }
+        let created = self
+            .threads
+            .values()
+            .filter(|t| t.parent_thread_id == Some(caller.id) && !t.archived)
+            .count()
+            + self
+                .deferred
+                .iter()
+                .filter(|item| {
+                    matches!(item, Deferred::Dispatch(p) if matches!(
+                        &p.command.command,
+                        Command::ThreadCreate { parent_thread_id: Some(parent), .. }
+                            if *parent == caller.id
+                    ))
+                })
+                .count();
+        if created >= MAX_CHILDREN {
+            return Err(format!(
+                "this thread already started {MAX_CHILDREN} threads; reuse one with \
+                 t3_thread_send, or ask the user to archive some"
             ));
         }
         let live = self.live_agent_threads();
@@ -592,7 +679,14 @@ impl Orchestrator {
                     Some("steer") => Delivery::Steer,
                     _ => Delivery::Queue,
                 };
+                if let Err(e) = self.check_wake(caller, &target) {
+                    return answer(tx, Err(e));
+                }
                 let run_id = RunId::new();
+                if target.parent_thread_id.is_none() {
+                    self.agent_runs
+                        .insert(run_id, (target.id, caller.id, target.project_id));
+                }
                 let send = Command::MessageDispatch {
                     thread_id: target.id,
                     message_id: ItemId::new(),
