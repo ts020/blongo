@@ -776,6 +776,7 @@ async fn drive(
         stdin,
         stdout,
         stderr,
+        ..
     } = proc;
     let kill_grace = options.kill_grace;
     let mut peer = RpcPeer::new(RpcOut::new(stdin), stdout);

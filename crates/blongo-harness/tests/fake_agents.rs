@@ -198,29 +198,38 @@ async fn antigravity_tool_permission_and_cancel() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_signed_out_surfaces_oauth_url() {
-    let mut session = acp::start(
-        config("fake_acp.py").env("FAKE_ACP_SIGNED_OUT", "1"),
-        acp::antigravity(),
-    )
-    .await
-    .unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(20), session.next_event())
+    // stdout (as zeron/t3code describe it) and stderr (the real 1.2.1 and
+    // 1.3.0 servers, whose URL is longer than a stderr tail line).
+    for on_stderr in ["0", "1"] {
+        let mut session = acp::start(
+            config("fake_acp.py")
+                .env("FAKE_ACP_SIGNED_OUT", "1")
+                .env("FAKE_ACP_AUTH_STDERR", on_stderr),
+            acp::antigravity(),
+        )
         .await
-        .unwrap()
         .unwrap();
-    match event {
-        AgentEvent::AuthRequired { url: Some(url), .. } => {
-            assert!(url.starts_with("https://accounts.google.com/"), "{url}")
-        }
-        other => panic!("expected AuthRequired, got {other:?}"),
-    }
-    // The session ends (child reaped) instead of hanging on the browser.
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), session.next_event())
+        let event = tokio::time::timeout(Duration::from_secs(20), session.next_event())
             .await
-            .unwrap(),
-        None
-    );
+            .unwrap()
+            .unwrap();
+        match event {
+            AgentEvent::AuthRequired { url: Some(url), .. } => {
+                assert!(url.starts_with("https://accounts.google.com/"), "{url}");
+                if on_stderr == "1" {
+                    assert!(url.ends_with(&"x".repeat(500)), "URL cut short: {url}");
+                }
+            }
+            other => panic!("expected AuthRequired (stderr={on_stderr}), got {other:?}"),
+        }
+        // The session ends (child reaped) instead of hanging on the browser.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), session.next_event())
+                .await
+                .unwrap(),
+            None
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -276,34 +285,38 @@ async fn antigravity_resume_loads_without_replaying_history() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_login_waits_for_the_browser() {
-    let dir = std::env::temp_dir().join(format!("blongo-login-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let done = dir.join("done");
-    let _ = std::fs::remove_file(&done);
-    let (url_tx, mut url_rx) = tokio::sync::mpsc::channel(4);
-    let config = config("fake_acp.py")
-        .env("FAKE_ACP_SIGNED_OUT", "1")
-        .env("FAKE_ACP_LOGIN_FILE", &done);
-    let login = tokio::spawn(acp::login(
-        config,
-        acp::antigravity(),
-        url_tx,
-        Duration::from_secs(20),
-    ));
-    let url = tokio::time::timeout(Duration::from_secs(20), url_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(url.starts_with("https://accounts.google.com/"), "{url}");
-    assert!(!login.is_finished(), "login must wait for the browser");
-    // The user finishes signing in.
-    std::fs::write(&done, "").unwrap();
-    tokio::time::timeout(Duration::from_secs(20), login)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    for on_stderr in ["0", "1"] {
+        let dir =
+            std::env::temp_dir().join(format!("blongo-login-{}-{on_stderr}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done");
+        let _ = std::fs::remove_file(&done);
+        let (url_tx, mut url_rx) = tokio::sync::mpsc::channel(4);
+        let config = config("fake_acp.py")
+            .env("FAKE_ACP_SIGNED_OUT", "1")
+            .env("FAKE_ACP_AUTH_STDERR", on_stderr)
+            .env("FAKE_ACP_LOGIN_FILE", &done);
+        let login = tokio::spawn(acp::login(
+            config,
+            acp::antigravity(),
+            url_tx,
+            Duration::from_secs(20),
+        ));
+        let url = tokio::time::timeout(Duration::from_secs(20), url_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(url.starts_with("https://accounts.google.com/"), "{url}");
+        assert!(!login.is_finished(), "login must wait for the browser");
+        // The user finishes signing in.
+        std::fs::write(&done, "").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), login)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

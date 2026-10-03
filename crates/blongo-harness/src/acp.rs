@@ -95,7 +95,14 @@ pub fn antigravity() -> AcpAgent {
         executable_name: ANTIGRAVITY_ENTRY,
         extra_paths: antigravity_managed_entry().into_iter().collect(),
         args: if cfg!(target_os = "linux") {
-            vec!["--uid="]
+            let mut args = vec!["--uid="];
+            // The google3 runtime aborts at start-up (SIGABRT, "Failed to
+            // create an AF_INET6 socket") on kernels or containers without
+            // IPv6 unless told not to check.
+            if !ipv6_available() {
+                args.push("--enforce_kernel_ipv6_support=false");
+            }
+            args
         } else {
             Vec::new()
         },
@@ -124,6 +131,11 @@ pub fn antigravity() -> AcpAgent {
         kill_grace: Duration::from_secs(3),
         resume_session: None,
     }
+}
+
+/// Whether this host can create an IPv6 socket.
+fn ipv6_available() -> bool {
+    std::net::UdpSocket::bind("[::]:0").is_ok()
 }
 
 /// Where Blongo would unpack the downloaded archive:
@@ -210,7 +222,7 @@ pub async fn start(config: SessionConfig, agent: AcpAgent) -> anyhow::Result<Ses
     config
         .env_remove
         .extend(agent.env_remove.iter().map(Into::into));
-    let proc = process::spawn(&exe, &args, &config, &agent.env)?;
+    let proc = process::spawn_watching(&exe, &args, &config, &agent.env, agent.auth_url_prefix)?;
     let pid = proc.pid();
     let (event_tx, event_rx) = mpsc::channel(crate::EVENT_CHANNEL_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -234,6 +246,28 @@ pub(crate) fn initialize_params() -> Value {
 pub fn auth_url(prefix: &str, line: &str) -> Option<String> {
     let url = line.strip_prefix(prefix)?.trim();
     (url.starts_with("https://") && url.len() <= 16_384).then(|| url.to_owned())
+}
+
+/// The next watched stderr line; pending forever without a watch.
+async fn stderr_line(matches: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match matches {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next sign-in URL printed on stderr; pending forever when there is
+/// none (or the stream ended).
+async fn stderr_auth_url(matches: &mut Option<mpsc::Receiver<String>>, agent: &AcpAgent) -> String {
+    loop {
+        let Some(line) = stderr_line(matches).await else {
+            *matches = None;
+            continue;
+        };
+        if let Some(url) = agent.auth_url_prefix.and_then(|p| auth_url(p, &line)) {
+            return url;
+        }
+    }
 }
 
 struct PendingPermission {
@@ -904,12 +938,13 @@ pub async fn login(
     config
         .env_remove
         .extend(agent.env_remove.iter().map(Into::into));
-    let proc = process::spawn(&exe, &args, &config, &agent.env)?;
+    let proc = process::spawn_watching(&exe, &args, &config, &agent.env, agent.auth_url_prefix)?;
     let AgentProcess {
         mut child,
         stdin,
         stdout,
         stderr,
+        mut stderr_matches,
     } = proc;
     let mut peer = RpcPeer::new(RpcOut::new(stdin), stdout);
     let result = async {
@@ -932,7 +967,19 @@ pub async fn login(
             .request("authenticate", json!({ "methodId": method }));
         let wait_for_auth = async {
             loop {
-                match peer.next().await {
+                let next = tokio::select! {
+                    next = peer.next() => next,
+                    Some(line) = stderr_line(&mut stderr_matches) => {
+                        if let Some(url) = agent
+                            .auth_url_prefix
+                            .and_then(|prefix| auth_url(prefix, &line))
+                        {
+                            let _ = on_url.send(url).await;
+                        }
+                        continue;
+                    }
+                };
+                match next {
                     Ok(Some(Incoming::Text(line))) => {
                         if let Some(url) = agent
                             .auth_url_prefix
@@ -985,6 +1032,7 @@ async fn drive(
         stdin,
         stdout,
         stderr,
+        mut stderr_matches,
     } = proc;
     let mut peer = RpcPeer::new(RpcOut::new(stdin), stdout);
     // `RpcPeer::on_text` is a plain fn pointer; Antigravity's prefix is the
@@ -995,6 +1043,9 @@ async fn drive(
     let setup_result = tokio::select! {
         r = setup(&mut peer, &config, &agent, &events) => r,
         _ = events.closed() => Err(String::new()),
+        // Real Antigravity builds (1.2.1, 1.3.0) print the sign-in URL on
+        // stderr while `authenticate` stays pending.
+        url = stderr_auth_url(&mut stderr_matches, &agent) => Err(format!("AUTH:{url}")),
     };
     let session_id = match setup_result {
         Ok(id) => id,
@@ -1034,6 +1085,12 @@ async fn drive(
     let mut batch = Vec::new();
     'main: loop {
         tokio::select! {
+            url = stderr_auth_url(&mut stderr_matches, &agent) => {
+                batch.push(AgentEvent::AuthRequired {
+                    message: format!("Sign in to {} to continue.", agent.display_name),
+                    url: Some(url),
+                });
+            }
             msg = peer.next() => match msg {
                 Ok(Some(Incoming::Text(line))) => {
                     // A sign-in URL mid-session (token expired).

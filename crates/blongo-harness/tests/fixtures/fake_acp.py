@@ -6,7 +6,9 @@ session/update / session/request_permission / session/cancel) with the
 Antigravity quirks the harness must handle:
 - non-JSON noise on stdout,
 - FAKE_ACP_SIGNED_OUT=1: `authenticate` prints the OAuth URL line on stdout
-  and never answers (the real server waits for the browser),
+  and never answers (the real server waits for the browser); with
+  FAKE_ACP_AUTH_STDERR=1 the line goes to stderr and the URL is over 500
+  bytes, as the real 1.2.1 / 1.3.0 servers print it,
 - tool payloads spell the command `CommandLine` and the output
   `combinedOutput`, plus a duplicated `formattedOutput` and a huge field.
 
@@ -174,8 +176,13 @@ def main():
         elif method == "authenticate":
             assert msg["params"] == {"methodId": "oauth-personal"}, msg
             if os.environ.get("FAKE_ACP_SIGNED_OUT") == "1":
-                print("Open the following link to authenticate the ACP server: "
-                      "https://accounts.google.com/o/oauth2/v2/auth?client_id=fake&state=s", flush=True)
+                # Real 1.2.1 / 1.3.0 builds print it on stderr, ~560 bytes.
+                real = os.environ.get("FAKE_ACP_AUTH_STDERR") == "1"
+                url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fake&state=s"
+                if real:
+                    url += "&scope=" + "x" * 500
+                print("Open the following link to authenticate the ACP server: " + url,
+                      file=sys.stderr if real else sys.stdout, flush=True)
                 done = os.environ.get("FAKE_ACP_LOGIN_FILE")
                 if not done:
                     continue  # waits for the browser forever

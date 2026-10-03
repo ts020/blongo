@@ -36,6 +36,10 @@ pub struct AgentProcess {
     pub stdin: mpsc::UnboundedSender<StdinMsg>,
     pub stdout: LineReader<ChildStdout>,
     pub stderr: StderrTail,
+    /// Whole stderr lines starting with the prefix given to
+    /// [`spawn_watching`] (Antigravity prints its sign-in URL there, longer
+    /// than a tail line keeps). Bounded; extra matches are dropped.
+    pub stderr_matches: Option<mpsc::Receiver<String>>,
 }
 
 impl AgentProcess {
@@ -56,6 +60,18 @@ pub fn spawn(
     args: &[&OsStr],
     config: &SessionConfig,
     harness_env: &[(&str, &str)],
+) -> io::Result<AgentProcess> {
+    spawn_watching(program, args, config, harness_env, None)
+}
+
+/// [`spawn`], also forwarding stderr lines that start with `watch_prefix`
+/// to [`AgentProcess::stderr_matches`].
+pub fn spawn_watching(
+    program: &Path,
+    args: &[&OsStr],
+    config: &SessionConfig,
+    harness_env: &[(&str, &str)],
+    watch_prefix: Option<&'static str>,
 ) -> io::Result<AgentProcess> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -96,12 +112,20 @@ pub fn spawn(
     let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
     tokio::spawn(stdin_writer(stdin, stdin_rx));
     let tail = StderrTail::default();
-    tokio::spawn(drain_stderr(stderr, tail.clone()));
+    let (watch, stderr_matches) = match watch_prefix {
+        Some(prefix) => {
+            let (tx, rx) = mpsc::channel(4);
+            (Some((prefix, tx)), Some(rx))
+        }
+        None => (None, None),
+    };
+    tokio::spawn(drain_stderr(stderr, tail.clone(), watch));
     Ok(AgentProcess {
         child,
         stdin: stdin_tx,
         stdout: LineReader::new(stdout),
         stderr: tail,
+        stderr_matches,
     })
 }
 
@@ -128,9 +152,18 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr, tail: StderrTail) {
+async fn drain_stderr(
+    stderr: tokio::process::ChildStderr,
+    tail: StderrTail,
+    watch: Option<(&'static str, mpsc::Sender<String>)>,
+) {
     let mut lines = LineReader::new(stderr);
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some((prefix, tx)) = &watch
+            && line.starts_with(prefix)
+        {
+            let _ = tx.try_send(line.clone());
+        }
         tail.push(&line);
     }
 }
