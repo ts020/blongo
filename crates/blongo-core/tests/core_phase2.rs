@@ -572,7 +572,7 @@ async fn provider_switch_hands_the_conversation_over() {
     )));
     let argv: Vec<String> = serde_json::from_value(read_log(&log)[0]["argv"].clone()).unwrap();
     assert!(!argv.contains(&"--resume".to_owned()));
-    assert!(argv.windows(2).any(|w| w == ["--model", "fake-large"]));
+    assert!(argv.contains(&"--model=fake-large".to_owned()));
     let state = core.thread_state(thread.id).await;
     assert_eq!(
         state.provider_thread_id.as_deref(),

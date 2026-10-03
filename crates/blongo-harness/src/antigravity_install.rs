@@ -182,8 +182,16 @@ async fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
             "--silent",
             "--show-error",
             "--location",
+            // Only the pinned origin's scheme (https in the app; tests serve
+            // plain http on localhost), and redirects only ever to https.
             "--proto",
-            "=https,http",
+            if url.starts_with("https://") {
+                "=https"
+            } else {
+                "=https,http"
+            },
+            "--proto-redir",
+            "=https",
             "--connect-timeout",
             "30",
             "--speed-limit",

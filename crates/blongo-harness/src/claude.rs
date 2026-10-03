@@ -86,8 +86,8 @@ pub fn args(config: &SessionConfig, options: &ClaudeOptions) -> Vec<String> {
     .collect();
     args.push(options.permission_mode.clone());
     if let Some(model) = &config.model {
-        args.push("--model".into());
-        args.push(model.clone());
+        // One argument, so a value starting with `-` is never read as a flag.
+        args.push(format!("--model={model}"));
     }
     if let Some(session) = &options.resume {
         args.push("--resume".into());
@@ -626,7 +626,7 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.starts_with("-p --input-format stream-json --output-format stream-json"));
         assert!(joined.contains("--permission-prompt-tool stdio --permission-mode default"));
-        assert!(joined.ends_with("--model fake-default"));
+        assert!(joined.ends_with("--model=fake-default"));
     }
 
     #[test]
