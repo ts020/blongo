@@ -339,6 +339,40 @@ async fn steer_antigravity_cancels_and_resends() {
     steer_once(ProviderKind::Antigravity).await;
 }
 
+/// The turn ends before the steer reaches it (Codex refuses the steer):
+/// the message becomes a queued run of its own instead of a hidden turn.
+#[tokio::test]
+async fn steer_that_misses_the_turn_is_queued() {
+    let dir = temp_dir("steer-missed");
+    let mut core = start(&dir);
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::Codex, false).await;
+    core.send(thread.id, "slow");
+    core.until(|e| matches!(e, CoreEvent::TextDelta { .. }).then_some(()))
+        .await;
+    let steer = core.send_with(thread.id, "missed: echo: later", Delivery::Steer);
+    core.accepted(&steer).await;
+    assert_eq!(core.run_finished().await, RunStatus::Completed);
+    assert_eq!(core.run_finished().await, RunStatus::Completed);
+    let snap = core.snapshot(thread.id).await;
+    assert_eq!(snap.runs.len(), 2, "{:?}", snap.runs);
+    let steered = snap
+        .items
+        .iter()
+        .find(|i| i.kind == ItemKind::UserMessage && &*i.text == "missed: echo: later")
+        .unwrap();
+    // The message moved to the second run, which answered it.
+    assert_eq!(steered.run_id, Some(snap.runs[1].id));
+    let answers = assistant_texts(&snap);
+    assert!(
+        answers.last().unwrap().contains("missed: echo: later"),
+        "{answers:?}"
+    );
+    assert!(snap.items.iter().any(|i| matches!(&i.kind,
+        ItemKind::SystemNotice { message } if message.contains("queued as the next turn"))));
+    core.shutdown();
+}
+
 #[tokio::test]
 async fn fork_codex_natively_at_a_turn() {
     let dir = temp_dir("fork-codex");

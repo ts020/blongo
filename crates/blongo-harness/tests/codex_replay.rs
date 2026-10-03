@@ -421,7 +421,7 @@ async fn message_steering_uses_turn_steer() {
     session.prompt(replay.prompt(0)).unwrap();
     // Sent before the turn id is known: the harness holds it until then.
     let steer = replay.recorded_text(|l| l == "turn/steer", 0);
-    session.steer(steer.clone()).unwrap();
+    session.steer("steer-1", steer.clone()).unwrap();
     let events = turn(&mut session, |_, _| {}).await;
     assert_eq!(status(&events), TurnStatus::Completed);
     assert!(

@@ -248,8 +248,10 @@ pub(crate) struct Driver {
     sanitize: bool,
     prompt_request: Option<i64>,
     cancel_sent: bool,
-    /// Text to send once the cancelled prompt answers (a steer).
-    steer: Option<String>,
+    /// Steers (id, text) to send once the cancelled prompt answers.
+    steer: Vec<(String, String)>,
+    /// The user interrupted the running prompt (steers no longer apply).
+    interrupting: bool,
     queued: VecDeque<String>,
     permissions: HashMap<String, PendingPermission>,
     permission_seq: u64,
@@ -262,7 +264,8 @@ impl Driver {
             sanitize,
             prompt_request: None,
             cancel_sent: false,
-            steer: None,
+            steer: Vec::new(),
+            interrupting: false,
             queued: VecDeque::new(),
             permissions: HashMap::new(),
             permission_seq: 0,
@@ -283,9 +286,12 @@ impl Driver {
         );
         self.prompt_request = Some(id);
         self.cancel_sent = false;
+        self.interrupting = false;
     }
 
-    pub(crate) fn command(&mut self, rpc: &mut RpcOut, command: Command) {
+    /// Handle a host command; returns events it causes right away.
+    pub(crate) fn command(&mut self, rpc: &mut RpcOut, command: Command) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
         match command {
             Command::Prompt(text) => {
                 if self.turn_active() {
@@ -306,25 +312,29 @@ impl Driver {
                     rpc.respond(&pending.id, json!({ "outcome": outcome }));
                 }
             }
-            Command::Steer(text) => {
-                if !self.turn_active() {
-                    self.send_prompt(rpc, &text);
+            Command::Steer { id, text } => {
+                if !self.turn_active() || self.interrupting {
+                    // Never a prompt of its own: the host decides.
+                    out.push(AgentEvent::SteerNotDelivered { id });
                 } else {
                     // Several steers before the cancel lands are joined.
-                    self.steer = Some(match self.steer.take() {
-                        Some(prev) => format!("{prev}\n\n{text}"),
-                        None => text,
-                    });
+                    self.steer.push((id, text));
                     self.cancel(rpc);
                 }
             }
             Command::Interrupt => {
-                self.steer = None;
+                if self.turn_active() {
+                    self.interrupting = true;
+                }
+                for (id, _) in self.steer.drain(..) {
+                    out.push(AgentEvent::SteerNotDelivered { id });
+                }
                 self.cancel(rpc);
             }
             // ACP v1 has no rewind.
             Command::Rewind { .. } => {}
         }
+        out
     }
 
     fn cancel(&mut self, rpc: &mut RpcOut) {
@@ -349,9 +359,15 @@ impl Driver {
         match msg {
             Incoming::Response { id, result } if Some(id) == self.prompt_request => {
                 self.prompt_request = None;
-                if let Some(text) = self.steer.take() {
+                if !self.steer.is_empty() {
                     // The cancelled half of a steer: the turn continues
                     // with the new prompt.
+                    let text = self
+                        .steer
+                        .drain(..)
+                        .map(|(_, t)| t)
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
                     self.permissions.clear();
                     self.send_prompt(rpc, &text);
                     return;
@@ -1046,7 +1062,7 @@ async fn drive(
                 }
             },
             command = commands.recv() => match command {
-                Some(command) => driver.command(&mut peer.out, command),
+                Some(command) => batch.extend(driver.command(&mut peer.out, command)),
                 None => break 'main,
             },
         }
@@ -1076,6 +1092,39 @@ mod tests {
             out.push(serde_json::from_str(&line).unwrap());
         }
         out
+    }
+
+    #[test]
+    fn steers_that_miss_the_prompt_never_start_one() {
+        let (mut d, mut rpc, mut rx) = harness();
+        let steer = |id: &str| Command::Steer {
+            id: id.into(),
+            text: "more".into(),
+        };
+        // Idle: no new prompt.
+        assert_eq!(
+            d.command(&mut rpc, steer("a")),
+            vec![AgentEvent::SteerNotDelivered { id: "a".into() }]
+        );
+        assert!(sent(&mut rx).is_empty());
+        // During an interrupt the steer does not revive the prompt.
+        d.command(&mut rpc, Command::Prompt("hi".into()));
+        assert!(d.command(&mut rpc, steer("b")).is_empty());
+        assert_eq!(
+            d.command(&mut rpc, Command::Interrupt),
+            vec![AgentEvent::SteerNotDelivered { id: "b".into() }]
+        );
+        assert_eq!(
+            d.command(&mut rpc, steer("c")),
+            vec![AgentEvent::SteerNotDelivered { id: "c".into() }]
+        );
+        let wire = sent(&mut rx);
+        assert_eq!(
+            wire.iter()
+                .filter(|f| f["method"] == "session/prompt")
+                .count(),
+            1
+        );
     }
 
     fn update(update: Value) -> Incoming {

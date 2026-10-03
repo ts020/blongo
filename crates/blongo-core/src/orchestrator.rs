@@ -1382,28 +1382,68 @@ impl Orchestrator {
         let live = self.rt.get(&thread_id).and_then(|rt| rt.session.as_ref());
         match live {
             Some(live) if still_running => {
-                let _ = live.session.steer(text.to_string());
+                let _ = live.session.steer(message_id.to_string(), text.to_string());
             }
             _ => {
                 // The turn ended before the steer got there.
-                if let Some(rt) = self.rt.get_mut(&thread_id)
-                    && rt.run.is_none()
-                {
-                    let item = self.new_item(
-                        thread_id,
-                        Some(run_id),
-                        ItemKind::SystemNotice {
-                            message: "The turn ended before this message reached the agent.".into(),
-                        },
-                        "",
-                    )?;
-                    self.commit_events(vec![EventKind::ItemAdded {
-                        item: Arc::new(item),
-                    }]);
-                }
+                self.requeue_steer(thread_id, message_id);
             }
         }
         Ok(())
+    }
+
+    /// A steered message that never reached its turn becomes a queued run of
+    /// its own (behind whatever runs now), so its text is neither lost nor
+    /// sent as a turn the core does not know about.
+    fn requeue_steer(&mut self, thread_id: ThreadId, message_id: ItemId) {
+        let Ok(Some(item)) = self.store.item(message_id) else {
+            return;
+        };
+        if item.thread_id != thread_id || item.kind != ItemKind::UserMessage {
+            return;
+        }
+        // Already moved (a duplicate report).
+        if self
+            .rt
+            .get(&thread_id)
+            .is_some_and(|rt| rt.queue.iter().any(|q| q.message_id == message_id))
+        {
+            return;
+        }
+        let Some(provider) = self.threads.get(&thread_id).map(|t| t.provider) else {
+            return;
+        };
+        let run_id = RunId::new();
+        let now = Timestamp::now();
+        let mut events = self.close_text(thread_id);
+        events.push(EventKind::RunCreated {
+            run: Run::new(run_id, thread_id, RunStatus::Queued, provider, now),
+        });
+        events.push(EventKind::ItemUpdated {
+            item: Arc::new(TurnItem {
+                run_id: Some(run_id),
+                ..item
+            }),
+        });
+        if let Ok(notice) = self.new_item(
+            thread_id,
+            None,
+            ItemKind::SystemNotice {
+                message: "The turn ended before your message reached the agent; \
+                          it was queued as the next turn."
+                    .into(),
+            },
+            "",
+        ) {
+            events.push(EventKind::ItemAdded {
+                item: Arc::new(notice),
+            });
+        }
+        self.commit_events(events);
+        if let Ok(rt) = self.rt(thread_id) {
+            rt.queue.push_back(Queued { run_id, message_id });
+        }
+        self.ready.push(thread_id);
     }
 
     /// Start the next queued message of every thread whose run just ended.
@@ -1684,6 +1724,13 @@ impl Orchestrator {
     }
 
     fn on_agent_event(&mut self, thread_id: ThreadId, event: AgentEvent) {
+        if let AgentEvent::SteerNotDelivered { id } = &event {
+            // May come before or after the turn's end: never tied to a run.
+            if let Some(message_id) = ItemId::parse(id) {
+                self.requeue_steer(thread_id, message_id);
+            }
+            return;
+        }
         if let AgentEvent::Models { models } = event {
             if let Some(thread) = self.threads.get(&thread_id) {
                 self.emit(CoreEvent::Models {
@@ -1742,7 +1789,9 @@ impl Orchestrator {
             return;
         };
         match event {
-            AgentEvent::SessionStarted { .. } | AgentEvent::Models { .. } => unreachable!(),
+            AgentEvent::SessionStarted { .. }
+            | AgentEvent::Models { .. }
+            | AgentEvent::SteerNotDelivered { .. } => unreachable!(),
             AgentEvent::ProviderTurnId { id } => {
                 let Some(run) = self.active_run(thread_id) else {
                     return;

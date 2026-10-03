@@ -151,7 +151,8 @@ pub(crate) fn initialize_params() -> Value {
 enum Pending {
     TurnStart,
     Interrupt,
-    Steer,
+    /// `turn/steer` for the steer with this id.
+    Steer(String),
     Revert,
 }
 
@@ -163,8 +164,8 @@ pub(crate) struct Driver {
     turn_id: Option<String>,
     interrupt_requested: bool,
     queued_prompts: VecDeque<String>,
-    /// Steers sent before the turn id was known.
-    pending_steers: Vec<String>,
+    /// Steers (id, text) sent before the turn id was known.
+    pending_steers: Vec<(String, String)>,
     /// JSON-RPC ids of approval requests awaiting the user, by event id.
     approvals: HashMap<String, Value>,
     /// agentMessage items that streamed deltas (completed-item fallback).
@@ -192,7 +193,9 @@ impl Driver {
         }
     }
 
-    pub(crate) fn command(&mut self, rpc: &mut RpcOut, command: Command) {
+    /// Handle a host command; returns events it causes right away.
+    pub(crate) fn command(&mut self, rpc: &mut RpcOut, command: Command) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
         match command {
             Command::Prompt(text) => {
                 if self.turn_active {
@@ -211,13 +214,14 @@ impl Driver {
                     self.pending.insert(id, Pending::Revert);
                 }
             }
-            Command::Steer(text) => {
-                if !self.turn_active {
-                    self.start_turn(rpc, &text);
+            Command::Steer { id, text } => {
+                if !self.turn_active || self.interrupt_requested {
+                    // Never a turn of its own: the host decides.
+                    out.push(AgentEvent::SteerNotDelivered { id });
                 } else if self.turn_id.is_some() {
-                    self.send_steer(rpc, &text);
+                    self.send_steer(rpc, &id, &text);
                 } else {
-                    self.pending_steers.push(text);
+                    self.pending_steers.push((id, text));
                 }
             }
             Command::Approve {
@@ -244,6 +248,7 @@ impl Driver {
                 }
             }
         }
+        out
     }
 
     fn start_turn(&mut self, rpc: &mut RpcOut, text: &str) {
@@ -265,7 +270,7 @@ impl Driver {
         self.interrupt_requested = false;
     }
 
-    fn send_steer(&mut self, rpc: &mut RpcOut, text: &str) {
+    fn send_steer(&mut self, rpc: &mut RpcOut, steer_id: &str, text: &str) {
         let Some(turn_id) = &self.turn_id else {
             return;
         };
@@ -277,7 +282,7 @@ impl Driver {
                 "input": [{ "type": "text", "text": text }],
             }),
         );
-        self.pending.insert(id, Pending::Steer);
+        self.pending.insert(id, Pending::Steer(steer_id.to_owned()));
     }
 
     fn send_interrupt(&mut self, rpc: &mut RpcOut) {
@@ -303,8 +308,8 @@ impl Driver {
             if self.interrupt_requested {
                 self.send_interrupt(rpc);
             } else {
-                for text in std::mem::take(&mut self.pending_steers) {
-                    self.send_steer(rpc, &text);
+                for (id, text) in std::mem::take(&mut self.pending_steers) {
+                    self.send_steer(rpc, &id, &text);
                 }
             }
         }
@@ -322,9 +327,10 @@ impl Driver {
         self.interrupt_requested = false;
         self.streamed.clear();
         self.approvals.clear();
-        // A steer that never reached the turn becomes the next one.
-        for text in std::mem::take(&mut self.pending_steers) {
-            self.queued_prompts.push_back(text);
+        // A steer that never reached the turn goes back to the host (it
+        // must not become a turn the host does not know about).
+        for (id, _) in std::mem::take(&mut self.pending_steers) {
+            out.push(AgentEvent::SteerNotDelivered { id });
         }
         if let Some(next) = self.queued_prompts.pop_front() {
             self.start_turn(rpc, &next);
@@ -337,9 +343,10 @@ impl Driver {
                 (Some(Pending::TurnStart), Ok(result)) => {
                     self.note_turn_id(rpc, result.pointer("/turn/id").and_then(Value::as_str), out);
                 }
-                (Some(Pending::Steer), Err(e)) => out.push(AgentEvent::Error {
-                    message: format!("turn/steer: {e}"),
-                }),
+                // Refused (typically: the turn already ended).
+                (Some(Pending::Steer(steer_id)), Err(_)) => {
+                    out.push(AgentEvent::SteerNotDelivered { id: steer_id })
+                }
                 (Some(Pending::Revert), Err(e)) => out.push(AgentEvent::Error {
                     message: format!(
                         "Codex could not roll back its conversation ({e}); it may still \
@@ -818,7 +825,7 @@ async fn drive(
                 }
             },
             command = commands.recv() => match command {
-                Some(command) => driver.command(&mut peer.out, command),
+                Some(command) => batch.extend(driver.command(&mut peer.out, command)),
                 None => break 'main,
             },
         }
@@ -869,6 +876,82 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    fn steer(id: &str, text: &str) -> Command {
+        Command::Steer {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn steers_that_miss_the_turn_never_start_one() {
+        let (mut d, mut rpc, mut rx) = harness();
+        let mut out = Vec::new();
+        // Idle: nothing is sent, the steer comes straight back.
+        assert_eq!(
+            d.command(&mut rpc, steer("s0", "idle")),
+            vec![AgentEvent::SteerNotDelivered { id: "s0".into() }]
+        );
+        assert!(sent(&mut rx).is_empty());
+
+        // Before the turn id is known it waits; the turn ends first.
+        d.command(&mut rpc, Command::Prompt("go".into()));
+        assert!(d.command(&mut rpc, steer("s1", "early")).is_empty());
+        sent(&mut rx);
+        d.incoming(
+            &mut rpc,
+            note(
+                "turn/completed",
+                json!({"threadId":"th1","turn":{"id":"tu1","status":"completed","error":null}}),
+            ),
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![
+                AgentEvent::TurnCompleted {
+                    status: TurnStatus::Completed
+                },
+                AgentEvent::SteerNotDelivered { id: "s1".into() },
+            ]
+        );
+        assert!(
+            sent(&mut rx).iter().all(|f| f["method"] != "turn/start"),
+            "no hidden turn"
+        );
+
+        // Sent as turn/steer, but Codex refuses it (the turn ended first).
+        out.clear();
+        d.command(&mut rpc, Command::Prompt("again".into()));
+        d.incoming(
+            &mut rpc,
+            note(
+                "turn/started",
+                json!({"threadId":"th1","turn":{"id":"tu2"}}),
+            ),
+            &mut out,
+        );
+        sent(&mut rx);
+        d.command(&mut rpc, steer("s2", "late"));
+        let wire = sent(&mut rx);
+        assert_eq!(wire[0]["method"], "turn/steer");
+        let id = wire[0]["id"].as_i64().unwrap();
+        out.clear();
+        d.incoming(
+            &mut rpc,
+            Incoming::Response {
+                id,
+                result: Err(crate::jsonrpc::RpcError {
+                    code: -32600,
+                    message: "no active turn".into(),
+                    data: None,
+                }),
+            },
+            &mut out,
+        );
+        assert_eq!(out, vec![AgentEvent::SteerNotDelivered { id: "s2".into() }]);
     }
 
     #[test]

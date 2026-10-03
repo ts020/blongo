@@ -547,9 +547,9 @@ impl Shell {
                 }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
-                if let (EventKind::ItemAdded { .. }, ItemKind::UserMessage, Some(run_id)) =
-                    (kind, &item.kind, item.run_id)
+                if let (ItemKind::UserMessage, Some(run_id)) = (&item.kind, item.run_id)
                     && let Some(q) = self.queued.iter_mut().find(|(id, _)| *id == run_id)
+                    && q.1.is_empty()
                 {
                     q.1 = SharedString::from(item.text.to_string());
                     cx.notify();

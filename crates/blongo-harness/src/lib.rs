@@ -90,8 +90,12 @@ pub enum ApprovalDecision {
 #[derive(Debug)]
 pub(crate) enum Command {
     Prompt(String),
-    /// Add input to the running turn (see `SteerMode`); a prompt when idle.
-    Steer(String),
+    /// Add input to the running turn (see `SteerMode`). Never starts a
+    /// turn: undelivered steers come back as `SteerNotDelivered { id }`.
+    Steer {
+        id: String,
+        text: String,
+    },
     Approve {
         request_id: String,
         decision: ApprovalDecision,
@@ -135,11 +139,16 @@ impl Session {
         self.send(Command::Prompt(text.into()))
     }
 
-    /// Add input to the running turn (the provider's steering). When no turn
-    /// runs it is an ordinary prompt. The turn still ends with one
-    /// `TurnCompleted`.
-    pub fn steer(&self, text: impl Into<String>) -> anyhow::Result<()> {
-        self.send(Command::Steer(text.into()))
+    /// Add input to the running turn (the provider's steering); the turn
+    /// still ends with one `TurnCompleted`. If no turn is running, or the
+    /// turn ends or is interrupted before the input reaches it, the harness
+    /// emits `AgentEvent::SteerNotDelivered { id }` instead of starting a
+    /// turn of its own.
+    pub fn steer(&self, id: impl Into<String>, text: impl Into<String>) -> anyhow::Result<()> {
+        self.send(Command::Steer {
+            id: id.into(),
+            text: text.into(),
+        })
     }
 
     /// Roll the provider conversation back to before `before_turn` (a

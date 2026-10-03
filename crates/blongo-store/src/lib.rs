@@ -707,8 +707,8 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
         EventKind::ItemUpdated { item } => {
             expect_one(
                 tx.prepare_cached(
-                    "UPDATE turn_items SET kind = ?2, data = ?3, updated_at = ?4, ordinal = ?5
-                     WHERE id = ?1",
+                    "UPDATE turn_items SET kind = ?2, data = ?3, updated_at = ?4, ordinal = ?5,
+                     run_id = ?6 WHERE id = ?1",
                 )?
                 .execute(params![
                     item.id.to_string(),
@@ -716,6 +716,7 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                     serde_json::to_string(&item.kind)?,
                     at,
                     item.ordinal,
+                    item.run_id.map(|r| r.to_string()),
                 ])?,
                 "item",
             )?;

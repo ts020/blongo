@@ -319,3 +319,99 @@ async fn antigravity_login_times_out() {
     .unwrap_err();
     assert!(err.to_string().contains("timed out"), "{err}");
 }
+
+/// A steer that arrives after the turn ended comes back as
+/// `SteerNotDelivered`; the harness never runs it as a turn of its own.
+#[tokio::test(flavor = "current_thread")]
+async fn steer_after_the_turn_ended_is_returned_not_run() {
+    let sessions = [
+        claude::start(config("fake_claude.py")).await.unwrap(),
+        codex::start(config("fake_codex.py")).await.unwrap(),
+        acp::start(config("fake_acp.py"), acp::antigravity())
+            .await
+            .unwrap(),
+    ];
+    for mut session in sessions {
+        session.prompt("echo: one").unwrap();
+        run_turn(&mut session, ApprovalDecision::Allow).await;
+        session.steer("late-1", "echo: late").unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), session.next_event())
+            .await
+            .expect("an answer to the steer")
+            .expect("session alive");
+        assert_eq!(
+            event,
+            AgentEvent::SteerNotDelivered {
+                id: "late-1".into()
+            }
+        );
+        // Nothing else: no hidden turn started.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), session.next_event())
+                .await
+                .is_err(),
+            "the late steer started a turn"
+        );
+        session.shutdown().await;
+    }
+}
+
+/// A steer sent while an interrupt is in flight is not delivered either.
+#[tokio::test(flavor = "current_thread")]
+async fn steer_during_an_interrupt_is_returned() {
+    let sessions = [
+        claude::start(config("fake_claude.py")).await.unwrap(),
+        codex::start(config("fake_codex.py")).await.unwrap(),
+        acp::start(config("fake_acp.py"), acp::antigravity())
+            .await
+            .unwrap(),
+    ];
+    for mut session in sessions {
+        session.prompt("loop").unwrap();
+        let mut saw_not_delivered = false;
+        let mut deltas = 0;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(20), session.next_event())
+                .await
+                .expect("timed out")
+                .expect("ended");
+            match event {
+                AgentEvent::TextDelta { .. } => {
+                    deltas += 1;
+                    if deltas == 3 {
+                        session.interrupt().unwrap();
+                        session.steer("during", "echo: too late").unwrap();
+                    }
+                }
+                AgentEvent::SteerNotDelivered { id } => {
+                    assert_eq!(id, "during");
+                    saw_not_delivered = true;
+                }
+                AgentEvent::TurnCompleted { status } => {
+                    assert_eq!(status, TurnStatus::Interrupted);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !saw_not_delivered {
+            let event = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+                .await
+                .expect("steer answer")
+                .unwrap();
+            assert_eq!(
+                event,
+                AgentEvent::SteerNotDelivered {
+                    id: "during".into()
+                }
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), session.next_event())
+                .await
+                .is_err(),
+            "the steer started a turn"
+        );
+        session.shutdown().await;
+    }
+}

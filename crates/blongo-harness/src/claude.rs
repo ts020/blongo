@@ -565,14 +565,17 @@ async fn drive(
                     norm.turns_in_flight += 1;
                     proc.write_line(user_message_line(&text));
                 }
-                Some(Command::Steer(text)) => {
-                    let line = if norm.turns_in_flight > 0 && !norm.interrupted {
-                        steer_message_line(&text)
+                Some(Command::Steer { id, text }) => {
+                    if norm.turns_in_flight > 0 && !norm.interrupted {
+                        // If the CLI finishes the turn before reading it, it
+                        // answers it as a further turn; `turns_in_flight`
+                        // folds that into the same app turn.
+                        norm.turns_in_flight += 1;
+                        proc.write_line(steer_message_line(&text));
                     } else {
-                        user_message_line(&text)
-                    };
-                    norm.turns_in_flight += 1;
-                    proc.write_line(line);
+                        // Never a turn of its own: the host decides.
+                        let _ = events.send(AgentEvent::SteerNotDelivered { id }).await;
+                    }
                 }
                 Some(Command::Approve { request_id, decision }) => {
                     if let Some(pending) = norm.approvals.remove(&request_id) {

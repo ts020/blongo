@@ -13,7 +13,8 @@ command-execution approval round trip. FAKE_CODEX_SIGNED_OUT=1 makes
 `account/read` report no account.
 
 Phase 2: "slow" streams ticks for a while and ends by itself; "loop" and
-"slow" answer `turn/steer` by streaming "steered: <text>" and completing;
+"slow" answer `turn/steer` by streaming "steered: <text>" and completing
+(a steer starting with "missed:" ends the turn first and is then refused);
 "plan" sends two `turn/plan/updated`; "write <file> <text>" writes a file in
 the working directory (checkpoint tests); a prompt containing "echo:" is
 answered with the whole prompt text. `model/list`, `thread/fork` and
@@ -178,6 +179,13 @@ def loop_turn(turn_id, limit=None, delay=0.02):
             return
         if msg.get("method") == "turn/steer":
             assert msg["params"]["expectedTurnId"] == turn_id, msg
+            text = msg["params"]["input"][0]["text"]
+            if text.startswith("missed:"):
+                # The race: the turn ends before the steer is read, then the
+                # steer is refused.
+                complete(turn_id, "completed")
+                send({"id": msg["id"], "error": {"code": -32600, "message": "no active turn"}})
+                return
             respond(msg, {"turnId": turn_id})
             text = msg["params"]["input"][0]["text"]
             notify("item/agentMessage/delta",

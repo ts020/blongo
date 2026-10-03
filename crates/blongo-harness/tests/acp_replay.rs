@@ -325,7 +325,7 @@ async fn steering_cancels_and_resends_as_one_turn() {
             break;
         }
     }
-    session.steer(replay.prompt(1)).unwrap();
+    session.steer("steer-1", replay.prompt(1)).unwrap();
     events.extend(turn(&mut session, |_, _| {}).await);
     assert_eq!(status(&events), TurnStatus::Completed);
     assert_eq!(

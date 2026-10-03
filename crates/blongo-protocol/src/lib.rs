@@ -59,6 +59,13 @@ pub enum AgentEvent {
     ProviderTurnId {
         id: String,
     },
+    /// A steer (see `Session::steer`) did not reach a running turn: no turn
+    /// was running, the turn ended (or was interrupted) first, or the
+    /// provider refused it. The harness never turns a steer into a turn of
+    /// its own; the host decides what to do with the text.
+    SteerNotDelivered {
+        id: String,
+    },
     /// The agent's current plan / todo list for this turn (replaces the
     /// previous one).
     Plan {

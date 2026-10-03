@@ -257,7 +257,10 @@ impl Timeline {
             EventKind::ItemUpdated { item } => {
                 if let Some(&ix) = self.index.get(&item.id) {
                     let moved = self.entries[ix].item.ordinal != item.ordinal;
+                    // A steer that missed its turn moves to a queued run.
+                    let hidden = hides(item.run_id.as_ref().and_then(|r| self.runs.get(r)));
                     let entry = &mut self.entries[ix];
+                    entry.hidden = hidden;
                     entry.item = Arc::new(TurnItem {
                         text: "".into(),
                         ..(**item).clone()

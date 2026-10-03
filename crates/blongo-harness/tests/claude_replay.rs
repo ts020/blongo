@@ -378,7 +378,7 @@ async fn message_steering_is_one_turn() {
     let replay = Replay::new("message_steering");
     let mut session = replay.start(bypass()).await;
     session.prompt(replay.prompt(0)).unwrap();
-    session.steer(replay.prompt(1)).unwrap();
+    session.steer("steer-1", replay.prompt(1)).unwrap();
     let events = turn(&mut session, |_, _| {}).await;
     // The CLI's error_during_execution for the cut-short part is not a
     // failure: the steered turn completes once.
