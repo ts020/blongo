@@ -744,6 +744,7 @@ name = "blongo-git"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blongo-protocol",
  "tokio",
 ]
 

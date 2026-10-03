@@ -458,5 +458,7 @@ pub async fn remove_pristine_worktree(repo: &Path, path: &Path, root: &Path) -> 
     Ok(())
 }
 
+pub mod workspace;
+
 #[cfg(test)]
 mod tests;
