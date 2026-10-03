@@ -78,6 +78,8 @@ pub fn spawn(
     }
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(target_os = "linux")]
+    die_with_parent(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             io::Error::new(
@@ -276,6 +278,39 @@ pub async fn terminate(child: &mut Child, grace: Duration) {
     let _ = grace;
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// Linux: the agent gets SIGKILL when the thread that spawned it exits, so
+/// a crashed or `kill -9`-ed Blongo does not leave Codex running. (The core
+/// spawns agents from its own long-lived thread.) Grandchildren in the
+/// agent's process group are not covered; the agent normally takes them down
+/// itself when its stdin closes.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    // SAFETY: getpid is async-signal-safe; the pre_exec closure only calls
+    // prctl, getppid and _exit, which are async-signal-safe too.
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The parent may have died before prctl took effect.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// SIGKILL a process group created by [`spawn`] (its leader's pid), for
+/// callers that gave up waiting on an orderly shutdown.
+pub fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    signal_group(pid, libc::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(unix)]

@@ -43,6 +43,9 @@ pub enum AgentEvent {
         call_id: String,
         is_error: bool,
         output: String,
+        /// Process exit code, for command executions that report one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     /// The agent is blocked until the user answers.
     ApprovalRequest {

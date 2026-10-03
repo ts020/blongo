@@ -67,7 +67,11 @@ def handle_setup(msg):
                       "model": "fake-model", "approvalPolicy": msg["params"].get("approvalPolicy")})
         notify("thread/started", {"thread": {"id": THREAD}})
     elif method == "thread/resume":
-        if msg["params"].get("threadId") == THREAD:
+        if msg["params"].get("excludeTurns") is not True:
+            # Real Codex would hydrate the whole history into one line.
+            send({"id": msg["id"], "error": {"code": -32602,
+                                             "message": "fake: resume without excludeTurns"}})
+        elif msg["params"].get("threadId") == THREAD:
             respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
                           "model": "fake-model"})
         else:

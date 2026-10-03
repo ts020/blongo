@@ -578,3 +578,237 @@ async fn streamed_text_is_coalesced_not_written_per_delta() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ------------------------------------------------------------------------
+// Recorded real Codex sessions (t3code replay fixtures, codex-cli 0.156.1)
+// played by crates/blongo-harness/tests/fixtures/replay_codex.py.
+
+struct Recording {
+    transcript: PathBuf,
+    log: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+impl Recording {
+    fn new(dir: &Path, scenario: &str) -> Self {
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blongo-harness/tests/fixtures");
+        let transcript = fixtures.join(format!("t3code/{scenario}.ndjson"));
+        let log = dir.join("replay-log.ndjson");
+        let env = vec![
+            (
+                "CODEX_REPLAY_TRANSCRIPT".into(),
+                transcript.to_string_lossy().into(),
+            ),
+            ("CODEX_REPLAY_LOG".into(), log.to_string_lossy().into()),
+            (
+                "CODEX_REPLAY_STATE".into(),
+                dir.join("replay-state").to_string_lossy().into(),
+            ),
+        ];
+        Self {
+            transcript,
+            log,
+            env,
+        }
+    }
+
+    fn start(&self, dir: &Path) -> TestCore {
+        let replay = fake_codex().with_file_name("replay_codex.py");
+        TestCore::start_with(dir, |c| {
+            c.codex_executable = Some(replay);
+            c.agent_env = self.env.clone();
+        })
+        .0
+    }
+
+    /// The recorded prompt of the n-th turn.
+    fn prompt(&self, n: usize) -> String {
+        std::fs::read_to_string(&self.transcript)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["type"] == "expect_outbound" && e["label"] == "turn/start")
+            .nth(n)
+            .and_then(|e| {
+                e.pointer("/frame/params/input/0/text")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap()
+    }
+
+    /// Actual frames the client sent for `label`.
+    fn sent(&self, label: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["label"] == label)
+            .map(|e| e["actual"].clone())
+            .collect()
+    }
+}
+
+fn command_item(snap: &ThreadSnapshot) -> &ItemKind {
+    &snap
+        .items
+        .iter()
+        .find(|i| matches!(i.kind, ItemKind::CommandExecution { .. }))
+        .expect("a command item")
+        .kind
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recorded_approval_turn() {
+    let dir = temp_dir("rec-approval");
+    let rec = Recording::new(&dir, "tool_call_read_only_on_request");
+    let mut core = rec.start(&dir);
+    let (_, thread_id) = core.project_and_thread(&dir).await;
+    core.send(thread_id, &rec.prompt(0));
+    let approval = core
+        .added_item(|i| matches!(i.kind, ItemKind::ApprovalRequest { .. }))
+        .await;
+    core.dispatch(Command::RuntimeRequestRespond {
+        thread_id,
+        item_id: approval.id,
+        decision: ApprovalDecision::Approve,
+    });
+    assert_eq!(core.run_finished().await, RunStatus::Completed);
+    let snap = core.snapshot(thread_id).await;
+    assert_eq!(
+        kinds(&snap),
+        [
+            "user_message",
+            "reasoning",
+            "assistant_message",
+            "command_execution",
+            "approval_request",
+            "assistant_message"
+        ]
+    );
+    let ItemKind::CommandExecution {
+        command,
+        status,
+        exit_code,
+        ..
+    } = command_item(&snap)
+    else {
+        unreachable!()
+    };
+    assert!(
+        command.contains("codex app-server approval fixture"),
+        "{command}"
+    );
+    assert_eq!(*status, ToolStatus::Completed);
+    assert_eq!(*exit_code, Some(0));
+    let answers = texts(&snap, "assistant_message");
+    assert!(
+        answers[1].starts_with("Created or overwrote"),
+        "{answers:?}"
+    );
+    let reasoning = texts(&snap, "reasoning");
+    assert!(
+        reasoning[0].contains("Waiting for write access"),
+        "{reasoning:?}"
+    );
+    assert_eq!(
+        rec.sent("item/commandExecution/requestApproval")[0]["result"]["decision"],
+        "accept"
+    );
+    core.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recorded_interrupts() {
+    // Before any output.
+    let dir = temp_dir("rec-interrupt");
+    let rec = Recording::new(&dir, "turn_interrupt");
+    let mut core = rec.start(&dir);
+    let (_, thread_id) = core.project_and_thread(&dir).await;
+    core.send(thread_id, &rec.prompt(0));
+    core.dispatch(Command::RunInterrupt { thread_id });
+    assert_eq!(core.run_finished().await, RunStatus::Interrupted);
+    let snap = core.snapshot(thread_id).await;
+    assert_eq!(kinds(&snap), ["user_message", "system_notice"]);
+    assert_eq!(snap.runs[0].status, RunStatus::Interrupted);
+    let interrupt = &rec.sent("turn/interrupt")[0]["params"];
+    assert_eq!(interrupt["turnId"], "01a0d5ed-38b3-7a11-9203-bd9650a02764");
+    core.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+
+    // While a command runs: the tool item ends failed, the run interrupted.
+    let dir = temp_dir("rec-interrupt-tool");
+    let rec = Recording::new(&dir, "turn_interrupt_mid_tool");
+    let mut core = rec.start(&dir);
+    let (_, thread_id) = core.project_and_thread(&dir).await;
+    core.send(thread_id, &rec.prompt(0));
+    core.added_item(|i| matches!(i.kind, ItemKind::CommandExecution { .. }))
+        .await;
+    core.dispatch(Command::RunInterrupt { thread_id });
+    assert_eq!(core.run_finished().await, RunStatus::Interrupted);
+    let snap = core.snapshot(thread_id).await;
+    assert!(matches!(
+        command_item(&snap),
+        ItemKind::CommandExecution {
+            status: ToolStatus::Failed,
+            exit_code: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &snap.items.last().unwrap().kind,
+        ItemKind::SystemNotice { message } if message == "Turn interrupted."
+    ));
+    assert_eq!(rec.sent("turn/interrupt").len(), 1);
+    core.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recorded_resume_after_restart() {
+    let dir = temp_dir("rec-resume");
+    let rec = Recording::new(&dir, "provider_thread_resume");
+    let mut core = rec.start(&dir);
+    let (_, thread_id) = core.project_and_thread(&dir).await;
+    core.send(thread_id, &rec.prompt(0));
+    assert_eq!(core.run_finished().await, RunStatus::Completed);
+    let first = core.snapshot(thread_id).await;
+    assert_eq!(
+        texts(&first, "assistant_message"),
+        ["provider thread resume fixture first turn complete"]
+    );
+    core.shutdown();
+
+    // A new Blongo process: the next message resumes the same Codex thread.
+    let mut core = rec.start(&dir);
+    core.send(thread_id, &rec.prompt(1));
+    assert_eq!(core.run_finished().await, RunStatus::Completed);
+    let snap = core.snapshot(thread_id).await;
+    assert_eq!(
+        kinds(&snap),
+        [
+            "user_message",
+            "assistant_message",
+            "user_message",
+            "assistant_message"
+        ],
+        "resumed without a 'could not resume' notice"
+    );
+    let reply = texts(&snap, "assistant_message").pop().unwrap();
+    assert!(
+        reply.starts_with("provider thread resume fixture first turn complete\n"),
+        "{reply}"
+    );
+    let resume = &rec.sent("thread/resume")[0]["params"];
+    assert_eq!(resume["threadId"], "01a0d5ef-62bd-7c20-861b-0528ff7d86bd");
+    assert_eq!(resume["excludeTurns"], true);
+    core.shutdown();
+    let (_core, shell) = TestCore::start(&dir);
+    assert_eq!(
+        shell.threads[0].provider_thread_id.as_deref(),
+        Some("01a0d5ef-62bd-7c20-861b-0528ff7d86bd")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

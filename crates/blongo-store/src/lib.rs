@@ -452,6 +452,14 @@ impl Store {
         Ok(())
     }
 
+    /// Remove an executed effect (a done row has no further use).
+    pub fn complete_effect(&self, id: i64) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached("DELETE FROM effect_outbox WHERE id = ?1")?
+            .execute(params![id])?;
+        Ok(())
+    }
+
     /// Delete finished outbox rows (they have no further use).
     pub fn prune_effects(&self) -> anyhow::Result<usize> {
         Ok(self

@@ -212,6 +212,7 @@ impl Normalizer {
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false),
                             output: tool_result_text(block.get("content")),
+                            exit_code: None,
                         });
                     }
                 }
@@ -448,7 +449,8 @@ mod tests {
                 AgentEvent::ToolResult {
                     call_id: "t1".into(),
                     is_error: false,
-                    output: "a\nb".into()
+                    output: "a\nb".into(),
+                    exit_code: None,
                 },
                 AgentEvent::TurnCompleted {
                     status: TurnStatus::Completed

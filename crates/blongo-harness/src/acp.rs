@@ -533,6 +533,7 @@ fn tool_result(update: &Value, call_id: String, out: &mut Vec<AgentEvent>) {
         call_id,
         is_error: status == "failed" || exit.is_some_and(|c| c != 0),
         output,
+        exit_code: exit.and_then(|c| i32::try_from(c).ok()),
     });
 }
 
@@ -923,7 +924,8 @@ mod tests {
                 AgentEvent::ToolResult {
                     call_id: "t1".into(),
                     is_error: false,
-                    output: "total 0".into()
+                    output: "total 0".into(),
+                    exit_code: Some(0),
                 },
                 AgentEvent::TurnCompleted {
                     status: TurnStatus::Completed

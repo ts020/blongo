@@ -491,17 +491,20 @@ fn item_completed(item: &Value) -> Option<AgentEvent> {
                         .unwrap_or(""),
                     MAX_TOOL_OUTPUT,
                 ),
+                exit_code: exit.and_then(|c| i32::try_from(c).ok()),
             })
         }
         "fileChange" | "webSearch" => Some(AgentEvent::ToolResult {
             call_id: id,
             is_error: failed,
             output: status.to_owned(),
+            exit_code: None,
         }),
         "mcpToolCall" => Some(AgentEvent::ToolResult {
             call_id: id,
             is_error: failed || item.get("error").is_some_and(|e| !e.is_null()),
             output: preview_json(item.get("result").unwrap_or(&Value::Null), MAX_TOOL_OUTPUT),
+            exit_code: None,
         }),
         _ => None,
     }
@@ -542,6 +545,9 @@ async fn setup(
     if let Some(resume) = &options.resume_thread_id {
         let mut resume_params = params.clone();
         resume_params["threadId"] = json!(resume);
+        // Only the thread is needed, not its history: without
+        // `excludeTurns` Codex sends every past turn in one (multi-MB) line.
+        resume_params["excludeTurns"] = json!(true);
         // A thread Codex no longer has (or an older CLI) is not fatal: the
         // conversation continues in a fresh Codex thread.
         if let Ok(thread) = peer
@@ -770,7 +776,8 @@ mod tests {
                 AgentEvent::ToolResult {
                     call_id: "c1".into(),
                     is_error: false,
-                    output: "a\n".into()
+                    output: "a\n".into(),
+                    exit_code: Some(0),
                 },
                 AgentEvent::TurnCompleted {
                     status: TurnStatus::Completed

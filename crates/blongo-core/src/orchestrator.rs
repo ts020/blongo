@@ -38,6 +38,8 @@ struct LiveSession {
     generation: u64,
 }
 
+const SESSION_CHANNEL_CAPACITY: usize = 256;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextKind {
     Assistant,
@@ -79,7 +81,7 @@ pub(crate) struct Orchestrator {
     projects: HashMap<ProjectId, Project>,
     threads: HashMap<ThreadId, Thread>,
     rt: HashMap<ThreadId, ThreadRt>,
-    session_tx: mpsc::UnboundedSender<SessionMsg>,
+    session_tx: mpsc::Sender<SessionMsg>,
     generation: u64,
     flush_deadline: Option<Instant>,
 }
@@ -90,7 +92,9 @@ pub(crate) async fn run(
     mut requests: mpsc::UnboundedReceiver<Request>,
     out: mpsc::UnboundedSender<CoreEvent>,
 ) {
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    // Bounded: a core busy committing back-pressures the agents' stdout
+    // instead of queueing their output in memory.
+    let (session_tx, mut session_rx) = mpsc::channel(SESSION_CHANNEL_CAPACITY);
     let mut core = Orchestrator {
         store,
         config,
@@ -622,7 +626,9 @@ impl Orchestrator {
         if let Err(err) = result {
             eprintln!("blongo-core: effect failed: {err:#}");
         }
-        if let Err(err) = self.store.set_effect_status(row.id, EffectStatus::Done) {
+        // Executed effects are deleted right away so the outbox only ever
+        // holds work in flight.
+        if let Err(err) = self.store.complete_effect(row.id) {
             eprintln!("blongo-core: outbox update failed: {err:#}");
         }
     }
@@ -708,15 +714,17 @@ impl Orchestrator {
                     generation,
                     event: Some(event),
                 };
-                if tx.send(msg).is_err() {
+                if tx.send(msg).await.is_err() {
                     return;
                 }
             }
-            let _ = tx.send(SessionMsg {
-                thread_id,
-                generation,
-                event: None,
-            });
+            let _ = tx
+                .send(SessionMsg {
+                    thread_id,
+                    generation,
+                    event: None,
+                })
+                .await;
         });
         self.rt(thread_id)?.session = Some(LiveSession {
             session,
@@ -758,13 +766,17 @@ impl Orchestrator {
             None => {
                 let rt = self.rt.get_mut(&msg.thread_id).expect("checked");
                 let session = rt.session.take();
-                let had_run = rt.run.is_some();
-                if had_run {
-                    self.finish_run(
+                match rt.run.as_ref().map(|r| r.interrupt_deadline.is_some()) {
+                    // Exiting is one way to honour an interrupt.
+                    Some(true) => self.finish_run(msg.thread_id, RunStatus::Interrupted, None),
+                    Some(false) => self.finish_run(
                         msg.thread_id,
                         RunStatus::Failed,
                         Some("The Codex process exited.".into()),
-                    );
+                    ),
+                    None => {
+                        self.rt.remove(&msg.thread_id);
+                    }
                 }
                 if let Some(live) = session {
                     tokio::spawn(live.session.shutdown());
@@ -843,13 +855,14 @@ impl Orchestrator {
                 call_id,
                 is_error,
                 output,
+                exit_code,
             } => {
                 let mut events = self.close_text(thread_id);
                 let Some(run) = self.active_run(thread_id) else {
                     return;
                 };
                 if let Some(item) = run.tools.get(&call_id) {
-                    let updated = Arc::new(with_tool_result(item, is_error, &output));
+                    let updated = Arc::new(with_tool_result(item, is_error, &output, exit_code));
                     run.tools.insert(call_id, updated.clone());
                     events.push(EventKind::ItemUpdated { item: updated });
                 }
@@ -1089,8 +1102,13 @@ impl Orchestrator {
             error,
         });
         self.commit_events(events);
-        if let Some(rt) = self.rt.get_mut(&thread_id) {
-            rt.idle_since = Some(Instant::now());
+        match self.rt.get_mut(&thread_id) {
+            Some(rt) if rt.session.is_some() => rt.idle_since = Some(Instant::now()),
+            // No process to keep warm: drop the runtime state entirely.
+            Some(_) => {
+                self.rt.remove(&thread_id);
+            }
+            None => {}
         }
         eprintln!("blongo: run {} finished ({status:?})", run.run_id);
         self.emit(CoreEvent::RunFinished { thread_id, status });
@@ -1217,8 +1235,17 @@ impl Orchestrator {
             .filter_map(|rt| rt.session.take())
             .map(|live| live.session)
             .collect();
+        let pids: Vec<u32> = sessions.iter().filter_map(Session::pid).collect();
         let all = futures_join(sessions.into_iter().map(Session::shutdown).collect());
-        let _ = tokio::time::timeout(Duration::from_secs(5), all).await;
+        if tokio::time::timeout(Duration::from_secs(5), all)
+            .await
+            .is_err()
+        {
+            // Do not leave an agent (or its tool processes) behind.
+            for pid in pids {
+                blongo_harness::process::kill_group(pid);
+            }
+        }
     }
 }
 
@@ -1310,7 +1337,7 @@ fn tool_kind(call_id: &str, name: &str, input: &Value) -> ItemKind {
     }
 }
 
-fn with_tool_result(item: &TurnItem, is_error: bool, output: &str) -> TurnItem {
+fn with_tool_result(item: &TurnItem, is_error: bool, output: &str, exit: Option<i32>) -> TurnItem {
     let mut item = item.clone();
     let status = if is_error {
         ToolStatus::Failed
@@ -1321,9 +1348,14 @@ fn with_tool_result(item: &TurnItem, is_error: bool, output: &str) -> TurnItem {
         ItemKind::CommandExecution {
             status: s,
             output: o,
+            exit_code,
             ..
+        } => {
+            *s = status;
+            *o = preview(output);
+            *exit_code = exit;
         }
-        | ItemKind::ToolCall {
+        ItemKind::ToolCall {
             status: s,
             output: o,
             ..

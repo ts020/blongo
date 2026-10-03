@@ -138,6 +138,29 @@ fn commit_writes_events_projections_receipt_and_outbox_together() {
 }
 
 #[test]
+fn completed_effects_leave_the_outbox() {
+    let mut store = Store::open_in_memory().unwrap();
+    let f = fixture(&mut store);
+    let CommitOutcome::Committed { outbox, .. } = store
+        .commit(Batch {
+            command_id: Some(CommandId::new()),
+            events: vec![],
+            effects: vec![Effect::ProviderInterrupt {
+                thread_id: f.thread.id,
+                run_id: RunId::new(),
+            }],
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(store.pending_effects().unwrap().len(), 1);
+    store.complete_effect(outbox[0].id).unwrap();
+    assert!(store.pending_effects().unwrap().is_empty());
+    assert_eq!(store.prune_effects().unwrap(), 0, "row already gone");
+}
+
+#[test]
 fn replayed_command_is_a_no_op() {
     let mut store = Store::open_in_memory().unwrap();
     let f = fixture(&mut store);
