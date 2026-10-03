@@ -31,6 +31,10 @@ pub mod auth;
 mod conn;
 pub mod hub;
 pub mod outbox;
+#[cfg(unix)]
+mod pty;
+#[cfg(not(unix))]
+#[path = "pty_unsupported.rs"]
 mod pty;
 
 use std::net::{IpAddr, SocketAddr};
@@ -40,10 +44,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use blongo_client::secret::random;
-use blongo_client::transport::{stream_halves, ws_config, ws_halves};
+use blongo_client::transport::{ws_config, ws_halves};
 use blongo_core::{CoreConfig, CoreEvent};
 use blongo_protocol::wire::MAX_CLIENT_FRAME;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::auth::AuthStore;
@@ -209,7 +215,8 @@ impl ServeConfig {
             ))),
             insecure_listen: false,
             tailscale_listen: false,
-            unix_socket: true,
+            // Unix only: Windows has no Unix sockets in tokio.
+            unix_socket: cfg!(unix),
             limits: Limits::default(),
         }
     }
@@ -503,6 +510,7 @@ pub async fn run(
     let _ = tokio::time::timeout(Duration::from_secs(5), hub_task).await;
 }
 
+#[cfg(unix)]
 async fn bind_unix(path: &Path) -> Result<UnixListener, String> {
     if let Some(dir) = path.parent() {
         blongo_client::secret::private_dir(dir)
@@ -518,8 +526,11 @@ async fn bind_unix(path: &Path) -> Result<UnixListener, String> {
         }
         let _ = std::fs::remove_file(path);
     }
-    // sun_path holds 108 bytes including the terminating NUL.
-    if path.as_os_str().len() > 107 {
+    // sun_path holds 108 bytes on Linux, 104 on macOS, including the NUL.
+    let sun_path = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    if path.as_os_str().len() >= sun_path {
         return Err(format!(
             "the socket path {} is too long for a Unix socket; use a shorter --data-dir \
              or --no-socket",
@@ -531,12 +542,24 @@ async fn bind_unix(path: &Path) -> Result<UnixListener, String> {
     // also apply to files other threads create meanwhile.
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(listener)
+}
+
+/// No local socket without Unix sockets: nothing can be listened on.
+#[cfg(not(unix))]
+type UnixListener = std::convert::Infallible;
+
+#[cfg(not(unix))]
+async fn bind_unix(path: &Path) -> Result<UnixListener, String> {
+    Err(format!(
+        "cannot listen on {}: the local socket needs Unix sockets, which this platform \
+         does not support; use --no-socket",
+        path.display()
+    ))
 }
 
 /// Accept the WebSocket upgrade only on `/ws`.
@@ -607,6 +630,7 @@ async fn accept_tcp(listener: TcpListener, shared: Arc<Shared>, slots: Arc<Semap
     }
 }
 
+#[cfg(unix)]
 async fn accept_unix(listener: UnixListener, shared: Arc<Shared>, slots: Arc<Semaphore>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -620,15 +644,27 @@ async fn accept_unix(listener: UnixListener, shared: Arc<Shared>, slots: Arc<Sem
         tokio::spawn(async move {
             let _permit = permit;
             let (read, write) = stream.into_split();
-            let (reader, writer) = stream_halves(read, write, MAX_CLIENT_FRAME);
+            let (reader, writer) =
+                blongo_client::transport::stream_halves(read, write, MAX_CLIENT_FRAME);
             conn::serve(reader, writer, Transport::Unix, "unix".into(), None, shared).await;
         });
     }
 }
 
+#[cfg(not(unix))]
+async fn accept_unix(listener: UnixListener, _shared: Arc<Shared>, _slots: Arc<Semaphore>) {
+    match listener {}
+}
+
 /// `--stdio` when a server already runs: copy bytes between stdin/stdout
 /// and its Unix socket (frames pass through untouched). `Ok(false)`: no
 /// server is running.
+#[cfg(not(unix))]
+pub async fn bridge_stdio(_state_dir: &Path) -> std::io::Result<bool> {
+    Ok(false) // no local socket on this platform: never a server to reach
+}
+
+#[cfg(unix)]
 pub async fn bridge_stdio(state_dir: &Path) -> std::io::Result<bool> {
     let path = socket_path(state_dir);
     let Ok(stream) = tokio::net::UnixStream::connect(&path).await else {
@@ -649,6 +685,12 @@ pub async fn bridge_stdio(state_dir: &Path) -> std::io::Result<bool> {
 /// Revoke a device through a running server's local socket, so its live
 /// connections (and their terminals) end now. `Ok(None)`: no server runs
 /// on this data directory.
+#[cfg(not(unix))]
+pub async fn revoke_via_socket(_state_dir: &Path, _who: &str) -> Result<Option<usize>, String> {
+    Ok(None) // no local socket on this platform: never a server to reach
+}
+
+#[cfg(unix)]
 pub async fn revoke_via_socket(state_dir: &Path, who: &str) -> Result<Option<usize>, String> {
     use blongo_client::handshake::{self, ClientAuth};
     use blongo_protocol::wire::{ClientMsg, Hello, MAX_SERVER_FRAME, ServerMsg};

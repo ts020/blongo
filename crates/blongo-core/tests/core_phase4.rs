@@ -7,7 +7,7 @@ mod common;
 
 use blongo_core::{ApprovalPolicy, CoreSettings};
 use blongo_protocol::workspace::{DiffScope, LineKind, Query, QueryReply};
-use blongo_protocol::{Schedule, ScheduleId, Thread, Timestamp};
+use blongo_protocol::{Schedule, ScheduleId, Timestamp};
 use common::*;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -87,6 +87,7 @@ impl TestCore {
         .await
     }
 
+    #[cfg(unix)] // only the MCP tests ask for a fresh snapshot
     async fn shell(&mut self) -> Arc<ShellSnapshot> {
         self.handle().client().shell();
         self.until(|e| match e {
@@ -567,6 +568,7 @@ async fn schedules_fire_persist_and_catch_up_after_a_restart() {
     assert!(!left[0].enabled && left[0].next_run_at.is_none());
 }
 
+#[cfg(unix)]
 fn start_mcp(dir: &Path) -> (TestCore, Arc<ShellSnapshot>) {
     let dump = dir.join("starts.jsonl");
     TestCore::start_with(dir, |c| {
@@ -581,6 +583,8 @@ fn start_mcp(dir: &Path) -> (TestCore, Arc<ShellSnapshot>) {
     })
 }
 
+// The MCP bridge needs Unix sockets.
+#[cfg(unix)]
 #[tokio::test]
 async fn mcp_tools_see_only_their_project_and_delegate_to_children() {
     let dir = temp_dir("p4-mcp");
@@ -681,7 +685,11 @@ async fn mcp_tools_see_only_their_project_and_delegate_to_children() {
 
 /// Collect events until `runs` runs finished; returns the threads created
 /// meanwhile.
-async fn threads_created_until_runs(core: &mut TestCore, runs: usize) -> Vec<Thread> {
+#[cfg(unix)]
+async fn threads_created_until_runs(
+    core: &mut TestCore,
+    runs: usize,
+) -> Vec<blongo_protocol::Thread> {
     let mut created = Vec::new();
     let mut finished = 0;
     while finished < runs {
@@ -698,6 +706,8 @@ async fn threads_created_until_runs(core: &mut TestCore, runs: usize) -> Vec<Thr
     created
 }
 
+// The MCP bridge needs Unix sockets.
+#[cfg(unix)]
 #[tokio::test]
 async fn agents_cannot_escape_the_spawn_limits() {
     let dir = temp_dir("p4-mcp-limits");
@@ -879,6 +889,8 @@ async fn agents_cannot_escape_the_spawn_limits() {
     core.shutdown();
 }
 
+// The MCP bridge needs Unix sockets.
+#[cfg(unix)]
 #[tokio::test]
 async fn agents_cannot_wake_more_threads_than_they_could_start() {
     let dir = temp_dir("p4-mcp-wake");

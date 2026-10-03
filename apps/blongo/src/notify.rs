@@ -80,7 +80,7 @@ fn platform(_title: &str, _body: &str) -> Option<Command> {
 }
 
 /// `gdbus call` arguments for the freedesktop notification service.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 fn gdbus_args(title: &str, body: &str) -> Vec<String> {
     let gv = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
     vec![
@@ -100,7 +100,7 @@ fn gdbus_args(title: &str, body: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn which(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

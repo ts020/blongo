@@ -33,6 +33,33 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// The fake agents are Python scripts that run through their `#!` line.
+/// Windows has no shebangs, so there they run through a `.cmd` wrapper
+/// that calls `python`.
+fn runnable(script: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let dir = std::env::temp_dir().join(format!("blongo-test-shims-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join(script.file_stem().unwrap()).with_extension("cmd");
+        if !shim.exists() {
+            // Tests run in parallel: write aside, then move into place.
+            let tmp = dir.join(format!(
+                "{}.{:?}.tmp",
+                script.file_stem().unwrap().to_string_lossy(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&tmp, format!("@python \"{}\" %*\r\n", script.display())).unwrap();
+            if std::fs::rename(&tmp, &shim).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        shim
+    }
+    #[cfg(not(windows))]
+    script
+}
+
 /// A recorded scenario plus the replay's comparison log.
 struct Replay {
     transcript: PathBuf,
@@ -80,7 +107,7 @@ impl Replay {
             None => config,
         };
         config
-            .executable(fixtures().join("replay_codex.py"))
+            .executable(runnable(fixtures().join("replay_codex.py")))
             .env("CODEX_REPLAY_TRANSCRIPT", &self.transcript)
             .env("CODEX_REPLAY_LOG", &self.log)
             .env("CODEX_REPLAY_STATE", &self.state)

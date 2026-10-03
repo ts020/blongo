@@ -22,6 +22,7 @@ use crate::{Shared, Transport};
 /// Most bytes one frame carries (several queued messages).
 const FRAME_BUDGET: usize = 256 << 10;
 /// Most terminal input chunks queued for one terminal's writer.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const TERMINAL_INPUT_QUEUE: usize = 256;
 
 async fn send_now(writer: &mut Writer, msgs: Vec<ServerMsg>) -> std::io::Result<()> {

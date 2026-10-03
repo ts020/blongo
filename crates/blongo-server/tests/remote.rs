@@ -591,6 +591,9 @@ async fn resume_points_outside_the_ring_get_snapshots() {
     server.stop();
 }
 
+// SSH tunnel targets and the stdio bridge to a running server need Unix
+// sockets.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_tunnel_and_ssh_stdio_with_a_fake_ssh() {
     let dir = temp_dir("ssh");
@@ -720,6 +723,7 @@ async fn stdio_without_a_running_server_serves_in_process() {
     assert!(status.success(), "{status}");
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unix_socket_clients_authenticate_by_file_permissions() {
     let dir = temp_dir("unix");
@@ -762,6 +766,8 @@ async fn unix_socket_clients_authenticate_by_file_permissions() {
     server.stop();
 }
 
+// Server-side terminals are Unix-only for now.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_side_terminal_runs_in_the_thread_folder() {
     let dir = temp_dir("pty");
@@ -805,8 +811,15 @@ async fn server_side_terminal_runs_in_the_thread_folder() {
 fn tailscale_listen_uses_the_tailnet_address_and_refuses_others() {
     let dir = temp_dir("tailscale");
     let fake = |ip: &str| {
-        let path = dir.join(format!("tailscale-{}", ip.replace('.', "_")));
+        let name = format!("tailscale-{}", ip.replace('.', "_"));
+        #[cfg(unix)]
+        let path = dir.join(name);
+        #[cfg(unix)]
         std::fs::write(&path, format!("#!/bin/sh\necho {ip}\n")).unwrap();
+        #[cfg(windows)]
+        let path = dir.join(name).with_extension("cmd");
+        #[cfg(windows)]
+        std::fs::write(&path, format!("@echo {ip}\r\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -840,6 +853,8 @@ fn tailscale_listen_uses_the_tailnet_address_and_refuses_others() {
     assert!(err.contains("refusing to listen"), "{err}");
 }
 
+// Needs a server-side terminal and the local socket (Unix-only).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_a_device_ends_its_live_connection_and_terminals() {
     let dir = temp_dir("revoke");
@@ -865,7 +880,8 @@ async fn revoking_a_device_ends_its_live_connection_and_terminals() {
         _ => None,
     })
     .await;
-    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    assert!(alive(pid));
 
     // Revoke from the command line while the device is connected: the
     // CLI reaches the running server over its socket.
@@ -894,7 +910,7 @@ async fn revoking_a_device_ends_its_live_connection_and_terminals() {
     assert!(message.contains("revoked"), "{message}");
     // Its server-side shell is gone.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+    while alive(pid) {
         assert!(
             std::time::Instant::now() < deadline,
             "shell {pid} still running"
@@ -1121,15 +1137,28 @@ async fn queries_over_the_wire_and_agents_use_the_real_mcp_bridge() {
     };
     assert_eq!(hits[0].path, "hello_world.txt");
 
-    // The agent delegates through `blongo-serve mcp-bridge`.
+    // The agent delegates through `blongo-serve mcp-bridge` (the bridge
+    // needs Unix sockets).
+    #[cfg(unix)]
+    agent_delegates_through_the_bridge(&backend, &mut rx, thread_id).await;
+    drop(backend);
+    server.stop();
+}
+
+#[cfg(unix)]
+async fn agent_delegates_through_the_bridge(
+    backend: &RemoteBackend,
+    rx: &mut UnboundedReceiver<CoreEvent>,
+    thread_id: ThreadId,
+) {
     send(
-        &backend,
+        backend,
         thread_id,
         "mcp: delegate_task {\"prompt\": \"echo: from the child\"}",
     );
     let mut text = String::new();
     let mut finished = 0;
-    wait_for(&mut rx, |e| match e {
+    wait_for(rx, |e| match e {
         CoreEvent::TextDelta { chunk, .. } => {
             text.push_str(chunk);
             None
@@ -1145,6 +1174,4 @@ async fn queries_over_the_wire_and_agents_use_the_real_mcp_bridge() {
     assert_eq!(finished, 1, "the child ran");
     assert!(text.contains("echo: from the child"), "{text}");
     assert!(!text.starts_with("ERROR"), "{text}");
-    drop(backend);
-    server.stop();
 }

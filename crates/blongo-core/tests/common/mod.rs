@@ -15,7 +15,7 @@ pub use blongo_protocol::{
 pub use tokio::sync::mpsc::UnboundedReceiver;
 
 pub fn fake_codex() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blongo-harness/tests/fixtures/fake_codex.py")
+    fixture("fake_codex.py")
 }
 
 /// A scratch directory removed when the test ends.
@@ -41,7 +41,14 @@ impl Drop for TempDir {
 }
 
 pub fn temp_dir(name: &str) -> TempDir {
-    let dir = std::env::temp_dir().join(format!("blongo-core-{name}-{}", ThreadId::new()));
+    // macOS's per-user $TMPDIR (/var/folders/../T/) is ~50 bytes: with it
+    // the sockets under the data folder would not fit sun_path (104).
+    let base = if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = base.join(format!("blongo-core-{name}-{}", ThreadId::new()));
     std::fs::create_dir_all(dir.join("project")).unwrap();
     TempDir(dir)
 }
@@ -253,7 +260,36 @@ pub fn texts(snapshot: &ThreadSnapshot, tag: &str) -> Vec<String> {
 }
 
 pub fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../blongo-harness/tests/fixtures")
-        .join(name)
+    runnable(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../blongo-harness/tests/fixtures")
+            .join(name),
+    )
+}
+
+/// The fake agents are Python scripts that run through their `#!` line.
+/// Windows has no shebangs, so there they run through a `.cmd` wrapper
+/// that calls `python`.
+pub fn runnable(script: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let dir = std::env::temp_dir().join(format!("blongo-test-shims-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join(script.file_stem().unwrap()).with_extension("cmd");
+        if !shim.exists() {
+            // Tests run in parallel: write aside, then move into place.
+            let tmp = dir.join(format!(
+                "{}.{:?}.tmp",
+                script.file_stem().unwrap().to_string_lossy(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&tmp, format!("@python \"{}\" %*\r\n", script.display())).unwrap();
+            if std::fs::rename(&tmp, &shim).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        shim
+    }
+    #[cfg(not(windows))]
+    script
 }

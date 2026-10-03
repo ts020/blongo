@@ -230,6 +230,7 @@ pub struct Link {
 struct TunnelDir(std::path::PathBuf);
 
 impl TunnelDir {
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn new() -> io::Result<Self> {
         let dir = std::env::temp_dir().join(format!(
             "blongo-ssh-{}",
@@ -375,59 +376,7 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
             host,
             ssh_port,
             remote_port,
-        } => {
-            // The forward listens on a Unix socket in a fresh owner-only
-            // directory: no other local user (and no race for a free TCP
-            // port) can reach or take the tunnel's local end.
-            let dir = TunnelDir::new()?;
-            let socket = dir.0.join("t.sock");
-            let mut cmd = ssh_command(*ssh_port);
-            cmd.arg("-N")
-                .arg("-o")
-                .arg("ExitOnForwardFailure=yes")
-                .arg("-o")
-                .arg("ServerAliveInterval=15")
-                .arg("-o")
-                .arg("StreamLocalBindMask=0177")
-                .arg("-L")
-                .arg(format!("{}:127.0.0.1:{remote_port}", socket.display()))
-                .arg("--")
-                .arg(host)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-            let mut child = cmd.spawn()?;
-            let stderr = drain_stderr(&mut child);
-            // Wait for the forward to accept connections.
-            let mut waited = Duration::ZERO;
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    return Err(io::Error::other(format!(
-                        "ssh exited ({status}): {}",
-                        stderr.borrow().trim()
-                    )));
-                }
-                if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await
-                    && let Ok((reader, writer)) = websocket_on(stream, "localhost", 0, "/ws").await
-                {
-                    return Ok(Link {
-                        reader,
-                        writer,
-                        local_auth: false,
-                        _child: Some(child),
-                        _dir: Some(dir),
-                    });
-                }
-                if waited > CONNECT_TIMEOUT {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the SSH tunnel did not come up",
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                waited += Duration::from_millis(100);
-            }
-        }
+        } => ssh_tunnel(host, *ssh_port, *remote_port).await,
         Target::SshStdio {
             host,
             ssh_port,
@@ -455,6 +404,71 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
             })
         }
     }
+}
+
+#[cfg(unix)]
+async fn ssh_tunnel(host: &str, ssh_port: Option<u16>, remote_port: u16) -> io::Result<Link> {
+    // The forward listens on a Unix socket in a fresh owner-only
+    // directory: no other local user (and no race for a free TCP
+    // port) can reach or take the tunnel's local end.
+    let dir = TunnelDir::new()?;
+    let socket = dir.0.join("t.sock");
+    let mut cmd = ssh_command(ssh_port);
+    cmd.arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-L")
+        .arg(format!("{}:127.0.0.1:{remote_port}", socket.display()))
+        .arg("--")
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stderr = drain_stderr(&mut child);
+    // Wait for the forward to accept connections.
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "ssh exited ({status}): {}",
+                stderr.borrow().trim()
+            )));
+        }
+        if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await
+            && let Ok((reader, writer)) = websocket_on(stream, "localhost", 0, "/ws").await
+        {
+            return Ok(Link {
+                reader,
+                writer,
+                local_auth: false,
+                _child: Some(child),
+                _dir: Some(dir),
+            });
+        }
+        if waited > CONNECT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the SSH tunnel did not come up",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    }
+}
+
+/// The tunnel's local end is a Unix socket in an owner-only folder; a TCP
+/// port on 127.0.0.1 would be reachable by every local user.
+#[cfg(not(unix))]
+async fn ssh_tunnel(_host: &str, _ssh_port: Option<u16>, _remote_port: u16) -> io::Result<Link> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SSH tunnel targets need Unix sockets and are not supported on this platform; use an SSH stdio target",
+    ))
 }
 
 async fn websocket(host: &str, port: u16, path: &str) -> io::Result<(Reader, Writer)> {

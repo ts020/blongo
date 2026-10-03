@@ -209,13 +209,12 @@ fn hang_up(mut t: Terminal) {
     });
 }
 
-/// A close-on-exec pipe: (read end, write end).
+/// A close-on-exec pipe: (read end, write end). `std::io::pipe` sets
+/// close-on-exec atomically where the OS can (`pipe2` on Linux) and right
+/// after creation elsewhere (macOS has no `pipe2`).
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let (read, write) = std::io::pipe()?;
+    Ok((OwnedFd::from(read), OwnedFd::from(write)))
 }
 
 /// Block until the PTY has output or hung up (`true`: read it), or the

@@ -377,8 +377,9 @@ async fn missing_agent_fails_the_run() {
         ItemKind::Error { message } if message.contains("Could not start Codex")
     ));
     core.shutdown();
-    let (_core, shell) = TestCore::start(&dir);
+    let (core, shell) = TestCore::start(&dir);
     assert_eq!(shell.threads[0].status, ThreadStatus::Failed);
+    core.shutdown();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -491,7 +492,7 @@ impl Recording {
     }
 
     fn start(&self, dir: &Path) -> TestCore {
-        let replay = fake_codex().with_file_name("replay_codex.py");
+        let replay = fixture("replay_codex.py");
         TestCore::start_with(dir, |c| {
             c.codex_executable = Some(replay);
             c.agent_env = self.env.clone();
@@ -682,11 +683,12 @@ async fn recorded_resume_after_restart() {
     assert_eq!(resume["threadId"], "01a0d5ef-62bd-7c20-861b-0528ff7d86bd");
     assert_eq!(resume["excludeTurns"], true);
     core.shutdown();
-    let (_core, shell) = TestCore::start(&dir);
+    let (core, shell) = TestCore::start(&dir);
     assert_eq!(
         shell.threads[0].provider_thread_id.as_deref(),
         Some("01a0d5ef-62bd-7c20-861b-0528ff7d86bd")
     );
+    core.shutdown();
     std::fs::remove_dir_all(dir).unwrap();
 }
 

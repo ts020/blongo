@@ -17,7 +17,8 @@
 //!   for it (they answer "not found"). Archived threads are not listed.
 //!   `delegate_task` children are capped in depth and number.
 //! - Tokens die with their session (released, idle-stopped, or the core
-//!   stopping); the files are removed then, and the folder at start.
+//!   stopping); the files are removed then, and the folder at start and
+//!   stop.
 //! - The folder is `-wx------` once the socket is bound: a session knows
 //!   its own token file's (random) name, but cannot list the folder to
 //!   find the others'. Processes of the same user can still change that
@@ -26,6 +27,10 @@
 //!   and answers queue in a bounded channel (an agent that stops reading
 //!   stops being read); at most [`MAX_CONNECTIONS`] bridges are served.
 
+// Without Unix sockets (Windows) the bridge cannot be reached, so the
+// JSON-RPC side is only exercised by the tests there.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,7 +38,7 @@ use std::time::Duration;
 
 use blongo_protocol::ThreadId;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 /// Longest JSON-RPC line accepted from an agent.
@@ -128,6 +133,16 @@ impl Drop for McpServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
         self.tokens.lock().expect("tokens").clear();
+        // Remove the whole folder: left at `-wx------` it cannot be listed,
+        // so anything else walking the data folder (backups, `rm -r` by a
+        // non-root user) would fail on it. Leftovers of a crash are
+        // cleared by `bind` at the next start.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -198,7 +213,7 @@ async fn accept(
         let calls = calls.clone();
         tokio::spawn(async move {
             let (read, write) = stream.into_split();
-            serve(BufReader::new(read), write, tokens, calls).await;
+            serve(tokio::io::BufReader::new(read), write, tokens, calls).await;
             drop(slot);
         });
     }
@@ -583,6 +598,7 @@ pub fn run_bridge(socket: &Path, token_file: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::BufReader;
 
     #[tokio::test]
     async fn protocol_round_trip_and_unknown_tokens() {

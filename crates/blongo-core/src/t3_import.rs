@@ -53,11 +53,12 @@ fn derived(kind: &str, id: &str) -> Uuid {
     Uuid::new_v5(&NAMESPACE, format!("t3code:{kind}:{id}").as_bytes())
 }
 
-/// A private (0700) temporary directory, removed on drop.
+/// A private (0700 on Unix) temporary directory, removed on drop.
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
     fn new() -> anyhow::Result<Self> {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
         let base = std::env::temp_dir();
         for attempt in 0..16u32 {
@@ -67,7 +68,12 @@ impl PrivateDir {
                 Timestamp::now().0
             ));
             // `create` (not `create_all`): fails if someone else made it.
-            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            #[cfg(unix)]
+            let created = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+            // Elsewhere the per-user temp folder's ACL keeps it private.
+            #[cfg(not(unix))]
+            let created = std::fs::DirBuilder::new().create(&dir);
+            match created {
                 Ok(()) => return Ok(Self(dir)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e).context("creating a temporary directory"),

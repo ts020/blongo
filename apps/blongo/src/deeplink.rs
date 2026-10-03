@@ -17,6 +17,7 @@
 //! entry with `MimeType=x-scheme-handler/blongo` and runs `xdg-mime`.
 //! macOS and Windows: see docs/phase4/deep-links.md.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 

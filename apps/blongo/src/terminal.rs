@@ -16,7 +16,9 @@
 //! same emulator here, fed with the output the backend relays, and keys
 //! sent back through it.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
@@ -35,7 +37,9 @@ use gpui::{
     AppContext as _, Context, FocusHandle, Focusable, HighlightStyle, Hsla, KeyDownEvent,
     ScrollWheelEvent, SharedString, StyledText, Window, div, prelude::*, px, rgb,
 };
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, MasterPty, PtySize};
+#[cfg(unix)]
+use portable_pty::{CommandBuilder, native_pty_system};
 
 use blongo_client::Backend;
 use blongo_protocol::ThreadId;
@@ -47,8 +51,10 @@ use crate::theme;
 pub const SCROLLBACK: usize = 1_000;
 pub const FONT_SIZE: f32 = 12.;
 pub const LINE_HEIGHT: f32 = 16.;
+#[cfg(unix)]
 const FRAME: Duration = Duration::from_millis(16);
 /// How often the reader checks whether its panel closed.
+#[cfg(unix)]
 const READ_POLL_MS: i32 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +93,7 @@ impl EventListener for Listener {
 
 enum Kind {
     /// A shell on this machine's PTY.
+    #[cfg_attr(not(unix), allow(dead_code))] // no local terminals there yet
     Local {
         master: Box<dyn MasterPty + Send>,
         child: Option<Box<dyn Child + Send + Sync>>,
@@ -112,7 +119,19 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    /// Local terminals need the Unix PTY plumbing below (a pollable
+    /// master); Windows (ConPTY) is not wired up yet.
+    #[cfg(not(unix))]
+    pub fn open(
+        _cwd: &Path,
+        _shell: Option<String>,
+        _cx: &mut gpui::App,
+    ) -> anyhow::Result<gpui::Entity<Self>> {
+        anyhow::bail!("local terminals are not supported on this platform yet")
+    }
+
     /// Start `shell` (default: `$SHELL`, else `/bin/sh`) in `cwd`.
+    #[cfg(unix)]
     pub fn open(
         cwd: &Path,
         shell: Option<String>,
@@ -258,6 +277,7 @@ impl TerminalView {
 
     /// The thread that owns the PTY writer; it ends when every sender
     /// (the view and the emulator's listener) is gone.
+    #[cfg(unix)]
     fn spawn_writer(mut pty: Box<dyn Write + Send>) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::Builder::new()
@@ -273,6 +293,7 @@ impl TerminalView {
     }
 
     /// Reader thread → emulator; wake the view at most once per frame.
+    #[cfg(unix)]
     fn pump(
         reader: OwnedFd,
         term: Arc<FairMutex<Term<Listener>>>,
@@ -371,6 +392,7 @@ impl TerminalView {
 }
 
 /// Wait up to [`READ_POLL_MS`] for the PTY to have output (or hang up).
+#[cfg(unix)]
 fn readable(file: &std::fs::File) -> bool {
     use std::os::fd::AsRawFd;
     let mut fds = libc::pollfd {
@@ -401,6 +423,9 @@ impl Drop for TerminalView {
         let pid = child.process_id();
         std::thread::spawn(move || {
             if let Some(pid) = pid {
+                #[cfg(not(unix))]
+                let _ = pid;
+                #[cfg(unix)]
                 if matches!(child.try_wait(), Ok(None)) {
                     unsafe { libc::kill(pid as i32, libc::SIGHUP) };
                 }
@@ -411,7 +436,12 @@ impl Drop for TerminalView {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 if matches!(child.try_wait(), Ok(None)) {
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL)
+                    };
+                    #[cfg(not(unix))]
+                    let _ = child.kill();
                 }
             }
             let _ = child.wait();

@@ -146,7 +146,7 @@ fn main() {
 async fn serve(args: Args, core: CoreConfig, state_dir: PathBuf) -> i32 {
     let mut config = ServeConfig::new(core);
     config.state_dir = state_dir.clone();
-    config.unix_socket = !args.no_socket;
+    config.unix_socket = cfg!(unix) && !args.no_socket;
     config.insecure_listen = args.insecure;
     if args.stdio {
         // Bridge to a running server when there is one.
@@ -241,6 +241,12 @@ async fn serve(args: Args, core: CoreConfig, state_dir: PathBuf) -> i32 {
     }
 }
 
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
