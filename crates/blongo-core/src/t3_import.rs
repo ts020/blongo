@@ -42,20 +42,7 @@ use serde_json::Value;
 /// Namespace of the derived ids.
 const NAMESPACE: Uuid = Uuid::from_u128(0x6f3c_7a52_1d0e_4b8e_9a51_2c4d_8e7f_b10c);
 
-/// What an import did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportReport {
-    pub projects: usize,
-    pub threads: usize,
-    pub runs: usize,
-    pub items: usize,
-    /// Threads already imported earlier with nothing new.
-    pub skipped_threads: usize,
-    /// Threads imported earlier that got new turns or items.
-    pub updated_threads: Vec<ThreadId>,
-    /// Rows skipped because they could not be read.
-    pub bad_rows: usize,
-}
+pub use blongo_protocol::client::ImportReport;
 
 /// t3code's default database location (`~/.t3/userdata/statev2.sqlite`).
 pub fn default_source() -> Option<PathBuf> {

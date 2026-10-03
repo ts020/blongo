@@ -322,6 +322,7 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::CommandDuplicate { .. } => {}
+            CoreEvent::Connection(_) | CoreEvent::Terminal(_) => {}
             CoreEvent::Failed { message } => {
                 self.fatal = Some(message.into());
                 cx.notify();

@@ -12,6 +12,9 @@ pub use domain::*;
 pub mod provider;
 pub use provider::*;
 
+pub mod client;
+pub mod wire;
+
 /// One normalized event from an agent turn. Harnesses translate their
 /// provider's wire format into these at the edge; nothing above the harness
 /// looks at provider-shaped JSON.

@@ -17,14 +17,13 @@
 //! [`CoreConfig::text_flush_interval`] and at item / turn end.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use blongo_harness::antigravity_install::ArchivePin;
-use blongo_protocol::{
-    CommandEnvelope, CommandId, DomainEvent, ItemId, ModelInfo, ProviderKind, ShellSnapshot,
-    ThreadId, ThreadSnapshot,
+pub use blongo_protocol::client::{
+    ConnectionState, CoreEvent, ImportReport, InstallState, LoginState, TerminalEvent,
 };
+use blongo_protocol::{CommandEnvelope, ProviderKind, ThreadId};
 use tokio::sync::mpsc;
 
 mod orchestrator;
@@ -142,80 +141,10 @@ impl Default for AntigravityInstall {
     }
 }
 
-/// Progress of an interactive provider sign-in.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LoginState {
-    /// Open this URL in a browser to continue.
-    Url(String),
-    Succeeded,
-    Failed(String),
-}
-
-/// Progress of the Antigravity install.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InstallState {
-    Progress(String),
-    Done(PathBuf),
-    Failed(String),
-}
-
-/// What the core tells its client, in order.
-#[derive(Clone, Debug)]
-pub enum CoreEvent {
-    /// Sent once at startup: every project and live thread.
-    Shell(Arc<ShellSnapshot>),
-    /// Answer to [`CoreHandle::open_thread`]. Every event after it in the
-    /// channel is newer than the snapshot.
-    Thread(Arc<ThreadSnapshot>),
-    /// A committed domain event (except coalesced text flushes, which the
-    /// client already saw as `TextDelta`s).
-    Event(Arc<DomainEvent>),
-    /// Live streamed text for a text item (not yet necessarily persisted).
-    TextDelta {
-        thread_id: ThreadId,
-        item_id: ItemId,
-        chunk: Arc<str>,
-    },
-    /// The command was refused; nothing was written.
-    CommandRejected {
-        command_id: CommandId,
-        reason: String,
-    },
-    /// The command id was already processed; nothing was written again.
-    CommandDuplicate {
-        command_id: CommandId,
-    },
-    /// The core could not start (or stopped) and accepts no more commands.
-    Failed {
-        message: String,
-    },
-    /// A root run ended (also visible as an event; convenient for tools).
-    RunFinished {
-        thread_id: ThreadId,
-        status: blongo_protocol::RunStatus,
-    },
-    /// Models a provider offered in its handshake (not persisted).
-    Models {
-        provider: ProviderKind,
-        models: Arc<[ModelInfo]>,
-    },
-    Login {
-        provider: ProviderKind,
-        state: LoginState,
-    },
-    Install(InstallState),
-    /// Something the user should know that belongs to no open thread (for
-    /// example, why an archived thread's worktree was kept).
-    Notice {
-        message: String,
-    },
-    /// Answer to [`CoreClient::import_t3`]; a new [`CoreEvent::Shell`]
-    /// follows a successful import.
-    Imported(Result<t3_import::ImportReport, String>),
-}
-
 pub(crate) enum Request {
     Dispatch(CommandEnvelope),
+    /// Re-send the shell snapshot ([`CoreEvent::Shell`]).
+    Shell,
     OpenThread(ThreadId),
     Login(ProviderKind),
     InstallAntigravity,
@@ -254,6 +183,12 @@ impl CoreClient {
     /// Ask for a thread's snapshot ([`CoreEvent::Thread`]).
     pub fn open_thread(&self, thread_id: ThreadId) {
         let _ = self.requests.send(Request::OpenThread(thread_id));
+    }
+
+    /// Ask for a fresh shell snapshot ([`CoreEvent::Shell`]); every event
+    /// after it in the channel is newer.
+    pub fn shell(&self) {
+        let _ = self.requests.send(Request::Shell);
     }
 
     /// Start an interactive sign-in ([`CoreEvent::Login`]).
@@ -324,14 +259,22 @@ impl Drop for CoreHandle {
 pub fn spawn(
     config: CoreConfig,
 ) -> anyhow::Result<(CoreHandle, mpsc::UnboundedReceiver<CoreEvent>)> {
+    // One core per data directory: two orchestrators on one database would
+    // each "recover" the other's running turns.
+    let lock = lock_database(&config.database);
     // Opened here, not on the core thread: the connection's allocations then
     // share the caller's allocator heap instead of touching a fresh one.
-    let store = Store::open(&config.database);
+    let store = match &lock {
+        Ok(_) => Store::open(&config.database),
+        Err(err) => Err(anyhow::anyhow!("{err}")),
+    };
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let thread = std::thread::Builder::new()
         .name("blongo-core".into())
         .spawn(move || {
+            // Held for the core's lifetime.
+            let _lock = lock;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -345,4 +288,29 @@ pub fn spawn(
         },
         event_rx,
     ))
+}
+
+/// Take an exclusive lock next to the database (`<db>.lock`), held until
+/// the core stops. Fails when another Blongo process (an app or `blongo
+/// serve`) already runs a core on the same data.
+fn lock_database(database: &std::path::Path) -> Result<std::fs::File, String> {
+    let path = database.with_extension("lock");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another Blongo process is already using {} (an open window or `blongo serve`); \
+             set BLONGO_DATA_DIR to use separate data",
+            database.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
 }

@@ -194,6 +194,10 @@ pub(crate) async fn run(
             request = requests.recv() => match request {
                 Some(Request::Dispatch(command)) => core.dispatch(command).await,
                 Some(Request::OpenThread(thread_id)) => core.open_thread(thread_id),
+                Some(Request::Shell) => match core.shell_snapshot() {
+                    Ok(shell) => core.emit(CoreEvent::Shell(Arc::new(shell))),
+                    Err(err) => eprintln!("blongo-core: shell snapshot failed: {err:#}"),
+                },
                 Some(Request::Login(provider)) => core.login(provider),
                 Some(Request::InstallAntigravity) => core.install_antigravity(),
                 Some(Request::ImportT3(source)) => core.import_t3(&source),

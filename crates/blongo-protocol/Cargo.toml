@@ -9,3 +9,6 @@ publish.workspace = true
 serde = { workspace = true, features = ["rc"] }
 uuid.workspace = true
 serde_json.workspace = true
+rmp-serde.workspace = true
+serde_bytes.workspace = true
+sha2.workspace = true
