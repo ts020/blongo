@@ -429,6 +429,7 @@ async fn streamed_text_is_coalesced_not_written_per_delta() {
         appended * 4 < deltas,
         "{appended} text rows for {deltas} deltas"
     );
+    drop(store); // Windows cannot remove a file that is still open
     std::fs::remove_dir_all(dir).unwrap();
 }
 

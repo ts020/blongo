@@ -23,7 +23,8 @@ fn fixtures() -> PathBuf {
 
 /// The fake agents are Python scripts that run through their `#!` line.
 /// Windows has no shebangs, so there they run through a `.cmd` wrapper
-/// that calls `python`.
+/// that calls `python` in UTF-8 mode (the fixtures are UTF-8; Windows'
+/// default code page would garble them).
 fn runnable(script: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
@@ -37,7 +38,14 @@ fn runnable(script: PathBuf) -> PathBuf {
                 script.file_stem().unwrap().to_string_lossy(),
                 std::thread::current().id()
             ));
-            std::fs::write(&tmp, format!("@python \"{}\" %*\r\n", script.display())).unwrap();
+            std::fs::write(
+                &tmp,
+                format!(
+                    "@set PYTHONUTF8=1\r\n@python \"{}\" %*\r\n",
+                    script.display()
+                ),
+            )
+            .unwrap();
             if std::fs::rename(&tmp, &shim).is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }

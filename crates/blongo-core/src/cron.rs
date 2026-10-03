@@ -504,6 +504,8 @@ mod tests {
 
     /// Daylight saving changes, in a child process with `TZ` set (the
     /// zone is process-wide, so it is not changed under other tests).
+    /// Unix only: elsewhere schedules run in UTC (no local time zones).
+    #[cfg(unix)]
     #[test]
     fn daylight_saving_changes_neither_skip_nor_repeat() {
         if std::env::var_os("BLONGO_CRON_DST_CHILD").is_some() {
@@ -526,6 +528,7 @@ mod tests {
         assert!(text.contains("1 passed"), "{text}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "run by daylight_saving_changes_neither_skip_nor_repeat with TZ set"]
     fn dst_in_new_york() {

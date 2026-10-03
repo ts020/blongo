@@ -44,11 +44,18 @@ fn scratch() -> PathBuf {
     dir
 }
 
-fn synthetic_db(dir: &Path, workspace: &Path) -> PathBuf {
+/// The database, and with `keep_open` the connection that wrote it (a
+/// running t3): hold it for as long as the database should look in use.
+fn synthetic_db(dir: &Path, workspace: &Path) -> (PathBuf, Option<Connection>) {
     synthetic_db_with(dir, workspace, SCHEMA, true)
 }
 
-fn synthetic_db_with(dir: &Path, workspace: &Path, schema: &str, keep_open: bool) -> PathBuf {
+fn synthetic_db_with(
+    dir: &Path,
+    workspace: &Path,
+    schema: &str,
+    keep_open: bool,
+) -> (PathBuf, Option<Connection>) {
     let path = dir.join("statev2.sqlite");
     let conn = Connection::open(&path).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -177,11 +184,9 @@ fn synthetic_db_with(dir: &Path, workspace: &Path, schema: &str, keep_open: bool
         )
         .unwrap();
     }
-    if keep_open {
-        // Leave the last writes in the WAL (no checkpoint), like a running t3.
-        std::mem::forget(conn);
-    }
-    path
+    // Kept open, the last writes stay in the WAL (no checkpoint), like a
+    // running t3.
+    (path, keep_open.then_some(conn))
 }
 
 fn digest(path: &Path) -> Vec<u8> {
@@ -195,7 +200,7 @@ fn imports_projects_threads_runs_and_items_read_only() {
     std::fs::create_dir_all(&workspace).unwrap();
     let source_dir = dir.join("t3");
     std::fs::create_dir_all(&source_dir).unwrap();
-    let source = synthetic_db(&source_dir, &workspace);
+    let (source, t3) = synthetic_db(&source_dir, &workspace);
     let wal = PathBuf::from(format!("{}-wal", source.display()));
     let before: Vec<_> = std::fs::read_dir(&source_dir)
         .unwrap()
@@ -290,6 +295,9 @@ fn imports_projects_threads_runs_and_items_read_only() {
             ..ImportReport::default()
         }
     );
+    // Windows cannot remove files that are still open.
+    drop(store);
+    drop(t3);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -305,6 +313,7 @@ fn rejects_files_that_are_not_t3code_databases() {
         .unwrap();
     let err = import(&mut store, &other, &|_| false).unwrap_err();
     assert!(err.to_string().contains("not a t3code"), "{err}");
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -318,7 +327,7 @@ fn reimport_adds_new_turns_and_skips_unreadable_rows() {
     // t3code closed cleanly (no -wal / -shm left), with a schema loose
     // enough to hold NULLs.
     let loose = SCHEMA.replace(" NOT NULL", "");
-    let source = synthetic_db_with(&source_dir, &workspace, &loose, false);
+    let (source, _) = synthetic_db_with(&source_dir, &workspace, &loose, false);
     let conn = Connection::open(&source).unwrap();
     conn.execute(
         "INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title,
@@ -388,5 +397,6 @@ fn reimport_adds_new_turns_and_skips_unreadable_rows() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert_eq!(names, vec!["statev2.sqlite"]);
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
