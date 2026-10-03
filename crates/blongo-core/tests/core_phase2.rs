@@ -638,7 +638,7 @@ async fn codex_rollback_restores_files_and_reverts_live() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: second.id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
@@ -658,7 +658,7 @@ async fn codex_rollback_restores_files_and_reverts_live() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: snap.runs[0].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     assert!(!file.exists());
@@ -691,7 +691,7 @@ async fn codex_rollback_after_restart_reverts_on_resume() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     assert_eq!(
@@ -734,7 +734,7 @@ async fn claude_rollback_resumes_at_the_kept_turn() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     core.turn(thread.id, "echo: three").await;
@@ -782,7 +782,7 @@ async fn claude_rollback_past_a_turn_without_an_id_keeps_the_newest_named_one() 
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[2].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     assert_eq!(
@@ -812,7 +812,7 @@ async fn claude_fork_after_rollback_is_still_native() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     let fork_id = ThreadId::new();
@@ -852,7 +852,7 @@ async fn rollback_is_refused_while_running() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: run,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     assert!(core.rejected(&c).await.contains("wait"));
     core.dispatch(Command::RunInterrupt {
@@ -876,7 +876,7 @@ async fn rollback_keeps_the_replaced_files() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     core.accepted(&c).await;
     assert_eq!(
@@ -905,18 +905,15 @@ async fn rollback_keeps_the_replaced_files() {
         std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
         "second"
     );
-    // Archiving the thread drops its hidden refs.
-    let c = core.dispatch(Command::ThreadArchive {
-        thread_id: thread.id,
-    });
-    core.accepted(&c).await;
-    core.snapshot(thread.id).await;
+    // Archiving the thread drops its checkpoint refs; the files a rollback
+    // replaced stay until the user discards them.
+    assert_eq!(archive(&mut core, thread.id).await, None);
     assert_eq!(
         git(
             &repo,
             &["for-each-ref", "--format=%(refname)", "refs/blongo/"]
         ),
-        ""
+        pre
     );
     core.shutdown();
 }
@@ -941,7 +938,7 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: run,
-        acknowledged_sharers: 1,
+        acknowledged_sharers: vec![other.id],
     });
     assert!(
         core.rejected(&c)
@@ -953,11 +950,22 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
     });
     core.run_finished().await;
 
+    // Idle now, but the confirmation named another set of threads.
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: run,
+        acknowledged_sharers: vec![elsewhere.id],
+    });
+    assert!(
+        core.rejected(&c)
+            .await
+            .contains("1 other thread works in this folder")
+    );
     // Idle now, but the user was not told about it.
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: run,
-        acknowledged_sharers: 0,
+        acknowledged_sharers: vec![],
     });
     assert!(
         core.rejected(&c)
@@ -969,7 +977,7 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: run,
-        acknowledged_sharers: 1,
+        acknowledged_sharers: vec![other.id],
     });
     core.accepted(&c).await;
     assert!(!dir.join("project/notes.txt").exists());
@@ -985,6 +993,100 @@ async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation(
     core.accepted(&c).await;
     core.snapshot(thread.id).await;
     assert!(!Path::new(&elsewhere.worktree.as_ref().unwrap().path).exists());
+    core.shutdown();
+}
+
+/// Archive the thread and return the core's notice, if any, once the
+/// archive committed.
+async fn archive(core: &mut TestCore, thread_id: ThreadId) -> Option<String> {
+    let c = core.dispatch(Command::ThreadArchive { thread_id });
+    core.accepted(&c).await;
+    // The clean-up runs right after the commit, before the next request.
+    let probe = ThreadId::new();
+    let c = core.dispatch(Command::ThreadArchive { thread_id: probe });
+    let mut notice = None;
+    loop {
+        match core.next().await {
+            CoreEvent::Notice { message } => notice = Some(message),
+            CoreEvent::CommandRejected { command_id, .. } if command_id == c.command_id => {
+                return notice;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn archive_keeps_a_worktree_a_fork_still_uses_and_its_checkpoints() {
+    let dir = temp_dir("archive-fork");
+    git_project(&dir);
+    let mut core = start(&dir);
+    let project = core.project(&dir).await;
+    let source = core.thread(project, ProviderKind::Codex, true).await;
+    let path = PathBuf::from(&source.worktree.as_ref().unwrap().path);
+    core.turn(source.id, "echo: one").await;
+    let fork_id = ThreadId::new();
+    let c = core.dispatch(Command::ThreadFork {
+        source_thread_id: source.id,
+        thread_id: fork_id,
+        up_to_run_id: None,
+    });
+    core.accepted(&c).await;
+    let checkpoint = core.snapshot(fork_id).await.runs[0]
+        .checkpoint
+        .clone()
+        .expect("the fork's copied run has the checkpoint");
+
+    let notice = archive(&mut core, source.id).await.expect("a notice");
+    assert!(notice.contains("still works in it"), "{notice}");
+    assert!(path.exists(), "the fork works there");
+    // The fork's copied run still finds its checkpoint.
+    let refs = git(
+        &path,
+        &["for-each-ref", "--format=%(objectname)", "refs/blongo/"],
+    );
+    assert!(refs.contains(&checkpoint), "{refs}");
+
+    // The fork goes too: nothing uses the folder or the refs any more.
+    assert_eq!(archive(&mut core, fork_id).await, None);
+    assert!(!path.exists());
+    let repo = dir.join("project");
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/blongo/checkpoints/"
+            ]
+        ),
+        ""
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn archive_keeps_a_worktree_with_ignored_files() {
+    let dir = temp_dir("archive-ignored");
+    git_project(&dir);
+    let repo = dir.join("project");
+    std::fs::write(repo.join(".git/info/exclude"), "*.env\n").unwrap();
+    let mut core = start(&dir);
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::Codex, true).await;
+    let path = PathBuf::from(&thread.worktree.as_ref().unwrap().path);
+    std::fs::write(path.join("secret.env"), "TOKEN=x\n").unwrap();
+    assert_eq!(
+        git(&path, &["status", "--porcelain"]),
+        "",
+        "ignored, not untracked"
+    );
+    let notice = archive(&mut core, thread.id).await.expect("a notice");
+    assert!(notice.contains("ignored"), "{notice}");
+    assert_eq!(
+        std::fs::read_to_string(path.join("secret.env")).unwrap(),
+        "TOKEN=x\n"
+    );
     core.shutdown();
 }
 

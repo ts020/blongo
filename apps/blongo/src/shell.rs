@@ -359,6 +359,10 @@ impl Shell {
                 });
                 cx.notify();
             }
+            CoreEvent::Notice { message } => {
+                self.notice = Some(message.into());
+                cx.notify();
+            }
             CoreEvent::Imported(result) => {
                 let message: SharedString = match result {
                     Ok(r) => {
@@ -719,7 +723,7 @@ impl Shell {
                             theirs.starts_with(&mine) || mine.starts_with(&theirs)
                         })
                     })
-                    .map(|t| t.title.clone())
+                    .map(|t| (t.id, t.title.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -740,7 +744,7 @@ impl Shell {
         self.dispatch(Command::ThreadRollback {
             thread_id: confirm.thread_id,
             run_id: confirm.run_id,
-            acknowledged_sharers: confirm.sharers.len() as u32,
+            acknowledged_sharers: confirm.sharers.iter().map(|(id, _)| *id).collect(),
         });
         cx.notify();
     }
@@ -759,11 +763,16 @@ impl Shell {
             0 => {}
             1 => text.push_str(&format!(
                 " 1 other thread works in this folder and will see its files change: {}.",
-                confirm.sharers[0]
+                confirm.sharers[0].1
             )),
             n => text.push_str(&format!(
                 " {n} other threads work in this folder and will see their files change: {}.",
-                confirm.sharers.join(", ")
+                confirm
+                    .sharers
+                    .iter()
+                    .map(|(_, title)| title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
         Some(
@@ -1495,7 +1504,7 @@ struct RollbackConfirm {
     /// Turns the rollback drops.
     turns: usize,
     /// Titles of the other threads working in the same folder.
-    sharers: Vec<String>,
+    sharers: Vec<(ThreadId, String)>,
 }
 
 fn canonical(path: &str) -> PathBuf {

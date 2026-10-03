@@ -204,6 +204,11 @@ pub enum CoreEvent {
         state: LoginState,
     },
     Install(InstallState),
+    /// Something the user should know that belongs to no open thread (for
+    /// example, why an archived thread's worktree was kept).
+    Notice {
+        message: String,
+    },
     /// Answer to [`CoreClient::import_t3`]; a new [`CoreEvent::Shell`]
     /// follows a successful import.
     Imported(Result<t3_import::ImportReport, String>),

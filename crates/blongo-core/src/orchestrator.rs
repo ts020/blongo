@@ -1,7 +1,7 @@
 //! The core task: command handling, provider event translation, coalesced
 //! text persistence, effects, recovery and session lifecycle.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -458,12 +458,21 @@ impl Orchestrator {
         };
         self.post.clear();
         let worktree = prepared.worktree.clone();
+        // Files already restored by a rollback that is now refused: say
+        // where the replaced ones are.
+        let restored_note = prepared.pre_rollback.as_ref().map(|pre| {
+            format!(
+                " The files were already restored; how they were before is saved in {pre} \
+                 (`git restore --source={pre} --worktree -- .`)."
+            )
+        });
         let batch = match self.decide(&command, prepared) {
             Ok(batch) => batch,
             Err(reason) => {
                 self.post.clear();
                 self.discard_worktree(&command.command, worktree.clone())
                     .await;
+                let reason = reason + restored_note.as_deref().unwrap_or_default();
                 return self.reject(&command, reason);
             }
         };
@@ -485,7 +494,8 @@ impl Orchestrator {
                     .await;
                 // Ordinals handed out for the failed batch are not reused,
                 // which is harmless (ordinals only need to be increasing).
-                self.reject(&command, format!("{err:#}"));
+                let reason = format!("{err:#}") + restored_note.as_deref().unwrap_or_default();
+                self.reject(&command, reason);
             }
         }
     }
@@ -589,7 +599,9 @@ impl Orchestrator {
                         ));
                     }
                     let n = sharers.len() as u32;
-                    if n != *acknowledged_sharers {
+                    let ids: HashSet<ThreadId> = sharers.iter().map(|t| t.id).collect();
+                    let acked: HashSet<ThreadId> = acknowledged_sharers.iter().copied().collect();
+                    if ids != acked {
                         return Err(format!(
                             "{n} other thread{} work{} in this folder and will see its files \
                              change; confirm the rollback for all of them",
@@ -609,7 +621,13 @@ impl Orchestrator {
                         })?;
                     blongo_git::restore_checkpoint(Path::new(&cwd), commit)
                         .await
-                        .map_err(|e| format!("could not restore the files: {e:#}"))?;
+                        .map_err(|e| {
+                            format!(
+                                "could not restore the files: {e:#}. The files may be partly \
+                                 restored; how they were before is saved in {pre} \
+                                 (`git restore --source={pre} --worktree -- .`)"
+                            )
+                        })?;
                     prepared.restored = Some(commit.clone());
                     prepared.pre_rollback = Some(pre);
                     prepared.sharers = n;
@@ -620,9 +638,12 @@ impl Orchestrator {
         Ok(prepared)
     }
 
-    /// An archived thread's checkpoints and pre-rollback refs go, and so
-    /// does its worktree when nothing in it is uncommitted (its branch
-    /// stays, so committed work is kept).
+    /// An archived thread's checkpoint refs go (and any left by threads
+    /// archived before), except those a live fork's copied runs still use; its pre-rollback refs stay (they hold files a
+    /// rollback replaced). Its worktree goes only when no other live thread
+    /// works in it and nothing in it would be lost, ignored files included
+    /// (the branch stays either way); otherwise the user is told why it
+    /// was kept.
     async fn clean_up_archived(&mut self, thread_id: ThreadId) {
         let Some(thread) = self.threads.get(&thread_id).cloned() else {
             return;
@@ -634,18 +655,66 @@ impl Orchestrator {
         if blongo_git::work_tree_root(&cwd).await.is_none() {
             return;
         }
-        blongo_git::delete_thread_refs(&cwd, &thread_id.to_string()).await;
-        if let Some(worktree) = &thread.worktree
-            && let Err(err) = blongo_git::remove_clean_worktree(
+        let live: Vec<Thread> = self
+            .threads
+            .values()
+            .filter(|t| t.id != thread_id && !t.archived)
+            .cloned()
+            .collect();
+        let keep: HashSet<String> = live
+            .iter()
+            .flat_map(|t| self.store.runs(t.id).unwrap_or_default())
+            .filter_map(|r| r.checkpoint)
+            .collect();
+        // This thread's refs, and those of threads archived earlier that
+        // were kept for a fork that may be gone now.
+        let archived: Vec<ThreadId> = self
+            .store
+            .threads(true)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.archived && t.project_id == thread.project_id)
+            .map(|t| t.id)
+            .chain([thread_id])
+            .collect();
+        for id in archived {
+            blongo_git::delete_thread_refs(&cwd, &id.to_string(), &keep).await;
+        }
+        let Some(worktree) = &thread.worktree else {
+            return;
+        };
+        let top = canonical(&worktree.path);
+        let users: Vec<&str> = live
+            .iter()
+            .filter(|t| {
+                self.projects
+                    .get(&t.project_id)
+                    .is_some_and(|p| canonical(t.cwd(p)).starts_with(&top))
+            })
+            .map(|t| t.title.as_str())
+            .collect();
+        let kept = if !users.is_empty() {
+            Some(format!(
+                "{} still work{} in it",
+                users.join(", "),
+                if users.len() == 1 { "s" } else { "" }
+            ))
+        } else {
+            blongo_git::remove_pristine_worktree(
                 Path::new(&project.path),
                 Path::new(&worktree.path),
             )
             .await
-        {
-            eprintln!(
-                "blongo-core: kept the worktree of an archived thread at {}: {err:#}",
-                worktree.path
-            );
+            .err()
+            .map(|e| format!("{e:#}"))
+        };
+        if let Some(why) = kept {
+            self.emit(CoreEvent::Notice {
+                message: format!(
+                    "Kept the worktree of \"{}\" at {}: {why}.",
+                    thread.title, worktree.path
+                ),
+            });
         }
     }
 
@@ -1504,7 +1573,14 @@ impl Orchestrator {
         let live = self.rt.get(&thread_id).and_then(|rt| rt.session.as_ref());
         match live {
             Some(live) if still_running => {
-                let _ = live.session.steer(message_id.to_string(), text.to_string());
+                if live
+                    .session
+                    .steer(message_id.to_string(), text.to_string())
+                    .is_err()
+                {
+                    // The session is gone: the steer never left.
+                    self.requeue_steer(thread_id, message_id);
+                }
             }
             _ => {
                 // The turn ended before the steer got there.
@@ -1522,6 +1598,19 @@ impl Orchestrator {
             return;
         };
         if item.thread_id != thread_id || item.kind != ItemKind::UserMessage {
+            return;
+        }
+        if self.threads.get(&thread_id).is_none_or(|t| t.archived) {
+            return;
+        }
+        // Already its own turn (moved before, then started): a duplicate.
+        let heads_its_run = self.store.items(thread_id).is_ok_and(|items| {
+            items
+                .iter()
+                .find(|i| i.run_id == item.run_id && i.kind == ItemKind::UserMessage)
+                .is_some_and(|first| first.id == item.id)
+        });
+        if heads_its_run {
             return;
         }
         // Already moved (a duplicate report).
@@ -1841,6 +1930,13 @@ impl Orchestrator {
             .and_then(|rt| rt.session.as_ref())
             .is_some_and(|live| live.generation == msg.generation);
         if !current {
+            // A released session can still report a steer it never
+            // delivered: its text must not be lost.
+            if let Some(AgentEvent::SteerNotDelivered { id }) = &msg.event
+                && let Some(message_id) = ItemId::parse(id)
+            {
+                self.requeue_steer(msg.thread_id, message_id);
+            }
             return;
         }
         match msg.event {
