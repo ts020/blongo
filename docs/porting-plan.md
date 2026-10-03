@@ -10,10 +10,10 @@
 ## 0. 結論（先に要点）
 
 1. **t3code の本体は「Node サーバー（オーケストレーター）＋薄いクライアント」**。重さの源は Electron（Chromium レンダラー + Node 本体 + 子プロセスの Node サーバー）で、ロジックの中心はイベントソーシングの `orchestration-v2`。
-2. **移植は「クライアント先行 → コア置換」の二段構え**を推奨する。
-   - Phase 1 で GPUI クライアントを作り、既存の `npx t3` サーバーにつないで動かす。これだけで Chromium と Electron が消え、メモリ削減の大半が早期に手に入る。
-   - Phase 2 で Rust コア（イベントストア＋オーケストレーター＋プロバイダーアダプター）をアプリ内に組み込み、Node サーバーを不要にする。
-   - クライアントは `Backend` トレイトの裏で「リモート t3 サーバー」と「プロセス内 Rust コア」を差し替えられる設計にする。
+2. **t3code とのワイヤ互換は持たない（2026-10-03 決定）**。既存の t3 サーバー、Web、モバイルとは接続しない。
+   - Phase 1 から Rust コア（イベントストア＋オーケストレーター＋プロバイダーアダプター）と GPUI UI を同時に縦に通す。最初から Node も Electron も使わない。
+   - Effect RPC の再現が不要になるので、ワイヤ形式は Blongo 側で自由に最適化できる。
+   - クライアントは `Backend` トレイトの裏で「プロセス内コア（LocalBackend）」と「`blongo serve`（RemoteBackend、Phase 3）」を差し替えられる設計にする。
 3. **ドメインモデルはそのまま借りる**（Project → AppThread → Run → ExecutionNode、TurnItem、コマンド／イベント／プロジェクション／アウトボックス）。t3code が何度も作り直して到達した形なので、再発明しない。
 4. **プロバイダーの移植難易度に大きな差がある**。Codex と ACP 系（Grok, Antigravity, 任意の ACP エージェント）は公式 Rust クレートがあり容易。Claude は JS SDK を介さず CLI の stream-json を直接話す実装が必要。Cursor は JS SDK しかないので後回し（Node サイドカーか非対応）。
 5. **ライセンス注意**: GPUI 本体は Apache-2.0 だが、Zed の `editor` / `terminal` / `markdown` / `ui` / `acp_thread` などは **GPL-3.0**。Blongo は MIT なので、これらはコピーも依存もしない。参考に読むだけにする。
@@ -35,7 +35,7 @@
 | `packages/shared` | 約3.3万行 | DPoP、ワーカー、ログ、テーマ等の雑多な共有物 | 必要な部分だけ |
 | `packages/ssh`, `packages/tailscale` | 約0.5万行 | SSH 環境、tailscale serve | Phase 3 以降 |
 | `apps/desktop` | 約8万行 | Electron メインプロセス（サーバー同梱、IPC、更新、プレビューブラウザ、スクショ） | GPUI アプリ本体に吸収 / 一部は対象外 |
-| `apps/mobile` | 約15万行 | Expo/React Native | **対象外**（ただしワイヤ互換の判断に影響） |
+| `apps/mobile` | 約15万行 | Expo/React Native | **対象外**（ワイヤ互換なしと決定済み） |
 | `infra/relay` | 約2.7万行 | T3 Connect（Cloudflare Workers の制御プレーン） | **対象外**（クライアント側の接続部分のみ将来検討） |
 | `native/*` | 小 | Rust 製の resource-monitor、Hyprland/KDE スクショ、C 製 browser-secret、libghostty-vt ヘッダ | resource-monitor はライブラリとして取り込み可 |
 
@@ -129,7 +129,7 @@ blongo (単一バイナリ)
 │    └─ blongo-app: ビュー群 + クライアント状態 (ClientStore)
 │          │  Backend トレイト
 │          ├─ LocalBackend  ──(チャネル)──▶ blongo-core (同一プロセス, 専用 tokio ランタイム)
-│          └─ RemoteBackend ──(WebSocket)─▶ 既存 t3 サーバー or `blongo serve`
+│          └─ RemoteBackend ──(WebSocket, Blongo独自)─▶ `blongo serve` (Phase 3)
 └─ blongo-core
      ├─ event store (rusqlite, WAL) / orchestrator / projections / outbox worker
      ├─ providers: codex, acp, claude, pi, opencode, (cursor-sidecar)
@@ -147,7 +147,6 @@ blongo (単一バイナリ)
 | クレート | 内容 | 主な依存 |
 |---|---|---|
 | `blongo-protocol` | ドメイン型（ID, Command, DomainEvent, TurnItem, Projection, Capabilities）。serde `#[serde(tag = "type")]` | serde, serde_json, uuid, time |
-| `blongo-t3-wire` | 既存 t3 サーバーと話すための Effect RPC JSON エンベロープ、WS クライアント、認証（WS チケット, bearer, DPoP） | async-tungstenite, p256/jose 相当 |
 | `blongo-store` | SQLite イベントストア、プロジェクション、レシート、アウトボックス、マイグレーション | rusqlite (bundled), r2d2 か専用ライタースレッド |
 | `blongo-core` | オーケストレーター（スレッド単位直列化、CommandPolicy、EventSink、EffectWorker、Run 実行、チェックポイント、フォーク） | tokio, blongo-store |
 | `blongo-provider` | アダプタートレイトと共通部品（イベント結合、テキストデルタの合体、プロセス監督） | tokio::process |
@@ -196,44 +195,41 @@ blongo (単一バイナリ)
 - Cargo ワークスペース作成、CI（fmt, clippy, test、macOS / Linux / Windows ビルド）
 - GPUI リビジョンを固定し、ウィンドウ＋サイドバー＋仮想リストの最小アプリ
 - **スパイク1**: gpui-component を使うか自前か（入力、リスト、Markdown の3点で判断）
-- **スパイク2**: 既存 t3 サーバーの WebSocket フレームを録って Effect RPC エンベロープ（Request / Chunk / Ack / Exit、エラーの形、DateTime のエンコード）を確定
+- **スパイク2**: Codex（`codex app-server`）を Rust から起動し、1ターン往復＋承認を通す。Phase 1 の最初のプロバイダーになる
 - **スパイク3**: `claude` CLI を stream-json で直接起動し、1ターン往復＋権限要求を通す
 
 完了条件: ベースラインの数値表、空の GPUI アプリがビルドできる CI、3つのスパイクの結論。
 
-### Phase 1: GPUI クライアント × 既存 t3 サーバー
+### Phase 1: 縦に一本通す（コア＋UI、Codex のみ）
 
-既存の `npx t3` サーバーに接続する GPUI クライアントを作る。オーケストレーターは t3code のものを使うので、UI に集中できる。
+Node なし・Electron なしで、1プロバイダーのスレッドが最後まで動く最小構成を作る。
 
-- `blongo-protocol`: `orchestrationV2.ts` と `rpc.ts` のうちクライアントが使う部分を serde 化。未知の `type` はフォールバック variant で受ける（サーバーが先に進んでも落ちない）
-- `blongo-t3-wire`: Effect RPC クライアント、ペアリング／WS チケット認証、再接続（3s, 4s, 8s, 16s のバックオフ、30秒健全でリセット）
-- `blongo-client`: shell reducer、thread プロジェクション reducer、`afterSequence` での再開、履歴ページング、スナップショットのディスクキャッシュ
-- 画面: サイドバー（プロジェクト、スレッド一覧、状態表示）、タイムライン（メッセージ、思考、ツール実行のまとめ表示、計画、承認）、コンポーザー（プレーンテキスト、モデル選択、送信・中断・steer）、承認パネル
-- Markdown とコードブロックのハイライト
+- `blongo-protocol`: ドメイン型（ID、Command、DomainEvent、TurnItem、Projection、Capabilities）。t3code の `orchestrationV2.ts` を参考に、必要なものだけを最初から Rust の型として設計する（互換は取らないので名前や形は簡素化してよい）
+- `blongo-store`: イベントログ、プロジェクション、コマンドレシート、アウトボックス（t3code の v2 テーブルを簡素化して採用）
+- `blongo-core`: スレッド単位の直列化、CommandPolicy、1トランザクションのコミット、EffectWorker、Run 実行と完了処理、承認、中断
+- `blongo-provider-codex`: 最初のプロバイダー
+- `blongo-client` と `LocalBackend`: コアの購読（スナップショット＋シーケンス付きイベント）を UI 用の状態に反映
+- 画面: サイドバー（プロジェクト、スレッド一覧、状態表示）、タイムライン（メッセージ、思考、ツール実行のまとめ、承認）、コンポーザー（プレーンテキスト、送信・中断）
+- t3code のリプレイフィクスチャ（Codex 分）を取り込み、適合テストにする
 
-完了条件: Blongo から既存サーバー経由で Codex と Claude のスレッドを作成・実行・承認・中断でき、Electron 版と並べて RSS と描画性能を比較した数値がある。
+完了条件: Blongo 単体で Codex のスレッドを作成・実行・承認・中断でき、アプリを再起動しても SQLite から復元できる。Phase 0 のベースラインと並べた RSS・描画性能の数値がある。
 
-### Phase 2: Rust コア（ローカル完結）
+### Phase 2: プロバイダーとワークスペース機能
 
-Node サーバーなしで動くようにする。
-
-- `blongo-store`: イベントログ、プロジェクション、レシート、アウトボックスのスキーマ（t3code の v2 テーブルを簡素化して採用）
-- `blongo-core`: スレッド単位の直列化、CommandPolicy、1トランザクションのコミット、EffectWorker、Run 実行と完了処理、キュー／steer、承認
-- プロバイダー: **Codex → ACP（Grok ほか）→ Claude → Pi** の順
-- t3code のリプレイフィクスチャを取り込み、同じ入力で同じイベント列になることを適合テストにする
-- `LocalBackend` を実装し、UI は Phase 1 のまま差し替え
+- プロバイダー追加: **ACP（Grok ほか）→ Claude → Pi** の順。各プロバイダーのリプレイ適合テストつき
+- キュー／steer、フォーク、プロバイダー切替（ContextHandoff）
 - チェックポイント（git の隠し ref）とロールバック、worktree 作成
 - PTY とターミナルビュー
-- t3code の DB からのインポート（`statev2.sqlite` を読むだけ。書き込まない）
+- Markdown とコードブロックのハイライト、プラン表示、モデル選択
+- t3code の DB からのインポート（`statev2.sqlite` を読み取り専用で取り込む一方向の移行ツール。継続的な互換ではない）
 
-完了条件: ネットワークなし・Node なしで、Codex / Claude / ACP エージェントのスレッドが完走し、チェックポイントからロールバックできる。
+完了条件: Codex / Claude / ACP エージェントのスレッドが完走し、チェックポイントからロールバックできる。
 
 ### Phase 3: リモートとサーバーモード
 
-- `blongo serve`（ヘッドレス）と `RemoteBackend` の Blongo 版プロトコル
+- `blongo serve`（ヘッドレス）と `RemoteBackend`。プロトコルは Blongo 独自（候補: WebSocket 上の長さ前置きバイナリ。型は `blongo-protocol` を共有し、スキーマのバージョンと機能フラグで交渉）
 - 認証（ペアリング、bearer、DPoP）、Tailscale、SSH 環境
-- 複数環境を同時に扱う接続レジストリ
-- （判断次第）t3 互換ワイヤで、t3code の Web / モバイルクライアントからも Blongo サーバーに接続できるようにする
+- 複数環境を同時に扱う接続レジストリと再接続（3s, 4s, 8s, 16s のバックオフ、30秒健全でリセット。t3code の方針を踏襲）
 
 ### Phase 4: 機能の厚み
 
@@ -259,7 +255,7 @@ Node サーバーなしで動くようにする。
 |---|---|---|
 | GPUI が pre-1.0 で破壊的変更が多い | 追従コスト | リビジョン固定、更新は専用 PR、GPUI 依存を `blongo-ui` に閉じ込める |
 | gpui-component が古い GPUI スナップショットに固定 | 最新 GPUI の改善を取り込めない | Phase 0 で判断。採用しても部品単位で抜けるよう薄いラッパー越しに使う |
-| Effect RPC のフレーミングが非公開仕様 | Phase 1 の接続が不安定 | 実フレームを録ってゴールデンテスト化。サーバーのバージョンを固定して検証 |
+| コア先行のため最初に動くものが出るまでが長い | 体感できる成果が遅れる | Phase 1 を Codex 1本・最小画面に絞り、縦に一本通すことを最優先にする |
 | Claude SDK 相当の機能（セッション履歴、スキル、使用量制限）の再実装 | Claude 対応が遅れる | Phase 0 でスパイク。足りなければ一時的に Node サイドカー |
 | Cursor は JS SDK のみ | Rust ネイティブ不可 | サイドカーか非対応。ユーザー判断 |
 | オーケストレーターの不変条件の取りこぼし | 二重実行、ターンが閉じない等 | リプレイ適合テスト、`docs/orchestration-v2` の不変条件をテスト化 |
@@ -270,10 +266,7 @@ Node サーバーなしで動くようにする。
 
 ## 5. 決めてほしいこと（推奨つき）
 
-1. **t3code とのワイヤ互換をどこまで保つか**
-   - A. クライアントだけ互換（Phase 1 で既存サーバーにつなぐ）、Blongo サーバーは独自プロトコル ← **推奨**。最短で動き、独自プロトコルで最適化の自由度が残る
-   - B. サーバーも t3 互換（t3code の Web / モバイルから Blongo に接続可能）。互換維持のコストが永続的にかかる
-   - C. 互換なし（コア先行）。Phase 1 の早期成果がなくなる
+1. ~~t3code とのワイヤ互換~~ → **互換なしに決定（2026-10-03）**
 2. **Cursor 対応**: 当面非対応 ← 推奨 / Node サイドカー
 3. **gpui-component の採用**: Phase 0 のスパイク結果で決める（初期採用を推奨）
 4. **対応 OS の優先順位**: macOS → Linux → Windows を推奨（GPUI の成熟度順）
@@ -284,7 +277,7 @@ Node サーバーなしで動くようにする。
 
 1. Cargo ワークスペースと CI、GPUI 固定リビジョンで空ウィンドウ（Phase 0）
 2. t3code のベースライン計測スクリプトと結果表（Phase 0）
-3. Effect RPC フレームの録画とエンベロープ仕様メモ（スパイク2）
+3. Rust から `codex app-server` を起動して1ターン往復するプロトタイプ（スパイク2）
 4. `claude` CLI stream-json 直結のプロトタイプ（スパイク3）
 
 ## 付録: 参照すべき t3code のファイル
