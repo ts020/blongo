@@ -16,7 +16,70 @@
    - クライアントは `Backend` トレイトの裏で「プロセス内コア（LocalBackend）」と「`blongo serve`（RemoteBackend、Phase 3）」を差し替えられる設計にする。
 3. **ドメインモデルはそのまま借りる**（Project → AppThread → Run → ExecutionNode、TurnItem、コマンド／イベント／プロジェクション／アウトボックス）。t3code が何度も作り直して到達した形なので、再発明しない。
 4. **初期の対応エージェントは Codex、Claude Code、Antigravity の3つ（2026-10-03 決定）**。それ以外（Grok, OpenCode, Pi, Cursor, ACP レジストリ等）は後で検討する。Codex は公式 Rust クレートがあり容易。Antigravity は ACP なので `agent-client-protocol` クレートで話せるが、独自の出力補正と認証がある。Claude は JS SDK を介さず CLI の stream-json を直接話す実装が必要。
-5. **ライセンス注意**: GPUI 本体は Apache-2.0 だが、Zed の `editor` / `terminal` / `markdown` / `ui` / `acp_thread` などは **GPL-3.0**。Blongo は MIT なので、これらはコピーも依存もしない。参考に読むだけにする。
+5. **比較対象は zeron**（同ジャンルの GPUI 実装）。Blongo は zeron より明確に軽いことを目標にし、アイドル RSS 100 MiB 以下（zeron 206 MiB）を狙う。差を生むのは CRDT を持たないこと、プロセス内でシリアライズしないこと、すりガラス等の GPU 演出を持たないこと、範囲を絞ること（§0.5）。zeron は MIT なのでハーネス実装は参考・流用できる。
+6. **ライセンス注意**: GPUI 本体は Apache-2.0 だが、Zed の `editor` / `terminal` / `markdown` / `ui` / `acp_thread` などは **GPL-3.0**。Blongo は MIT なので、これらはコピーも依存もしない。参考に読むだけにする。
+
+---
+
+## 0.5 比較対象 zeron と Blongo の存在意義
+
+[zeronsh/zeron](https://github.com/zeronsh/zeron)（`9e1a111`, 2026-10-02, MIT）は同ジャンルの GPUI 実装で、Claude Code / Codex / ACP（Antigravity を含む）/ OpenCode / Pi / Cursor を Rust で動かしている。規模は Rust 約39万行（ui 18.4万、engine 7.9万、harness 4.9万）。**Blongo は zeron より明確に軽くなければ存在意義がない**、を前提にする（2026-10-03 takanori）。
+
+### zeron の実測値（zeron 自身のドキュメントから）
+
+| 指標 | 値 | 出典 |
+|---|---|---|
+| UI＋エンジン合計のアイドル RSS（Linux ソフトウェア Vulkan、release） | 206 MiB | `docs/performance-resource-usage.md` |
+| 同ストリーミング中ピーク RSS | 235 MiB | 同上 |
+| アイドル CPU / ストリーミング CPU | 7.5% / 159%（1コア=100%） | 同上 |
+| macOS アイドル時の physical footprint | 中央値 約160 MiB、最大 約383 MiB | `docs/performance-idle-presence.md` |
+| エンジン単体アイドル | 32 MB | `docs/memory-plan.md` |
+| ストリーミング中の保持量（修正前） | 生テキストの約11.6倍 | 同上 |
+| 修正前の利用実態 | 450〜600 MB、重用で 1 GB 超 | 同上 |
+
+### zeron が重くなっている理由（読み取った範囲）
+
+1. **CRDT（Loro）がデータモデルの中心**: 全メッセージ本文が LoroText で、oplog・ミラー層・UI 側コピーと多重に持つ。同期を使わないローカルでも同じ構造
+2. **プロセス内でもシリアライズする**: 「境界を正直に保つ」ためにインメモリ二重管でも RPC を通し、watch フレームを約4コピー作っていた（後に差分化で 110 分の1 に改善）。UI はフレームごとにトランスクリプト全体を複製している（zeron 自身の既知課題）
+3. **見た目の GPU コスト**: すりガラス（backdrop blur）、エッジフェード、常時アニメーション。Metal の描画投入だけで footprint が一時的に最大約210 MiB 跳ねることを zeron 自身が計測している
+4. **機能の広さ**: マルチデバイス同期、Cloudflare エッジ、WorkOS 認証、プレゼンス、音声認識モデル、プレビュー、モバイル、6種のハーネス
+5. **後付けの対策**: mimalloc、glibc の arena 対策（`malloc_trim` を毎分）、画像 LRU、ドキュメント LRU は、問題が出てから入れている
+
+### Blongo が軽くなるための設計（zeron との差分）
+
+| 項目 | zeron | Blongo |
+|---|---|---|
+| 永続化 | Loro CRDT ドキュメント＋SQLite スナップショット | 追記型イベントログ（SQLite）。本文は1回だけ保存し、CRDT は持たない |
+| ストリーミング中の本文 | LoroText＋ミラー＋UI コピー | 追記バッファ1本を `Arc` で UI と共有。目標は生テキストの1.5倍以内 |
+| UI とエンジンの境界 | プロセス内でもシリアライズ | プロセス内は型付きイベントをチャネルで渡すだけ。シリアライズはリモート時のみ |
+| UI の状態 | フレームごとにトランスクリプト全体を複製 | エントリ単位の `Arc`。変わった行だけ通知 |
+| 見た目 | すりガラス、エッジフェード、常時アニメーション | 不透明でフラット。アニメーションは状態遷移時だけで、アイドル時の描画投入はゼロ |
+| 範囲 | 同期、エッジ、認証、音声、モバイルなど | ローカル単体、エージェント3種 |
+| メモリ規律 | 問題発生後に LRU・mimalloc・trim | 初日から上限付きキャッシュ、アロケータ設定、スレッド数の上限 |
+
+### 目標値（zeron と同じ負荷・同じ環境で比較）
+
+zeron の計測負荷（Haiku の出力 52KB の Markdown を 40ms 間隔で流す、1280×800 窓）をそのまま使い、同じマシンで zeron と並べて測る。
+
+| 指標 | zeron | Blongo 目標 |
+|---|---|---|
+| アイドル RSS（UI＋エンジン） | 206 MiB | **100 MiB 以下** |
+| ストリーミング中ピーク RSS | 235 MiB | **120 MiB 以下** |
+| エンジン単体アイドル | 32 MB | **15 MB 以下** |
+| ストリーミング保持量 | 生テキストの3倍以内を目標に改善中 | **1.5倍以内** |
+| アイドル CPU | 7.5% | **ほぼ0%**（描画もタイマーも止まる） |
+
+目標値は計画段階の数字で、まだ測っていない。Phase 0 で両者のベースラインを取ってから確定する。
+
+### zeron から借りるもの
+
+zeron は MIT なので、著作権表示を残せばコードを流用できる。
+- **ハーネス実装**: `crates/harness/src/claude`（stream-json 直結、約3.5k行）、`codex`（app-server、約3.9k行）、`acp`（Antigravity 対応を含む、約9.4k行）。Claude と Antigravity のスパイクは、ここを読むところから始める
+- **調査メモ**: `docs/research/{gpui,harness,acp,mugen-pretext}.md`、`docs/memory-plan.md`、`docs/performance-*.md`
+- **タイムラインの技法**: Markdown ブロック単位の行、行高さのメモ化（行 ID・本文長・幅をキー）、末尾追従のスプリング、ストリーミング末尾だけの再解析
+- **gpui フォークの修正**: zeron は Zed の gpui をフォーク（`zeronsh/zui`）して、GPU メモリの上限、`ImageSource::evict`（画像アトラスのリーク修正）、インスタンスプールの縮小を入れている。上流の gpui をそのまま使うと同じリークを踏む可能性があるので、Phase 0 で「上流 gpui＋必要な修正だけ当てる」か「zui を使う」かを決める
+
+借りないもの: Loro / 同期 / エッジ / WorkOS / 音声 / すりガラス系の描画。
 
 ---
 
@@ -182,7 +245,7 @@ blongo (単一バイナリ)
 7. **アイドル時はゼロ**。ポーリングしない。タイマーは必要時だけ
 8. **計測を CI に入れる**: 起動時間、アイドル RSS、1万行スレッドのスクロール fps、ストリーミング中の CPU を t3code と同じマシンで比較
 
-メモリの目標値は Phase 0 で t3code の実測ベースラインを取ってから決める。注意点として、エージェント CLI（`claude`, `codex` など）自体のメモリは Blongo からは削れないので、**計測は「Blongo 本体」と「エージェントプロセス」を分けて報告**する。
+メモリの目標値は §0.5 のとおり zeron を基準にし、Phase 0 で t3code と zeron の実測ベースラインを取ってから確定する。注意点として、エージェント CLI（`claude`, `codex` など）自体のメモリは Blongo からは削れないので、**計測は「Blongo 本体」と「エージェントプロセス」を分けて報告**する。
 
 ---
 
@@ -192,13 +255,14 @@ blongo (単一バイナリ)
 
 ### Phase 0: 土台とベースライン
 
-- t3code の実測ベースライン: 起動時間、アイドル RSS（Electron の全プロセス合計）、長いスレッドのスクロール、ストリーミング中の CPU。`native/resource-monitor` の手法を流用
+- 実測ベースライン: **zeron**（主な比較対象）と t3code の両方について、起動時間、アイドル RSS（全プロセス合計）、長いスレッドのスクロール、ストリーミング中の CPU と RSS、ストリーミング保持量を測る。負荷は zeron の計測負荷に揃える
+- メモリ計測を CI に入れる（zeron の mem-smoke 相当。閾値は §0.5 の目標値）
 - Cargo ワークスペース作成、CI（fmt, clippy, test、macOS / Linux / Windows ビルド）
 - GPUI リビジョンを固定し、ウィンドウ＋サイドバー＋仮想リストの最小アプリ
-- **スパイク1**: gpui-component を使うか自前か（入力、リスト、Markdown の3点で判断）
+- **スパイク1**: GPUI の土台を決める。上流 gpui か zeron の zui フォークか、gpui-component を使うか自前か（入力、リスト、Markdown、画像の解放の4点で、メモリと描画コストを測って判断）
 - **スパイク2**: Codex（`codex app-server`）を Rust から起動し、1ターン往復＋承認を通す。Phase 1 の最初のプロバイダーになる
-- **スパイク3**: `claude` CLI を stream-json で直接起動し、1ターン往復＋権限要求を通す
-- **スパイク4**: Antigravity を `agent-client-protocol` クレートで起動し、t3code の補正（`AntigravityProtocol.ts`）を当てて1ターン往復を通す
+- **スパイク3**: `claude` CLI を stream-json で直接起動し、1ターン往復＋権限要求を通す（zeron の `harness/src/claude` を参考に）
+- **スパイク4**: Antigravity を `agent-client-protocol` クレートで起動し、t3code の補正（`AntigravityProtocol.ts`）を当てて1ターン往復を通す（zeron の `harness/src/acp` も参考に）
 
 完了条件: ベースラインの数値表、空の GPUI アプリがビルドできる CI、4つのスパイクの結論。
 
@@ -255,6 +319,8 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 
 | リスク | 影響 | 対策 |
 |---|---|---|
+| zeron より軽くならない | 存在意義がなくなる | 機能を足すたびに CI のメモリ計測で zeron 基準の閾値を守る。超えたら機能より先に直す |
+| 上流 gpui の画像アトラス等のリーク | 長時間利用で RSS が増え続ける | zeron の zui の修正を確認し、必要な分だけ当てる。8時間の連続利用テストで横ばいを確認 |
 | GPUI が pre-1.0 で破壊的変更が多い | 追従コスト | リビジョン固定、更新は専用 PR、GPUI 依存を `blongo-ui` に閉じ込める |
 | gpui-component が古い GPUI スナップショットに固定 | 最新 GPUI の改善を取り込めない | Phase 0 で判断。採用しても部品単位で抜けるよう薄いラッパー越しに使う |
 | コア先行のため最初に動くものが出るまでが長い | 体感できる成果が遅れる | Phase 1 を Codex 1本・最小画面に絞り、縦に一本通すことを最優先にする |
@@ -278,7 +344,7 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 ## 6. 最初の一歩（次のスレッドで着手できる単位）
 
 1. Cargo ワークスペースと CI、GPUI 固定リビジョンで空ウィンドウ（Phase 0）
-2. t3code のベースライン計測スクリプトと結果表（Phase 0）
+2. zeron と t3code のベースライン計測スクリプトと結果表（Phase 0）
 3. Rust から `codex app-server` を起動して1ターン往復するプロトタイプ（スパイク2）
 4. `claude` CLI stream-json 直結のプロトタイプ（スパイク3）
 5. Antigravity を ACP で1ターン往復するプロトタイプ（スパイク4）
