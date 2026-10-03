@@ -7,7 +7,9 @@
 //! lost connection it asks the server to resume from there: replayed
 //! messages at or below `last_seq` are dropped (no duplicates), and the
 //! server either replays everything after it (no gaps) or sends fresh
-//! snapshots. Reconnects follow [`Backoff`]. Commands that were sent but
+//! snapshots. A position is only resumed once this epoch's sidebar snapshot
+//! was applied (a link lost between `Welcome` and the snapshot starts
+//! fresh). Reconnects follow [`Backoff`]; a revoked device stops for good. Commands that were sent but
 //! not yet answered are re-sent after a reconnect; their ids make that
 //! idempotent on the server.
 
@@ -28,7 +30,8 @@ use crate::environments::Environment;
 use crate::handshake::{ClientAuth, HandshakeError, handshake, recv, send};
 use crate::target::{Target, open};
 
-/// Ping when nothing was sent for this long.
+/// Ping when nothing was sent, or nothing heard, for this long (the server
+/// closes connections silent for 75 s).
 const PING_EVERY: Duration = Duration::from_secs(20);
 /// Give up on a connection that sent nothing for this long.
 const SILENCE_LIMIT: Duration = Duration::from_secs(45);
@@ -170,13 +173,21 @@ pub struct StreamState {
     pub ready: HashSet<ThreadId>,
     /// Threads the UI wants (the open timeline).
     pub desired: Vec<ThreadId>,
+    /// This epoch's sidebar snapshot was applied: the position is worth
+    /// resuming. Without it a resume would skip the snapshot for good.
+    pub have_shell: bool,
     /// Messages dropped as duplicates (tests, diagnostics).
     pub duplicates: u64,
+    /// The server revoked this device.
+    pub revoked: bool,
 }
 
 impl StreamState {
     /// What to ask the server for when (re)connecting.
     pub fn resume(&self) -> Option<Resume> {
+        if !self.have_shell {
+            return None;
+        }
         self.epoch.map(|epoch| Resume {
             epoch,
             last_seq: self.last_seq,
@@ -190,6 +201,7 @@ impl StreamState {
         if !resumed {
             self.ready.clear();
             self.last_seq = 0;
+            self.have_shell = false;
         }
         self.epoch = Some(epoch);
     }
@@ -217,7 +229,10 @@ impl StreamState {
                 }
                 self.last_seq = self.last_seq.max(s.seq);
                 match s.payload {
-                    Payload::Shell(shell) => vec![CoreEvent::Shell(Arc::new(shell))],
+                    Payload::Shell(shell) => {
+                        self.have_shell = true;
+                        vec![CoreEvent::Shell(Arc::new(shell))]
+                    }
                     Payload::Thread(t) => {
                         if !self.desired.contains(&t.thread_id) {
                             return vec![];
@@ -249,6 +264,11 @@ impl StreamState {
             }
             ServerMsg::Resnapshot => {
                 self.ready.clear();
+                self.have_shell = false;
+                vec![]
+            }
+            ServerMsg::DeviceRevoked => {
+                self.revoked = true;
                 vec![]
             }
             ServerMsg::CommandRejected { command_id, reason } => {
@@ -286,6 +306,7 @@ impl StreamState {
                 vec![CoreEvent::Terminal(TerminalEvent::Failed { id, message })]
             }
             ServerMsg::Pong { .. }
+            | ServerMsg::Revoked(_)
             | ServerMsg::Challenge(_)
             | ServerMsg::Welcome(_)
             | ServerMsg::Refused { .. } => vec![],
@@ -476,6 +497,9 @@ impl Supervisor {
             resumed: session.welcome.resumed,
         });
         self.deliver(session.rest);
+        if self.stream.revoked {
+            return revoked(&self.env.name);
+        }
         let (mut reader, mut writer) = (link.reader, link.writer);
         if self.stream.needs_subscribe() && !self.stream.desired.is_empty() {
             self.stream.ready.clear();
@@ -494,13 +518,20 @@ impl Supervisor {
         }
         let mut last_heard = Instant::now();
         let mut last_sent = Instant::now();
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut last_ping = Instant::now();
         loop {
+            // One timer: the next ping or the silence limit, whichever is first.
+            let ping_at = last_ping.max(last_sent.min(last_heard)) + PING_EVERY;
+            let wake_at = ping_at.min(last_heard + SILENCE_LIMIT);
             tokio::select! {
                 frame = recv(&mut reader) => match frame {
                     Ok(msgs) => {
                         last_heard = Instant::now();
                         self.deliver(msgs);
+                        if self.stream.revoked {
+                            writer.close().await;
+                            return revoked(&self.env.name);
+                        }
                     }
                     Err(e) => return lost_after(e.to_string()),
                 },
@@ -542,21 +573,28 @@ impl Supervisor {
                     }
                     last_sent = Instant::now();
                 }
-                _ = ticker.tick() => {
-                    if last_heard.elapsed() > SILENCE_LIMIT {
+                _ = tokio::time::sleep_until(wake_at) => {
+                    if last_heard.elapsed() >= SILENCE_LIMIT {
                         return lost_after("the server stopped answering".into());
                     }
-                    if last_sent.elapsed() >= PING_EVERY {
+                    if Instant::now() >= ping_at {
                         let at = crate::secret::unix_now();
                         if let Err(e) = send(&mut writer, &ClientMsg::Ping { at }).await {
                             return lost_after(e.to_string());
                         }
                         last_sent = Instant::now();
+                        last_ping = last_sent;
                     }
                 }
             }
         }
     }
+}
+
+fn revoked(name: &str) -> Outcome {
+    Outcome::Permanent(format!(
+        "{name} revoked this device; pair it again with a new code"
+    ))
 }
 
 #[cfg(test)]
@@ -650,6 +688,37 @@ mod tests {
         }
         assert_eq!(text_of(&out), "de");
         assert_eq!(s.duplicates, 2);
+    }
+
+    #[test]
+    fn no_resume_before_this_epochs_shell() {
+        let t = ThreadId::new();
+        let mut s = StreamState::default();
+        // Welcome arrives, then the link drops before the sidebar snapshot.
+        s.on_welcome(4, false);
+        s.open(t);
+        assert!(s.resume().is_none(), "nothing to resume without the shell");
+        // Next connection: a fresh start, so the server sends the shell.
+        s.on_welcome(4, false);
+        s.apply(ServerMsg::Seq(Sequenced {
+            seq: 2,
+            payload: Payload::Shell(ShellSnapshot::default()),
+        }));
+        s.apply(thread_snapshot(3, t));
+        let r = s.resume().unwrap();
+        assert_eq!((r.epoch, r.last_seq), (4, 3));
+        // A resnapshot (overflow) means a new shell is coming: until it is
+        // applied the position is not resumable either.
+        s.apply(ServerMsg::Resnapshot);
+        assert!(s.resume().is_none());
+        s.apply(ServerMsg::Seq(Sequenced {
+            seq: 9,
+            payload: Payload::Shell(ShellSnapshot::default()),
+        }));
+        assert_eq!(s.resume().unwrap().last_seq, 9);
+        // A resumed welcome keeps it.
+        s.on_welcome(4, true);
+        assert!(s.resume().is_some());
     }
 
     #[test]

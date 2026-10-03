@@ -372,9 +372,7 @@ impl Shell {
             let env =
                 blongo_client::pairing::pair(&name, &target, code.as_deref(), &device).await?;
             let path = environments::default_path();
-            let mut file = EnvironmentFile::load(&path)?;
-            file.upsert(env.clone());
-            file.save(&path)?;
+            EnvironmentFile::update(&path, |file| file.upsert(env.clone()))?;
             Ok::<_, String>(env)
         });
         cx.spawn(async move |this, cx| {

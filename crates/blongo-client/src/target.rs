@@ -56,6 +56,9 @@ impl Target {
                 None => (rest, "/ws".to_owned()),
             };
             let (host, port) = split_host_port(authority)?;
+            if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!("bad host {host:?}"));
+            }
             return Ok(Self::WebSocket {
                 host,
                 port: port.unwrap_or(DEFAULT_PORT),
@@ -84,6 +87,7 @@ impl Target {
         };
         let authority = authority.trim_end_matches('/');
         let (host, ssh_port) = split_host_port(authority)?;
+        check_ssh_destination(&host)?;
         let param = |key: &str| {
             query
                 .split('&')
@@ -139,6 +143,24 @@ impl std::fmt::Display for Target {
             }
         }
     }
+}
+
+/// An SSH destination (`[user@]host`) that `ssh` can only read as a
+/// destination: no option-looking user or host (`-oProxyCommand=...` would
+/// run a local command), no whitespace or control characters. It is also
+/// passed after `--`.
+fn check_ssh_destination(dest: &str) -> Result<(), String> {
+    let (user, host) = match dest.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, dest),
+    };
+    let bad = |s: &str| {
+        s.is_empty() || s.starts_with('-') || s.chars().any(|c| c.is_whitespace() || c.is_control())
+    };
+    if bad(host) || user.is_some_and(|u| bad(u) || u.contains('@')) {
+        return Err(format!("bad SSH destination {dest:?}"));
+    }
+    Ok(())
 }
 
 fn split_host_port(authority: &str) -> Result<(String, Option<u16>), String> {
@@ -201,6 +223,32 @@ pub struct Link {
     /// The transport authenticated the user (SSH stdio).
     pub local_auth: bool,
     _child: Option<Child>,
+    _dir: Option<TunnelDir>,
+}
+
+/// An owner-only directory for a tunnel's socket, removed with the link.
+struct TunnelDir(std::path::PathBuf);
+
+impl TunnelDir {
+    fn new() -> io::Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "blongo-ssh-{}",
+            crate::secret::b64(&crate::secret::random::<9>())
+        ));
+        std::fs::create_dir(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TunnelDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 static SSH_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -271,6 +319,7 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
                 writer,
                 local_auth: false,
                 _child: None,
+                _dir: None,
             })
         }
         Target::SshTunnel {
@@ -278,18 +327,22 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
             ssh_port,
             remote_port,
         } => {
-            // A free local port (released just before ssh binds it).
-            let local = std::net::TcpListener::bind("127.0.0.1:0")?
-                .local_addr()?
-                .port();
+            // The forward listens on a Unix socket in a fresh owner-only
+            // directory: no other local user (and no race for a free TCP
+            // port) can reach or take the tunnel's local end.
+            let dir = TunnelDir::new()?;
+            let socket = dir.0.join("t.sock");
             let mut cmd = ssh_command(*ssh_port);
             cmd.arg("-N")
                 .arg("-o")
                 .arg("ExitOnForwardFailure=yes")
                 .arg("-o")
                 .arg("ServerAliveInterval=15")
+                .arg("-o")
+                .arg("StreamLocalBindMask=0177")
                 .arg("-L")
-                .arg(format!("127.0.0.1:{local}:127.0.0.1:{remote_port}"))
+                .arg(format!("{}:127.0.0.1:{remote_port}", socket.display()))
+                .arg("--")
                 .arg(host)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -305,12 +358,15 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
                         stderr.borrow().trim()
                     )));
                 }
-                if let Ok((reader, writer)) = websocket("127.0.0.1", local, "/ws").await {
+                if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await
+                    && let Ok((reader, writer)) = websocket_on(stream, "localhost", 0, "/ws").await
+                {
                     return Ok(Link {
                         reader,
                         writer,
                         local_auth: false,
                         _child: Some(child),
+                        _dir: Some(dir),
                     });
                 }
                 if waited > CONNECT_TIMEOUT {
@@ -330,6 +386,7 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
         } => {
             let mut cmd = ssh_command(*ssh_port);
             cmd.arg("-T")
+                .arg("--")
                 .arg(host)
                 .arg(command)
                 .stdin(Stdio::piped())
@@ -345,6 +402,7 @@ async fn open_inner(target: &Target) -> io::Result<Link> {
                 writer,
                 local_auth: true,
                 _child: Some(child),
+                _dir: None,
             })
         }
     }
@@ -354,6 +412,18 @@ async fn websocket(host: &str, port: u16, path: &str) -> io::Result<(Reader, Wri
     let addr_host = host.trim_start_matches('[').trim_end_matches(']');
     let stream = TcpStream::connect((addr_host, port)).await?;
     stream.set_nodelay(true)?;
+    websocket_on(stream, host, port, path).await
+}
+
+async fn websocket_on<S>(
+    stream: S,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> io::Result<(Reader, Writer)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let url = format!("ws://{host}:{port}{path}");
     let (ws, _) = tokio_tungstenite::client_async_with_config(
         url.as_str(),
@@ -435,6 +505,23 @@ mod tests {
         assert!(Target::parse("ws://:7").is_err());
         assert!(Target::parse("ssh://h?port=x").is_err());
         assert!(Target::parse("ssh+stdio://h").unwrap().is_local_auth());
+        // Nothing ssh could read as an option, nor whitespace/control
+        // characters, in the destination.
+        for bad in [
+            "ssh+stdio://-oProxyCommand=touch%20x",
+            "ssh+stdio://-oProxyCommand=x",
+            "ssh://-L1:2:3",
+            "ssh://-evil@host",
+            "ssh://me@-host",
+            "ssh://me@@host",
+            "ssh+stdio://ho st",
+            "ssh+stdio://host\tx",
+            "ssh+stdio://me@",
+            "ws://ho st:1",
+        ] {
+            assert!(Target::parse(bad).is_err(), "{bad} was accepted");
+        }
+        assert!(Target::parse("ssh://me.name@dev-box.lan").is_ok());
     }
 
     #[test]

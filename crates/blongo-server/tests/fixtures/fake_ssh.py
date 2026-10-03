@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """A stand-in for `ssh` in tests: no network, no authentication.
 
-`-L 127.0.0.1:L:HOST:R` forwards local port L to HOST:R on this machine
+`-L 127.0.0.1:L:HOST:R` (or `-L /path.sock:HOST:R`) forwards local port L to HOST:R on this machine
 (like a real tunnel whose far end is local); otherwise the remote command
 runs locally through `sh -c`. Options taking a value (-o, -p, -L, -i, -l)
-and flags (-N, -T, -q) are accepted; the first other word is the host.
+and flags (-N, -T, -q) are accepted; `--` ends the options; the first
+other word is the host.
 FAKE_SSH_LOG appends the argument vector (one JSON array per line).
 """
 import json
@@ -28,6 +29,10 @@ while i < len(args):
     if host is None and a in ("-o", "-p", "-L", "-i", "-l"):
         if a == "-L":
             forward = args[i + 1]
+        i += 2
+        continue
+    if host is None and a == "--":
+        host = args[i + 1]
         i += 2
         continue
     if host is None and a in ("-N", "-T", "-q"):
@@ -62,10 +67,18 @@ def pump(src, dst):
 
 
 if forward:
-    bind_host, local, far_host, far = forward.split(":")
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((bind_host, int(local)))
+    parts = forward.split(":")
+    if len(parts) == 3:  # /local/socket:host:port
+        local_path, far_host, far = parts
+        server = socket.socket(socket.AF_UNIX)
+        old = os.umask(0o177)
+        server.bind(local_path)
+        os.umask(old)
+    else:
+        bind_host, local, far_host, far = parts
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((bind_host, int(local)))
     server.listen(16)
     while True:
         client, _ = server.accept()

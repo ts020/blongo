@@ -209,11 +209,24 @@ fn serve(args: &[String]) -> i32 {
     }
 }
 
+/// The pairing code from stdin (prompted on a terminal).
+fn read_code() -> Option<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("pairing code: ");
+        let _ = std::io::stderr().flush();
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok()?;
+    let code = line.trim().to_owned();
+    (!code.is_empty()).then_some(code)
+}
+
 /// `blongo env add|list|remove`.
 fn env_command(args: &[String]) -> i32 {
     use blongo_client::environments::{EnvironmentFile, default_path};
     let path = default_path();
-    let mut file = match EnvironmentFile::load(&path) {
+    let file = match EnvironmentFile::load(&path) {
         Ok(file) => file,
         Err(err) => {
             eprintln!("blongo: {err}");
@@ -234,12 +247,18 @@ fn env_command(args: &[String]) -> i32 {
             0
         }
         (Some("remove"), Some(name), None) => {
-            if !file.remove(name) {
-                eprintln!("blongo: no environment named {name}");
-                return 1;
-            }
-            match file.save(&path) {
-                Ok(()) => 0,
+            match EnvironmentFile::update(&path, |file| file.remove(name)) {
+                Ok(true) => {
+                    eprintln!(
+                        "blongo: removed {name} here; its credential still works on the server \
+                         until you run `blongo-serve revoke` there"
+                    );
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("blongo: no environment named {name}");
+                    1
+                }
                 Err(err) => {
                     eprintln!("blongo: {err}");
                     1
@@ -248,7 +267,23 @@ fn env_command(args: &[String]) -> i32 {
         }
         (Some("add"), Some(name), Some(target)) => {
             let (name, target) = (name.to_owned(), target.to_owned());
-            let code = arg(3).map(str::to_owned);
+            // The code is read from stdin unless given (an argument shows up
+            // in `ps` and shell history). SSH stdio needs none.
+            let needs_code = !matches!(
+                blongo_client::target::Target::parse(&target),
+                Ok(blongo_client::target::Target::SshStdio { .. })
+            );
+            let code = match arg(3) {
+                Some(code) => Some(code.to_owned()),
+                None if needs_code => match read_code() {
+                    Some(code) => Some(code),
+                    None => {
+                        eprintln!("blongo: no pairing code given");
+                        return 1;
+                    }
+                },
+                None => None,
+            };
             let (tx, rx) = std::sync::mpsc::channel();
             blongo_client::net::handle().spawn(async move {
                 let device = blongo_client::pairing::device_name();
@@ -259,8 +294,7 @@ fn env_command(args: &[String]) -> i32 {
             match rx.recv() {
                 Ok(Ok(env)) => {
                     let name = env.name.clone();
-                    file.upsert(env);
-                    if let Err(err) = file.save(&path) {
+                    if let Err(err) = EnvironmentFile::update(&path, |file| file.upsert(env)) {
                         eprintln!("blongo: {err}");
                         return 1;
                     }
@@ -276,7 +310,8 @@ fn env_command(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!(
-                "usage: blongo env add NAME TARGET [PAIRING-CODE] | blongo env list | blongo env remove NAME\n\
+                "usage: blongo env add NAME TARGET   (reads the pairing code from stdin) | blongo env list | \
+                 blongo env remove NAME\n\
                  targets: ws://HOST[:PORT], ssh://[USER@]HOST?port=N, ssh+stdio://[USER@]HOST"
             );
             2

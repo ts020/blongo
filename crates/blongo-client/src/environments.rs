@@ -83,6 +83,27 @@ impl EnvironmentFile {
         write_private(path, &json).map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
+    /// Load, change and save under an exclusive lock (`<file>.lock`), so
+    /// the app and `blongo env` editing at once do not lose an entry.
+    pub fn update<R>(path: &Path, change: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
+        if let Some(dir) = path.parent() {
+            private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let lock_path = path.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
+        lock.lock()
+            .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
+        let mut file = Self::load(path)?;
+        let result = change(&mut file);
+        file.save(path)?;
+        Ok(result)
+    }
+
     pub fn get(&self, name: &str) -> Option<&Environment> {
         self.environments.iter().find(|e| e.name == name)
     }
