@@ -3,37 +3,37 @@
   "fixture": "tools/fixtures/resource-stream.jsonl",
   "phases": {
     "idle": {
-      "durationSeconds": 9.569451332092285,
+      "durationSeconds": 9.572571039199829,
       "blongo": {
-        "peakRssMiB": 174.109375,
-        "endRssMiB": 174.109375,
-        "cpuPercent": 0.3134975972905728,
+        "peakRssMiB": 173.78515625,
+        "endRssMiB": 173.78515625,
+        "cpuPercent": 0.4178605709605011,
         "threads": 32,
-        "peakPssMiB": 151.1904296875
+        "peakPssMiB": 150.8486328125
       },
       "harnessPeakRssMiB": 0
     },
     "stream": {
-      "durationSeconds": 18.163978338241577,
+      "durationSeconds": 17.656813144683838,
       "blongo": {
-        "peakRssMiB": 188.9296875,
-        "endRssMiB": 181.25,
-        "cpuPercent": 114.40225050395912,
+        "peakRssMiB": 188.66796875,
+        "endRssMiB": 180.91015625,
+        "cpuPercent": 112.30792237256287,
         "threads": 32,
-        "peakPssMiB": 165.97265625
+        "peakPssMiB": 165.646484375
       },
-      "harnessPeakRssMiB": 10.47265625
+      "harnessPeakRssMiB": 10.5078125
     },
     "settled": {
-      "durationSeconds": 14.620185852050781,
+      "durationSeconds": 14.656870603561401,
       "blongo": {
-        "peakRssMiB": 181.33984375,
-        "endRssMiB": 181.33984375,
-        "cpuPercent": 0.3419929165468415,
+        "peakRssMiB": 180.984375,
+        "endRssMiB": 180.984375,
+        "cpuPercent": 0.6140464935136372,
         "threads": 32,
-        "peakPssMiB": 158.41796875
+        "peakPssMiB": 157.962890625
       },
-      "harnessPeakRssMiB": 10.4765625
+      "harnessPeakRssMiB": 10.5078125
     }
   }
 }

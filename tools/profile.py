@@ -112,6 +112,11 @@ def main():
         FAKE_CODEX_REPLAY=os.path.abspath(args.fixture),
         FAKE_CODEX_DELAY_MS=os.environ.get("BLONGO_REPLAY_DELAY_MS", "40"),
     )
+    # Only lavapipe, as in every recorded baseline: without this the Vulkan
+    # loader maps every installed ICD (about +12 MiB PSS on Ubuntu 24.04).
+    lvp = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    if "VK_ICD_FILENAMES" not in env and os.path.exists(lvp):
+        env["VK_ICD_FILENAMES"] = lvp
     log = open(os.path.join(args.output, "blongo.log"), "w+")
     child = subprocess.Popen([binary], env=env, stdout=log, stderr=log, start_new_session=True)
     samples = []

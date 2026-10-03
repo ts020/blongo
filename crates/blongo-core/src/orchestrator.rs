@@ -87,11 +87,12 @@ pub(crate) struct Orchestrator {
 }
 
 pub(crate) async fn run(
+    store: anyhow::Result<Store>,
     config: CoreConfig,
     mut requests: mpsc::UnboundedReceiver<Request>,
     out: mpsc::UnboundedSender<CoreEvent>,
 ) {
-    let store = match Store::open(&config.database) {
+    let store = match store {
         Ok(store) => store,
         Err(err) => {
             eprintln!(

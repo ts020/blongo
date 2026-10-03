@@ -1,9 +1,0 @@
-libEGL warning: DRI3 error: Could not get DRI3 device
-libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
-blongo: run 01a100fa-dbdb-7435-8a3b-e29147ba7c20 finished (Completed)
-blongo: run 01a100fa-f9a1-7365-bdbd-b730ff0f2719 finished (Completed)
-blongo: run 01a100fb-0d9b-7746-880f-bdc6850d74df finished (Interrupted)
-libEGL warning: DRI3 error: Could not get DRI3 device
-libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
-libEGL warning: DRI3 error: Could not get DRI3 device
-libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering

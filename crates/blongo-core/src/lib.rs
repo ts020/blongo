@@ -196,13 +196,17 @@ impl Drop for CoreHandle {
     }
 }
 
-/// Start the core thread, which opens the store and recovers from an
+/// Open the store, then start the core thread, which recovers from an
 /// unclean previous exit. The first event on the returned channel is
 /// [`CoreEvent::Shell`], or [`CoreEvent::Failed`] when the data cannot be
-/// opened (the window can then say so instead of staying blank).
+/// opened or recovered (the window can then say so instead of staying
+/// blank).
 pub fn spawn(
     config: CoreConfig,
 ) -> anyhow::Result<(CoreHandle, mpsc::UnboundedReceiver<CoreEvent>)> {
+    // Opened here, not on the core thread: the connection's allocations then
+    // share the caller's allocator heap instead of touching a fresh one.
+    let store = Store::open(&config.database);
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let thread = std::thread::Builder::new()
@@ -212,7 +216,7 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            rt.block_on(orchestrator::run(config, req_rx, event_tx));
+            rt.block_on(orchestrator::run(store, config, req_rx, event_tx));
         })?;
     Ok((
         CoreHandle {

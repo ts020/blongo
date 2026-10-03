@@ -271,7 +271,9 @@ blongo (単一バイナリ)
 
 ### Phase 1: 縦に一本通す（コア＋UI、Codex のみ）（2026-10-03 完了、結果は `docs/phase1/report.md`）
 
-> 結果の要点: Node・Electron なしで、Codex スレッドの作成・ストリーミング・承認・中断・再起動後の SQLite 復元まで通った（フェイク Codex での GUI e2e）。idle PSS 151 / stream 166 MiB（Phase 0: 143 / 164）、idle CPU 0.3%。実 Codex でのターンと実機（macOS）計測は未確認。
+> 結果の要点: Node・Electron なしで、Codex スレッドの作成・ストリーミング・承認・中断・再起動後の SQLite 復元まで通った（フェイク Codex での GUI e2e と、t3code が実 Codex 0.156.1 で録った5シナリオのリプレイ適合テスト）。idle PSS 151 / stream 166 MiB（Phase 0: 143 / 164）、idle CPU 0.3%。実 Codex での生のターンと実機（macOS）計測は未確認。
+>
+> 計画からの変更: `blongo-client` クレート、`Backend` / `LocalBackend` トレイト、`ProviderCapabilities` はまだ作っていない（UI は `blongo-core` の `CoreClient` とイベントチャネルを直接使い、Codex のハーネスは `blongo-harness` の中）。UI はイベントのシーケンス番号を検査しない（プロセス内チャネルで欠落しないため）。どれも Phase 3（リモート）と Phase 2（2つ目のプロバイダー）で必要になった時点で入れる。
 
 Node なし・Electron なしで、1プロバイダーのスレッドが最後まで動く最小構成を作る。
 
