@@ -362,17 +362,66 @@ pub async fn add_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Res
     Ok(())
 }
 
-/// Remove a worktree created by [`add_worktree`] (its branch stays).
-pub async fn remove_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
+/// The top of the worktree containing `path`, checked to be one Blongo
+/// may delete: a linked worktree (never a main checkout) of `repo`'s
+/// repository (same git common dir) whose top lies strictly inside `root`
+/// (where Blongo creates worktrees, `<data_dir>/worktrees`). Every path is
+/// resolved (symlinks, `..`) before it is compared.
+pub async fn owned_worktree_top(repo: &Path, path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    let top = work_tree_root(path)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a git work tree", path.display()))?
+        .canonicalize()?;
+    let root = root.canonicalize()?;
+    if top == root || !top.starts_with(&root) {
+        bail!(
+            "{} is not inside Blongo's worktree folder {}",
+            top.display(),
+            root.display()
+        );
+    }
+    let dirs = |cwd: PathBuf| async move {
+        let out = git(
+            &cwd,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+        )
+        .await?;
+        let mut lines = out.lines().map(|l| Path::new(l).canonicalize());
+        match (lines.next(), lines.next()) {
+            (Some(dir), Some(common)) => Ok::<_, anyhow::Error>((dir?, common?)),
+            _ => bail!("unexpected git rev-parse output"),
+        }
+    };
+    let (git_dir, common) = dirs(top.clone()).await?;
+    let (_, repo_common) = dirs(repo.to_path_buf()).await?;
+    if common != repo_common {
+        bail!("{} belongs to another repository", top.display());
+    }
+    if git_dir == common {
+        bail!("{} is a main checkout, not a worktree", top.display());
+    }
+    Ok(top)
+}
+
+/// Remove a worktree created by [`add_worktree`] (its branch stays), after
+/// [`owned_worktree_top`] confirmed it is one of ours under `root`.
+pub async fn remove_worktree(repo: &Path, path: &Path, root: &Path) -> anyhow::Result<()> {
+    let top = owned_worktree_top(repo, path, root).await?;
     git(
         repo,
-        &["worktree", "remove", "--force", &path.to_string_lossy()],
+        &["worktree", "remove", "--force", &top.to_string_lossy()],
     )
     .await?;
     Ok(())
 }
 
-/// Remove the worktree containing `path` (a project inside a larger
+/// Remove the worktree containing `path` (only one [`owned_worktree_top`]
+/// accepts under `root`; a project inside a larger
 /// repository works in a subfolder of it) only when nothing in it would be
 /// lost: no uncommitted change, no untracked file, no ignored file (`git
 /// worktree remove` alone deletes ignored files such as `.env`) and no
@@ -384,10 +433,8 @@ pub async fn remove_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
 /// user's shell or editor) that writes into the folder in between can still
 /// lose that write. Blongo itself runs nothing there once the thread is
 /// archived.
-pub async fn remove_pristine_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
-    let top = work_tree_root(path)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("{} is not in a git work tree", path.display()))?;
+pub async fn remove_pristine_worktree(repo: &Path, path: &Path, root: &Path) -> anyhow::Result<()> {
+    let top = owned_worktree_top(repo, path, root).await?;
     let status = git(
         &top,
         &[

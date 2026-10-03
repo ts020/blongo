@@ -158,7 +158,9 @@ async fn worktree_add_and_remove() {
             .await
             .is_err()
     );
-    remove_worktree(&repo.0, &path).await.unwrap();
+    remove_worktree(&repo.0, &path, path.parent().unwrap())
+        .await
+        .unwrap();
     assert!(!path.exists());
     let empty = Repo::new("worktree-empty", false).await;
     let err = add_worktree(&empty.0, &empty.0.with_extension("wt"), "b")
@@ -252,11 +254,15 @@ async fn worktrees_with_ignored_files_are_kept() {
         .unwrap();
     std::fs::create_dir_all(path.join("target")).unwrap();
     std::fs::write(path.join("target/secret.env"), "TOKEN=x\n").unwrap();
-    let err = remove_pristine_worktree(&repo.0, &path).await.unwrap_err();
+    let err = remove_pristine_worktree(&repo.0, &path, path.parent().unwrap())
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("ignored"), "{err:#}");
     assert!(path.join("target/secret.env").exists());
     std::fs::remove_dir_all(path.join("target")).unwrap();
-    remove_pristine_worktree(&repo.0, &path).await.unwrap();
+    remove_pristine_worktree(&repo.0, &path, path.parent().unwrap())
+        .await
+        .unwrap();
     assert!(!path.exists());
 }
 
@@ -306,7 +312,9 @@ async fn user_status_settings_cannot_hide_files_from_the_worktree_check() {
         ""
     );
     // ...but not from the check.
-    let err = remove_pristine_worktree(&repo.0, &path).await.unwrap_err();
+    let err = remove_pristine_worktree(&repo.0, &path, path.parent().unwrap())
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("notes.txt"), "{err:#}");
     assert!(path.join("notes.txt").exists());
     // Called with a subfolder (a nested project), it checks and removes
@@ -315,13 +323,13 @@ async fn user_status_settings_cannot_hide_files_from_the_worktree_check() {
     std::fs::create_dir_all(path.join("sub")).unwrap();
     std::fs::write(path.join("sub/new.txt"), "x").unwrap();
     assert!(
-        remove_pristine_worktree(&repo.0, &path.join("sub"))
+        remove_pristine_worktree(&repo.0, &path.join("sub"), path.parent().unwrap())
             .await
             .is_err()
     );
     std::fs::remove_dir_all(path.join("sub")).unwrap();
     std::fs::create_dir_all(path.join("sub")).unwrap();
-    remove_pristine_worktree(&repo.0, &path.join("sub"))
+    remove_pristine_worktree(&repo.0, &path.join("sub"), path.parent().unwrap())
         .await
         .unwrap();
     assert!(!path.exists());
@@ -370,7 +378,53 @@ async fn ignored_submodule_changes_keep_the_worktree() {
         .await
         .unwrap();
     std::fs::write(path.join("inner/a.txt"), "changed in the submodule\n").unwrap();
-    assert!(remove_pristine_worktree(&repo.0, &path).await.is_err());
+    assert!(
+        remove_pristine_worktree(&repo.0, &path, path.parent().unwrap())
+            .await
+            .is_err()
+    );
     assert!(path.join("inner/a.txt").exists());
     let _ = std::fs::remove_dir_all(&path);
+}
+
+#[tokio::test]
+async fn only_our_linked_worktrees_can_be_removed() {
+    let repo = Repo::new("wt-guard", true).await;
+    let other = Repo::new("wt-guard-other", true).await;
+    let root = repo.0.with_extension("wts");
+    let path = root.join("thread");
+    add_worktree(&repo.0, &path, "blongo/guard").await.unwrap();
+    // The main checkout, even when it sits inside the root.
+    let err = remove_worktree(&repo.0, &repo.0, repo.0.parent().unwrap())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("main checkout"), "{err:#}");
+    assert!(repo.0.join("a.txt").exists());
+    // Outside the root.
+    let elsewhere = repo.0.with_extension("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let err = remove_worktree(&repo.0, &path, &elsewhere)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("not inside"), "{err:#}");
+    // The root itself.
+    assert!(remove_worktree(&repo.0, &path, &path).await.is_err());
+    // Reached through `..` from inside the root: resolved first.
+    let sneaky = root.join("..").join(repo.0.file_name().unwrap());
+    let err = remove_worktree(&repo.0, &sneaky, &root).await.unwrap_err();
+    assert!(format!("{err:#}").contains("not inside"), "{err:#}");
+    // Another repository's worktree under the root.
+    let foreign = root.join("foreign");
+    add_worktree(&other.0, &foreign, "blongo/foreign")
+        .await
+        .unwrap();
+    let err = remove_worktree(&repo.0, &foreign, &root).await.unwrap_err();
+    assert!(format!("{err:#}").contains("another repository"), "{err:#}");
+    assert!(foreign.exists());
+    // Ours: removed.
+    remove_worktree(&repo.0, &path, &root).await.unwrap();
+    assert!(!path.exists());
+    remove_worktree(&other.0, &foreign, &root).await.unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&elsewhere);
 }

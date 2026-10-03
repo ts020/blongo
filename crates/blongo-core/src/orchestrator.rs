@@ -711,6 +711,7 @@ impl Orchestrator {
             blongo_git::remove_pristine_worktree(
                 Path::new(&project.path),
                 Path::new(&worktree.path),
+                &self.config.data_dir.join("worktrees"),
             )
             .await
             .err()
@@ -734,9 +735,12 @@ impl Orchestrator {
         let Some(project) = self.projects.get(project_id) else {
             return;
         };
-        if let Some(top) = blongo_git::work_tree_root(Path::new(&worktree.path)).await {
-            let _ = blongo_git::remove_worktree(Path::new(&project.path), &top).await;
-        }
+        let _ = blongo_git::remove_worktree(
+            Path::new(&project.path),
+            Path::new(&worktree.path),
+            &self.config.data_dir.join("worktrees"),
+        )
+        .await;
     }
 
     fn thread_cwd(&self, thread_id: ThreadId) -> Result<(Thread, String), String> {
