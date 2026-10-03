@@ -18,10 +18,32 @@ pub fn fake_codex() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blongo-harness/tests/fixtures/fake_codex.py")
 }
 
-pub fn temp_dir(name: &str) -> PathBuf {
+/// A scratch directory removed when the test ends.
+pub struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn temp_dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("blongo-core-{name}-{}", ThreadId::new()));
     std::fs::create_dir_all(dir.join("project")).unwrap();
-    dir
+    TempDir(dir)
 }
 
 pub struct TestCore {

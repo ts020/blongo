@@ -17,7 +17,9 @@ the turn id; the `initialize` control request lists two models; a
 `"priority": "now"` user message during "loop"/"slow" ends the running part
 with `error_during_execution` and answers "steered: <text>"; "slow" ends by
 itself after a while; "plan" sends a TodoWrite; "write <file> <text>" writes
-a file; a prompt containing "echo:" is answered with the prompt.
+a file; "markdown" streams Markdown with a fenced Python block
+(FAKE_CLAUDE_DELAY_MS between words); a prompt containing "echo:" is
+answered with the prompt.
 FAKE_CLAUDE_LOG gets the argv and every stdin frame.
 """
 import json
@@ -152,6 +154,33 @@ def loop_turn(limit=None, delay=0.02):
         delta("text", f"tick {n} ")
 
 
+MARKDOWN = """### Fix
+
+The bug is in `load()`: it **ignores** the error.
+
+```python
+def load(path: str) -> dict:
+    # Fail loudly instead of returning None.
+    with open(path) as f:
+        return json.load(f)
+```
+
+- [x] reproduced
+- [x] fixed
+"""
+
+
+def markdown_turn():
+    delay = int(os.environ.get("FAKE_CLAUDE_DELAY_MS", "0")) / 1000
+    words = MARKDOWN.split(" ")
+    for i, w in enumerate(words):
+        delta("text", w if i == len(words) - 1 else w + " ")
+        if delay:
+            time.sleep(delay)
+    end_turn()
+    result()
+
+
 def simple(text):
     delta("text", text)
     end_turn()
@@ -190,6 +219,8 @@ def main():
             loop_turn()
         elif text == "slow":
             loop_turn(limit=60, delay=0.05)
+        elif text == "markdown":
+            markdown_turn()
         elif text == "plan":
             emit({"type": "assistant", "parent_tool_use_id": None, "message": {
                 "role": "assistant", "content": [{"type": "tool_use", "id": "todo1",

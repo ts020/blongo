@@ -27,6 +27,14 @@ struct Replay {
     state: PathBuf,
 }
 
+impl Drop for Replay {
+    fn drop(&mut self) {
+        if let Some(dir) = self.log.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 impl Replay {
     fn new(scenario: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
