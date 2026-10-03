@@ -7,6 +7,9 @@
 commit `9e1a11158b0626237c814f4bd36f5948483ed797`) so Blongo and zeron can be
 profiled with the identical workload. Parts of `crates/blongo-harness` are
 adapted from zeron's `crates/harness` where noted in the source.
+`crates/blongo-harness/src/antigravity_install.rs` uses the Antigravity
+1.2.1 archive names and SHA-512 digests zeron pins
+(`crates/harness/src/acp/mod.rs`) and follows its extraction rules.
 
 ```
 MIT License
@@ -45,6 +48,16 @@ commit `8ed276c246b624631e7d39241ebfd22d8314cb68`), used unchanged except that
 model names and one git branch name in the recorded metadata were replaced by
 neutral placeholders.
 
+`crates/blongo-harness/tests/fixtures/t3code/claude/*.ndjson` are t3code's
+recorded Claude Code sessions (`<scenario>/claude_transcript.ndjson`) and
+`crates/blongo-harness/tests/fixtures/t3code/acp/*.ndjson` its recorded ACP
+sessions (`<scenario>/grok_transcript.ndjson`, the Grok ACP agent; Blongo has
+no Antigravity recording), same commit. Model names, the agent's name and
+session metadata were replaced by neutral placeholders; the frames are
+otherwise unchanged. `tools/fixtures/make_t3_db.py` and
+`crates/blongo-core/tests/t3_import.rs` reproduce the columns of t3code's
+`005_Projections` and `055_OrchestrationV2` migrations.
+
 ```
 MIT License
 
@@ -78,3 +91,10 @@ Blongo links [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 soft wrapping and scrolling. The Apache License 2.0 text (copied from GPUI's
 repository) is in `licenses/Apache-2.0.txt`. Only Apache-2.0 GPUI crates are
 used; none of Zed's GPL-licensed crates are depended on or copied.
+
+## Markdown, highlighting and terminal crates
+
+Linked, not copied: pulldown-cmark (MIT), tree-sitter, tree-sitter-highlight
+and the tree-sitter grammars for Rust, Python, JavaScript, TypeScript, Bash,
+JSON, Go and C (MIT), portable-pty (MIT) and alacritty_terminal
+(Apache-2.0). `deny.toml` keeps every dependency on a permissive license.

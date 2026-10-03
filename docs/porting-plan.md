@@ -287,7 +287,9 @@ Node なし・Electron なしで、1プロバイダーのスレッドが最後�
 
 完了条件: Blongo 単体で Codex のスレッドを作成・実行・承認・中断でき、アプリを再起動しても SQLite から復元できる。Phase 0 のベースラインと並べた RSS・描画性能の数値がある。
 
-### Phase 2: プロバイダーとワークスペース機能
+### Phase 2: プロバイダーとワークスペース機能（2026-10-03 完了、結果は `docs/phase2/report.md`）
+
+> 結果の要点: Codex / Claude Code / Antigravity のスレッドがフェイクと t3code 録音のリプレイで完走し、チェックポイントからのロールバックで作業ツリーが戻る。キュー／steer、フォーク、切替の文脈引き継ぎ、worktree、PTY ターミナル、コードハイライト、プラン、モデル選択、t3code インポートも入った。idle PSS 155 / stream 170〜173 MiB、idle CPU 0.2〜0.3%。実エージェントと Antigravity の実バイナリでは未確認。
 
 - プロバイダー追加: **Claude → Antigravity** の順。各プロバイダーのリプレイ適合テストつき。Antigravity はバイナリのダウンロード・展開と OAuth ログインも含む
 - キュー／steer、フォーク、プロバイダー切替（ContextHandoff）
