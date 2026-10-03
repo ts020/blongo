@@ -1,5 +1,8 @@
 //! A minimal HTTP client: the system `curl` in a subprocess, configured
 //! through its stdin (so tokens never appear in `ps` or the environment).
+//! Request bodies travel inside that config too (`data-raw`), so nothing
+//! is written to disk; `-q` comes first so a user's `~/.curlrc` cannot
+//! change what is sent or where.
 //!
 //! Blongo talks HTTP only for opt-in features (the PR inbox, update
 //! checks); a full HTTP/TLS stack in the binary would cost more memory
@@ -14,6 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Most bytes of a response body read.
 pub const MAX_BODY: usize = 16 << 20;
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest request body (it is one line of curl's config, which curl
+/// caps at 10 MiB).
+pub const MAX_REQUEST_BODY: usize = 8 << 20;
 
 #[derive(Clone, Debug, Default)]
 pub struct Request {
@@ -112,10 +118,8 @@ fn quote(value: &str) -> String {
     out
 }
 
-/// The config text curl reads from stdin for `req` (the body follows it
-/// in a separate stream: `--data-binary @-` cannot share stdin, so it is
-/// written to a private temporary file).
-fn config(req: &Request, body_file: Option<&std::path::Path>) -> Result<String, String> {
+/// The config text curl reads from stdin for `req`, body included.
+fn config(req: &Request) -> Result<String, String> {
     check_url(&req.url)?;
     let mut c = String::new();
     c.push_str("silent\nshow-error\n");
@@ -137,11 +141,20 @@ fn config(req: &Request, body_file: Option<&std::path::Path>) -> Result<String, 
         ));
     }
     c.push_str("header = \"User-Agent: blongo\"\n");
-    if let Some(file) = body_file {
-        c.push_str(&format!(
-            "data-binary = {}\n",
-            quote(&format!("@{}", file.display()))
-        ));
+    if let Some(body) = &req.body {
+        // Text only (JSON): a config value cannot carry NUL or other
+        // control bytes, and `data-raw` never reads a file for `@`.
+        let text = std::str::from_utf8(body).map_err(|_| "the request body is not text")?;
+        if text.len() > MAX_REQUEST_BODY {
+            return Err("the request body is too large".into());
+        }
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return Err("the request body has control characters".into());
+        }
+        c.push_str(&format!("data-raw = {}\n", quote(text)));
     }
     // The status code on a line of its own after the body.
     c.push_str("write-out = \"\\n%{http_code}\"\n");
@@ -151,29 +164,14 @@ fn config(req: &Request, body_file: Option<&std::path::Path>) -> Result<String, 
 /// Send one request. Errors: curl missing, network failures, a refused
 /// URL; HTTP error statuses are a [`Response`] like any other.
 pub async fn send(req: Request) -> Result<Response, String> {
-    let body_file = match &req.body {
-        Some(body) => {
-            let path = std::env::temp_dir().join(format!(
-                "blongo-http-{}",
-                crate::secret::b64(&crate::secret::random::<9>())
-            ));
-            crate::secret::write_private(&path, body).map_err(|e| e.to_string())?;
-            Some(path)
-        }
-        None => None,
-    };
-    let result = run(&req, body_file.as_deref()).await;
-    if let Some(path) = body_file {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    run(&req).await
 }
 
-async fn run(req: &Request, body_file: Option<&std::path::Path>) -> Result<Response, String> {
-    let config = config(req, body_file)?;
+async fn run(req: &Request) -> Result<Response, String> {
+    let config = config(req)?;
     let program = std::env::var("BLONGO_CURL").unwrap_or_else(|_| "curl".into());
     let mut child = tokio::process::Command::new(&program)
-        .args(["--config", "-"])
+        .args(["-q", "--config", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -229,8 +227,26 @@ async fn run(req: &Request, body_file: Option<&std::path::Path>) -> Result<Respo
 /// Download `url` into `dest` (created 0600), at most `max` bytes.
 pub async fn download(url: &str, dest: &std::path::Path, max: u64) -> Result<u64, String> {
     check_url(url)?;
-    crate::secret::write_private(dest, b"").map_err(|e| e.to_string())?;
-    let mut c = config(&Request::get(url), None)?;
+    // A fresh 0600 file (the caller's folder is Blongo's own private one;
+    // no directory permissions are touched here).
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", dest.display())),
+    }
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(dest)
+            .map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    let mut c = config(&Request::get(url))?;
     c = c.replace(
         &format!("max-filesize = {MAX_BODY}\n"),
         &format!("max-filesize = {max}\n"),
@@ -247,7 +263,7 @@ pub async fn download(url: &str, dest: &std::path::Path, max: u64) -> Result<u64
     c = c.replace("write-out = \"\\n%{http_code}\"\n", "");
     let program = std::env::var("BLONGO_CURL").unwrap_or_else(|_| "curl".into());
     let mut child = tokio::process::Command::new(&program)
-        .args(["--config", "-"])
+        .args(["-q", "--config", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -292,12 +308,22 @@ mod tests {
     #[test]
     fn config_quotes_values_and_never_takes_headers_with_newlines() {
         let req = Request::get("https://h/x").header("Authorization", "Bearer a\"b\\c");
-        let c = config(&req, None).unwrap();
+        let c = config(&req).unwrap();
         assert!(
             c.contains(r#"header = "Authorization: Bearer a\"b\\c""#),
             "{c}"
         );
         let bad = Request::get("https://h/x").header("X", "a\nurl = file:///etc/passwd");
-        assert!(config(&bad, None).is_err());
+        assert!(config(&bad).is_err());
+        // Bodies go inside the config, quoted; binary bodies are refused.
+        let post = Request::post_json("https://h/x", &serde_json::json!({"a": "q\"\\\nz"}));
+        let c = config(&post).unwrap();
+        assert!(
+            c.contains(r#"data-raw = "{\"a\":\"q\\\"\\\\\\nz\"}""#),
+            "{c}"
+        );
+        let mut binary = Request::get("https://h/x");
+        binary.body = Some(vec![b'a', 0, b'b']);
+        assert!(config(&binary).is_err());
     }
 }

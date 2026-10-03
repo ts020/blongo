@@ -275,6 +275,8 @@ async fn update_check_and_verified_download() {
     let port = listener.local_addr().unwrap().port();
     let manifest = update::Manifest {
         version: "99.0.0".into(),
+        platform: update::platform(),
+        expires: blongo_client::secret::unix_now() as i64 + 3600,
         url: format!("http://127.0.0.1:{port}/blongo-99.tar.gz"),
         sha256: sha.clone(),
         notes: "big release".into(),
@@ -336,6 +338,18 @@ async fn update_check_and_verified_download() {
     let err = update::download(&bad, &dir).await.unwrap_err();
     assert!(err.contains("does not match"), "{err}");
     assert!(!dir.join("bad.tar.gz").exists());
+    // A signed manifest for another platform, or an expired one, is not
+    // believed.
+    let foreign = update::Manifest {
+        platform: "plan9-mips".into(),
+        ..manifest.clone()
+    };
+    let stale = update::Manifest {
+        expires: 1,
+        ..manifest.clone()
+    };
+    assert!(update::verify(&sign(&foreign), &key.verifying_key()).is_err());
+    assert!(update::verify(&sign(&stale), &key.verifying_key()).is_err());
     // Another key's signature is refused.
     let other = SigningKey::from_bytes(&[4u8; 32]);
     assert!(

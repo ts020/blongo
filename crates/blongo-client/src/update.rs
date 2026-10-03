@@ -5,15 +5,19 @@
 //! The manifest endpoint serves
 //! `{"manifest": BASE64(JSON), "signature": BASE64(Ed25519 signature of
 //! those JSON bytes)}`, where the JSON is
-//! `{"version": "0.2.0", "url": "https://…", "sha256": "…", "notes": "…"}`.
+//! `{"version": "0.2.0", "platform": "linux-x86_64", "expires": UNIX_SECS,
+//! "url": "https://…", "sha256": "…", "notes": "…"}`.
 //! Only a manifest signed by the release key is believed; the URL and
 //! hash come from inside the signed bytes, so a compromised download host
-//! cannot hand out another file.
+//! cannot hand out another file. The signed platform keeps one OS's build
+//! from being offered to another, and the expiry keeps an old (signed but
+//! superseded) manifest from being replayed forever.
 //!
 //! This build has no release key compiled in ([`RELEASE_KEY`] is `None`):
 //! update checks need `BLONGO_UPDATE_URL` and `BLONGO_UPDATE_KEY`
-//! (base64 public key), which is how the tests and the e2e run use a
-//! local fake server.
+//! (base64 public key), which is how the tests use a local fake server.
+//! Once a build has a release key, `BLONGO_UPDATE_KEY` is ignored: an
+//! environment variable can never replace the key a release trusts.
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -30,6 +34,10 @@ pub const MAX_DOWNLOAD: u64 = 512 << 20;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    /// `<os>-<arch>` as [`platform`] gives it.
+    pub platform: String,
+    /// The manifest is not believed after this time (Unix seconds).
+    pub expires: i64,
     pub url: String,
     pub sha256: String,
     #[serde(default)]
@@ -42,20 +50,31 @@ pub enum Status {
     Available(Manifest),
 }
 
-/// Where to look and whom to trust: the compiled-in key and URL, or the
-/// `BLONGO_UPDATE_URL` / `BLONGO_UPDATE_KEY` pair.
+/// This build's platform as manifests name it (`linux-x86_64`, …).
+pub fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Where to look and whom to trust: the compiled-in key (always, when the
+/// build has one) or, in builds without one, `BLONGO_UPDATE_KEY`; the URL
+/// from `BLONGO_UPDATE_URL`.
 pub fn configured() -> Option<(String, VerifyingKey)> {
     let url = std::env::var("BLONGO_UPDATE_URL")
         .ok()
         .filter(|u| !u.is_empty())?;
-    let key = match std::env::var("BLONGO_UPDATE_KEY").ok() {
-        Some(k) => base64::engine::general_purpose::STANDARD
-            .decode(k.trim())
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())?,
-        None => RELEASE_KEY?,
-    };
+    let key = trusted_key(RELEASE_KEY, std::env::var("BLONGO_UPDATE_KEY").ok())?;
     Some((url, VerifyingKey::from_bytes(&key).ok()?))
+}
+
+/// The release key wins over the environment's.
+fn trusted_key(release: Option<[u8; 32]>, from_env: Option<String>) -> Option<[u8; 32]> {
+    match release {
+        Some(key) => Some(key),
+        None => base64::engine::general_purpose::STANDARD
+            .decode(from_env?.trim())
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -64,8 +83,18 @@ struct Envelope {
     signature: String,
 }
 
-/// Verify an envelope's signature and parse its manifest.
+/// Verify an envelope's signature and parse its manifest, which must be
+/// for this platform and not expired.
 pub fn verify(envelope: &[u8], key: &VerifyingKey) -> Result<Manifest, String> {
+    verify_at(envelope, key, &platform(), crate::secret::unix_now() as i64)
+}
+
+fn verify_at(
+    envelope: &[u8],
+    key: &VerifyingKey,
+    platform: &str,
+    now: i64,
+) -> Result<Manifest, String> {
     let env: Envelope =
         serde_json::from_slice(envelope).map_err(|e| format!("bad update manifest: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -81,6 +110,15 @@ pub fn verify(envelope: &[u8], key: &VerifyingKey) -> Result<Manifest, String> {
         .map_err(|_| "the update manifest is not signed by the release key".to_owned())?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|e| format!("bad update manifest: {e}"))?;
+    if manifest.platform != platform {
+        return Err(format!(
+            "the update manifest is for {}, not {platform}",
+            manifest.platform
+        ));
+    }
+    if manifest.expires <= now {
+        return Err("the update manifest has expired".into());
+    }
     http::check_url(&manifest.url)?;
     if manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("bad sha256 in the update manifest".into());
@@ -202,6 +240,8 @@ mod tests {
         let other = SigningKey::from_bytes(&[8u8; 32]);
         let m = Manifest {
             version: "9.9.9".into(),
+            platform: platform(),
+            expires: crate::secret::unix_now() as i64 + 3600,
             url: "https://example.invalid/blongo.tar.gz".into(),
             sha256: "a".repeat(64),
             notes: String::new(),
@@ -224,5 +264,36 @@ mod tests {
             ..m
         };
         assert!(verify(&signed(&key, &insecure), &key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn manifests_are_bound_to_a_platform_and_expire() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let m = Manifest {
+            version: "9.9.9".into(),
+            platform: "linux-x86_64".into(),
+            expires: 1_000,
+            url: "https://example.invalid/blongo.tar.gz".into(),
+            sha256: "a".repeat(64),
+            notes: String::new(),
+        };
+        let env = signed(&key, &m);
+        let k = key.verifying_key();
+        assert!(verify_at(&env, &k, "linux-x86_64", 999).is_ok());
+        let err = verify_at(&env, &k, "linux-x86_64", 1_000).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        let err = verify_at(&env, &k, "windows-x86_64", 999).unwrap_err();
+        assert!(err.contains("not windows-x86_64"), "{err}");
+    }
+
+    #[test]
+    fn a_release_key_cannot_be_replaced_from_the_environment() {
+        let env_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        assert_eq!(
+            trusted_key(Some([1; 32]), Some(env_key.clone())),
+            Some([1; 32])
+        );
+        assert_eq!(trusted_key(None, Some(env_key)), Some([9; 32]));
+        assert_eq!(trusted_key(None, None), None);
     }
 }

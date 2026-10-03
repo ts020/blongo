@@ -131,21 +131,59 @@ pub fn verify_proof(
         .map_err(|_| ProofError::BadSignature)
 }
 
-/// Create a directory readable only by its owner (0700 on Unix).
+/// Make `path` a directory readable only by its owner (0700 on Unix).
+///
+/// Missing directories are created 0700. An existing one is tightened to
+/// 0700 only when it belongs to this user and is not a shared directory
+/// (sticky bit, like `/tmp`); a shared or foreign directory is refused,
+/// never chmod-ed: Blongo must not change permissions of directories it
+/// does not own, and its secrets do not belong in them.
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if !path.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)?;
+        }
+        let meta = std::fs::metadata(path)?;
+        if !meta.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a directory",
+                path.display()
+            )));
+        }
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me || meta.mode() & 0o1000 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is shared or belongs to another user; refusing to keep private files there",
+                    path.display()
+                ),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 
 /// Replace `path` atomically with `data`, readable only by its owner
 /// (0600 on Unix, set before any byte is written).
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
+    // A missing parent is created private; an existing one is left as it
+    // is (the file itself is 0600).
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.exists()
+    {
         private_dir(dir)?;
     }
     let tmp = path.with_extension(format!("tmp-{}", b64(&random::<6>())));
@@ -171,6 +209,38 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Never chmod a directory Blongo does not own or that is shared:
+    /// writing a private file into an existing directory leaves its mode
+    /// alone, and a sticky (shared, `/tmp`-like) directory is refused.
+    #[cfg(unix)]
+    #[test]
+    fn existing_and_shared_directories_keep_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let root = std::env::temp_dir().join(format!("blongo-secret-{}", b64(&random::<6>())));
+        let open_dir = root.join("open");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&open_dir).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        write_private(&open_dir.join("a"), b"x").unwrap();
+        assert_eq!(mode(&open_dir), 0o755);
+        assert_eq!(mode(&open_dir.join("a")), 0o600);
+        write_private(&shared.join("b"), b"x").unwrap();
+        assert_eq!(mode(&shared), 0o1777);
+        assert!(private_dir(&shared).is_err());
+        assert_eq!(mode(&shared), 0o1777);
+        // A missing directory is created private.
+        write_private(&root.join("new/c"), b"x").unwrap();
+        assert_eq!(mode(&root.join("new")), 0o700);
+        // One of ours that is too open is tightened.
+        private_dir(&open_dir).unwrap();
+        assert_eq!(mode(&open_dir), 0o700);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn proofs_verify_and_fail_on_any_change() {
