@@ -101,6 +101,11 @@ pub struct DiffView {
     error: Option<String>,
     /// What the send button says ("Send to agent", "Submit review").
     send_label: &'static str,
+    /// Files waiting for their bodies, and whether one is being fetched.
+    queue: std::collections::VecDeque<usize>,
+    in_flight: bool,
+    /// Bumped by a reload: replies for older summaries are dropped.
+    generation: u64,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -146,6 +151,9 @@ impl DiffView {
             comment_input,
             error: None,
             send_label,
+            queue: std::collections::VecDeque::new(),
+            in_flight: false,
+            generation: 0,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         };
@@ -183,7 +191,7 @@ impl DiffView {
             })
             .collect();
         for ix in 0..self.files.len().min(OPEN_AT_FIRST) {
-            self.open_file(ix, cx);
+            self.open_file(ix, false, cx);
         }
         self.rebuild(cx);
     }
@@ -206,38 +214,51 @@ impl DiffView {
             thread_id: *thread_id,
             scope: *scope,
         };
-        crate::query::ask(backend, query, cx.weak_entity(), cx, |this, result, cx| {
-            match result {
-                Ok(QueryReply::DiffSummary(summary)) => {
-                    this.files = summary
-                        .files
-                        .iter()
-                        .map(|stat| FileEntry {
-                            stat: stat.clone(),
-                            patch: None,
-                            diff: None,
-                            open: false,
-                            loading: false,
-                            error: None,
-                            max_lines: FIRST_LINES,
-                        })
-                        .collect();
-                    this.summary = Some(summary);
-                    for ix in 0..this.files.len().min(OPEN_AT_FIRST) {
-                        this.open_file(ix, cx);
-                    }
+        let generation = self.generation;
+        crate::query::ask(
+            backend,
+            query,
+            cx.weak_entity(),
+            cx,
+            move |this, result, cx| {
+                if this.generation != generation {
+                    return;
                 }
-                Ok(other) => this.error = Some(format!("unexpected reply: {other:?}")),
-                Err(err) => this.error = Some(err),
-            }
-            this.rebuild(cx);
-        });
+                match result {
+                    Ok(QueryReply::DiffSummary(summary)) => {
+                        this.files = summary
+                            .files
+                            .iter()
+                            .map(|stat| FileEntry {
+                                stat: stat.clone(),
+                                patch: None,
+                                diff: None,
+                                open: false,
+                                loading: false,
+                                error: None,
+                                max_lines: FIRST_LINES,
+                            })
+                            .collect();
+                        this.summary = Some(summary);
+                        for ix in 0..this.files.len().min(OPEN_AT_FIRST) {
+                            this.open_file(ix, false, cx);
+                        }
+                    }
+                    Ok(other) => this.error = Some(format!("unexpected reply: {other:?}")),
+                    Err(err) => this.error = Some(err),
+                }
+                this.rebuild(cx);
+            },
+        );
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if matches!(self.source, Source::Thread { .. }) {
             self.summary = None;
             self.files.clear();
+            self.queue.clear();
+            self.in_flight = false;
+            self.generation += 1;
             self.error = None;
             self.composing = None;
             self.rebuild(cx);
@@ -245,7 +266,10 @@ impl DiffView {
         }
     }
 
-    fn open_file(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Open a file; its body is fetched in turn (one query at a time, so
+    /// a large diff never has many big replies in memory at once).
+    /// `first`: the user asked, so it goes before the ones opened at load.
+    fn open_file(&mut self, ix: usize, first: bool, cx: &mut Context<Self>) {
         let Some(file) = self.files.get_mut(ix) else {
             return;
         };
@@ -257,8 +281,21 @@ impl DiffView {
             file.diff = Some(parse_unified_diff(&file.stat.path, patch, file.max_lines));
             return;
         }
-        if file.patch.is_none() && matches!(self.source, Source::Patches) {
+        if matches!(self.source, Source::Patches) {
             file.error = Some("the forge sent no patch for this file (too large?)".into());
+            return;
+        }
+        file.loading = true;
+        if first {
+            self.queue.push_front(ix);
+        } else {
+            self.queue.push_back(ix);
+        }
+        self.pump(cx);
+    }
+
+    fn pump(&mut self, cx: &mut Context<Self>) {
+        if self.in_flight {
             return;
         }
         let Source::Thread {
@@ -270,7 +307,12 @@ impl DiffView {
         let Some(summary) = &self.summary else {
             return;
         };
-        file.loading = true;
+        let Some(ix) = self.queue.pop_front() else {
+            return;
+        };
+        let Some(file) = self.files.get(ix) else {
+            return;
+        };
         let query = Query::DiffFile {
             thread_id: *thread_id,
             from: summary.from.clone(),
@@ -278,12 +320,18 @@ impl DiffView {
             path: file.stat.path.clone(),
             max_lines: file.max_lines,
         };
+        let generation = self.generation;
+        self.in_flight = true;
         crate::query::ask(
             backend,
             query,
             cx.weak_entity(),
             cx,
             move |this, result, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.in_flight = false;
                 if let Some(file) = this.files.get_mut(ix) {
                     file.loading = false;
                     match result {
@@ -292,6 +340,7 @@ impl DiffView {
                         Err(err) => file.error = Some(err),
                     }
                 }
+                this.pump(cx);
                 this.rebuild(cx);
             },
         );
@@ -304,7 +353,7 @@ impl DiffView {
                 self.composing = None;
             }
         } else {
-            self.open_file(ix, cx);
+            self.open_file(ix, true, cx);
         }
         self.rebuild(cx);
     }
@@ -313,7 +362,7 @@ impl DiffView {
         let file = &mut self.files[ix];
         file.max_lines = (file.max_lines * 4).min(MAX_DIFF_LINES);
         file.diff = None;
-        self.open_file(ix, cx);
+        self.open_file(ix, true, cx);
         self.rebuild(cx);
     }
 
