@@ -423,6 +423,11 @@ async fn a_slow_reader_is_resnapshotted_with_bounded_memory() {
         ),
     ];
     config.limits.outbox.max_bytes = 256 * 1024;
+    // The slow client reads nothing until the run ends, so it overflows
+    // once per snapshot round trip for as long as the stream lasts: on a
+    // slow machine more often than the default allows before the server
+    // gives up on it. This test is about resnapshots, not that cutoff.
+    config.limits.max_overflows = usize::MAX;
     let server = blongo_server::start(config).unwrap();
     let target = ws_target(server.addr.unwrap());
     let env = pair(&dir, &target).await;

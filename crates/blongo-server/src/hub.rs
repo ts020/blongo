@@ -32,8 +32,6 @@ use crate::outbox::{Outbox, Push};
 
 pub type ConnId = u64;
 
-/// A connection that overflows more often than this within
-/// [`OVERFLOW_WINDOW`] is dropped (it can never catch up).
 /// Largest encoded query answer sent (half a server frame: the rest is
 /// room for messages drained into the same frame).
 pub(crate) const MAX_REPLY_BYTES: usize = blongo_protocol::wire::MAX_SERVER_FRAME / 2;
@@ -54,7 +52,10 @@ fn reply_msg(id: QueryId, result: Result<QueryReply, String>) -> ServerMsg {
         },
     }
 }
-const MAX_OVERFLOWS: usize = 5;
+/// A connection that overflows more often than this within
+/// [`OVERFLOW_WINDOW`] is dropped (it can never catch up). The default of
+/// [`crate::Limits::max_overflows`].
+pub const MAX_OVERFLOWS: usize = 5;
 const OVERFLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_ROUTED_COMMANDS: usize = 4096;
 const MAX_SUBSCRIBED_THREADS: usize = 16;
@@ -123,6 +124,7 @@ pub struct Hub {
     ring: VecDeque<(u64, Payload, usize)>,
     ring_bytes: usize,
     ring_limits: RingLimits,
+    max_overflows: usize,
     conns: HashMap<ConnId, Conn>,
     pending_shell: Vec<ConnId>,
     pending_threads: HashMap<ThreadId, Vec<ConnId>>,
@@ -151,6 +153,7 @@ impl Hub {
             ring: VecDeque::new(),
             ring_bytes: 0,
             ring_limits,
+            max_overflows: MAX_OVERFLOWS,
             conns: HashMap::new(),
             pending_shell: Vec::new(),
             pending_threads: HashMap::new(),
@@ -166,6 +169,13 @@ impl Hub {
             next_query: 0,
             revoked: VecDeque::new(),
         }
+    }
+
+    /// Close a connection once it overflows more than `n` times within
+    /// [`OVERFLOW_WINDOW`] (default [`MAX_OVERFLOWS`]).
+    pub fn with_max_overflows(mut self, n: usize) -> Self {
+        self.max_overflows = n;
+        self
     }
 
     pub fn failed(&self) -> Option<&str> {
@@ -213,7 +223,7 @@ impl Hub {
                     .retain(|t| now.duration_since(*t) < OVERFLOW_WINDOW);
                 conn.overflows.push_back(now);
                 self.stats.resnapshots.fetch_add(1, Ordering::Relaxed);
-                if conn.overflows.len() > MAX_OVERFLOWS {
+                if conn.overflows.len() > self.max_overflows {
                     eprintln!("blongo-serve: connection {conn_id} reads too slowly; closing it");
                     conn.outbox.close();
                     return;

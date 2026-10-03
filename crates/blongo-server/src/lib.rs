@@ -98,6 +98,9 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Pause before answering a failed authentication.
     pub refuse_delay: Duration,
+    /// A connection whose queue overflows more often than this within a
+    /// minute is closed: it can never catch up.
+    pub max_overflows: usize,
 }
 
 impl Default for Limits {
@@ -119,6 +122,7 @@ impl Default for Limits {
             idle_timeout: Duration::from_secs(75),
             write_timeout: Duration::from_secs(30),
             refuse_delay: Duration::from_millis(500),
+            max_overflows: hub::MAX_OVERFLOWS,
         }
     }
 }
@@ -462,7 +466,8 @@ pub async fn run(
     };
     let stats = Arc::new(Stats::default());
     let epoch = u64::from_be_bytes(random::<8>());
-    let hub = Hub::new(core.client(), epoch, config.limits.ring, stats.clone());
+    let hub = Hub::new(core.client(), epoch, config.limits.ring, stats.clone())
+        .with_max_overflows(config.limits.max_overflows);
     let (hub_tx, hub_rx) = mpsc::channel(HUB_QUEUE);
     let hub_task = tokio::spawn(hub.run(core_events, hub_rx));
     let shared = Arc::new(Shared {
