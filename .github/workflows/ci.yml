@@ -73,4 +73,9 @@ jobs:
         if: always()
         with:
           name: mem-smoke
-          path: profile-out
+          # Only the results: profile-out/data holds the app's data folder,
+          # whose MCP socket folder is deliberately unlistable (mode 0300),
+          # and the upload fails with EACCES when it walks into it.
+          path: |
+            profile-out/*.json
+            profile-out/*.log
