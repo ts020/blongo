@@ -638,6 +638,7 @@ async fn codex_rollback_restores_files_and_reverts_live() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: second.id,
+        acknowledged_sharers: 0,
     });
     core.accepted(&c).await;
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
@@ -657,6 +658,7 @@ async fn codex_rollback_restores_files_and_reverts_live() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: snap.runs[0].id,
+        acknowledged_sharers: 0,
     });
     core.accepted(&c).await;
     assert!(!file.exists());
@@ -689,6 +691,7 @@ async fn codex_rollback_after_restart_reverts_on_resume() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
+        acknowledged_sharers: 0,
     });
     core.accepted(&c).await;
     assert_eq!(
@@ -731,6 +734,7 @@ async fn claude_rollback_resumes_at_the_kept_turn() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
+        acknowledged_sharers: 0,
     });
     core.accepted(&c).await;
     core.turn(thread.id, "echo: three").await;
@@ -753,6 +757,45 @@ async fn claude_rollback_resumes_at_the_kept_turn() {
 }
 
 #[tokio::test]
+async fn claude_rollback_past_a_turn_without_an_id_keeps_the_newest_named_one() {
+    let dir = temp_dir("rollback-claude-noid");
+    let log = dir.join("claude.log");
+    let mut core = start_tweaked(&dir, |c| {
+        c.agent_env
+            .push(("FAKE_CLAUDE_LOG".into(), log.to_string_lossy().into_owned()))
+    });
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::ClaudeCode, false).await;
+    core.turn(thread.id, "echo: one").await;
+    // Interrupted before the agent named the turn.
+    core.send(thread.id, "loop");
+    core.until(|e| matches!(e, CoreEvent::TextDelta { .. }).then_some(()))
+        .await;
+    core.dispatch(Command::RunInterrupt {
+        thread_id: thread.id,
+    });
+    core.run_finished().await;
+    core.turn(thread.id, "echo: three").await;
+    let runs = core.snapshot(thread.id).await.runs.clone();
+    assert!(runs[1].provider_turn_id.is_none());
+    let kept = runs[0].provider_turn_id.clone().unwrap();
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: runs[2].id,
+        acknowledged_sharers: 0,
+    });
+    core.accepted(&c).await;
+    assert_eq!(
+        core.thread_state(thread.id).await.pending_context,
+        Some(PendingContext::Rewind {
+            keep_through_turn: Some(kept),
+            drop_from_turn: runs[2].provider_turn_id.clone(),
+        })
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
 async fn claude_fork_after_rollback_is_still_native() {
     let dir = temp_dir("rollback-fork-claude");
     let log = dir.join("claude.log");
@@ -769,6 +812,7 @@ async fn claude_fork_after_rollback_is_still_native() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: runs[1].id,
+        acknowledged_sharers: 0,
     });
     core.accepted(&c).await;
     let fork_id = ThreadId::new();
@@ -808,12 +852,139 @@ async fn rollback_is_refused_while_running() {
     let c = core.dispatch(Command::ThreadRollback {
         thread_id: thread.id,
         run_id: run,
+        acknowledged_sharers: 0,
     });
     assert!(core.rejected(&c).await.contains("wait"));
     core.dispatch(Command::RunInterrupt {
         thread_id: thread.id,
     });
     core.run_finished().await;
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn rollback_keeps_the_replaced_files() {
+    let dir = temp_dir("rollback-pre");
+    git_project(&dir);
+    let mut core = start(&dir);
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::Codex, false).await;
+    let repo = dir.join("project");
+    core.turn(thread.id, "write notes.txt first").await;
+    core.turn(thread.id, "write notes.txt second").await;
+    let runs = core.snapshot(thread.id).await.runs.clone();
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: runs[1].id,
+        acknowledged_sharers: 0,
+    });
+    core.accepted(&c).await;
+    assert_eq!(
+        std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+        "first"
+    );
+    let pre = format!("refs/blongo/pre-rollback/{}/{}", thread.id, runs[1].id);
+    let snap = core.snapshot(thread.id).await;
+    assert!(snap.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::SystemNotice { message } if message.contains(&pre)
+    )));
+    // The saved tree has what the rollback replaced.
+    assert_eq!(git(&repo, &["show", &format!("{pre}:notes.txt")]), "second");
+    git(
+        &repo,
+        &[
+            "restore",
+            &format!("--source={pre}"),
+            "--worktree",
+            "--",
+            ".",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+        "second"
+    );
+    // Archiving the thread drops its hidden refs.
+    let c = core.dispatch(Command::ThreadArchive {
+        thread_id: thread.id,
+    });
+    core.accepted(&c).await;
+    core.snapshot(thread.id).await;
+    assert_eq!(
+        git(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", "refs/blongo/"]
+        ),
+        ""
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn rollback_of_a_shared_folder_needs_every_thread_idle_and_a_confirmation() {
+    let dir = temp_dir("rollback-shared");
+    git_project(&dir);
+    let mut core = start(&dir);
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, ProviderKind::Codex, false).await;
+    let other = core.thread(project, ProviderKind::Codex, false).await;
+    // A worktree thread works elsewhere and does not count.
+    let elsewhere = core.thread(project, ProviderKind::Codex, true).await;
+    core.turn(thread.id, "write notes.txt first").await;
+    let run = core.snapshot(thread.id).await.runs[0].id;
+
+    // The other thread is running: refused whatever the confirmation says.
+    core.send(other.id, "slow");
+    core.until(|e| matches!(e, CoreEvent::TextDelta { .. }).then_some(()))
+        .await;
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: run,
+        acknowledged_sharers: 1,
+    });
+    assert!(
+        core.rejected(&c)
+            .await
+            .contains("same folder and is running")
+    );
+    core.dispatch(Command::RunInterrupt {
+        thread_id: other.id,
+    });
+    core.run_finished().await;
+
+    // Idle now, but the user was not told about it.
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: run,
+        acknowledged_sharers: 0,
+    });
+    assert!(
+        core.rejected(&c)
+            .await
+            .contains("1 other thread works in this folder")
+    );
+    assert!(dir.join("project/notes.txt").exists());
+
+    let c = core.dispatch(Command::ThreadRollback {
+        thread_id: thread.id,
+        run_id: run,
+        acknowledged_sharers: 1,
+    });
+    core.accepted(&c).await;
+    assert!(!dir.join("project/notes.txt").exists());
+    let snap = core.snapshot(thread.id).await;
+    assert!(snap.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::SystemNotice { message } if message.contains("1 other thread in this folder")
+    )));
+    // Archived with nothing uncommitted, its worktree goes (the branch stays).
+    let c = core.dispatch(Command::ThreadArchive {
+        thread_id: elsewhere.id,
+    });
+    core.accepted(&c).await;
+    core.snapshot(thread.id).await;
+    assert!(!Path::new(&elsewhere.worktree.as_ref().unwrap().path).exists());
     core.shutdown();
 }
 

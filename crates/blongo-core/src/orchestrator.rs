@@ -110,6 +110,10 @@ struct Prepared {
     worktree: Option<Worktree>,
     /// Rollback restored the workspace from this checkpoint.
     restored: Option<String>,
+    /// Rollback saved the files it replaced under this ref.
+    pre_rollback: Option<String>,
+    /// Other threads working in the folder the rollback rewrote.
+    sharers: u32,
 }
 
 /// Runtime state for a thread that has (or had) an agent session or run.
@@ -465,6 +469,9 @@ impl Orchestrator {
                 for post in std::mem::take(&mut self.post) {
                     self.apply_post(post);
                 }
+                if let Command::ThreadArchive { thread_id } = &command.command {
+                    self.clean_up_archived(*thread_id).await;
+                }
                 for row in outbox {
                     self.run_effect(row).await;
                 }
@@ -547,7 +554,11 @@ impl Orchestrator {
                     branch,
                 });
             }
-            Command::ThreadRollback { thread_id, run_id } => {
+            Command::ThreadRollback {
+                thread_id,
+                run_id,
+                acknowledged_sharers,
+            } => {
                 let (thread, cwd) = self.thread_cwd(*thread_id)?;
                 self.ensure_idle(&thread)?;
                 let run = self
@@ -563,15 +574,76 @@ impl Orchestrator {
                     return Err("this turn cannot be rolled back".into());
                 }
                 if let Some(commit) = &run.checkpoint {
+                    // The restore rewrites the whole folder: every other
+                    // thread working there must be idle, and the user must
+                    // know how many there are.
+                    let sharers = self.folder_sharers(*thread_id, &cwd);
+                    if let Some(busy) = sharers.iter().find(|t| self.is_busy(t.id)) {
+                        return Err(format!(
+                            "\"{}\" works in the same folder and is running; wait for it \
+                             to finish before rolling back",
+                            busy.title
+                        ));
+                    }
+                    let n = sharers.len() as u32;
+                    if n != *acknowledged_sharers {
+                        return Err(format!(
+                            "{n} other thread{} work{} in this folder and will see its files \
+                             change; confirm the rollback for all of them",
+                            if n == 1 { "" } else { "s" },
+                            if n == 1 { "s" } else { "" }
+                        ));
+                    }
+                    // Keep what is about to be overwritten.
+                    let pre = format!(
+                        "{}/{thread_id}/{run_id}",
+                        blongo_git::PRE_ROLLBACK_REF_PREFIX
+                    );
+                    blongo_git::capture_checkpoint(Path::new(&cwd), &pre)
+                        .await
+                        .map_err(|e| {
+                            format!("could not save the current files before rolling back: {e:#}")
+                        })?;
                     blongo_git::restore_checkpoint(Path::new(&cwd), commit)
                         .await
                         .map_err(|e| format!("could not restore the files: {e:#}"))?;
                     prepared.restored = Some(commit.clone());
+                    prepared.pre_rollback = Some(pre);
+                    prepared.sharers = n;
                 }
             }
             _ => {}
         }
         Ok(prepared)
+    }
+
+    /// An archived thread's checkpoints and pre-rollback refs go, and so
+    /// does its worktree when nothing in it is uncommitted (its branch
+    /// stays, so committed work is kept).
+    async fn clean_up_archived(&mut self, thread_id: ThreadId) {
+        let Some(thread) = self.threads.get(&thread_id).cloned() else {
+            return;
+        };
+        let Some(project) = self.projects.get(&thread.project_id).cloned() else {
+            return;
+        };
+        let cwd = PathBuf::from(thread.cwd(&project));
+        if blongo_git::work_tree_root(&cwd).await.is_none() {
+            return;
+        }
+        blongo_git::delete_thread_refs(&cwd, &thread_id.to_string()).await;
+        if let Some(worktree) = &thread.worktree
+            && let Err(err) = blongo_git::remove_clean_worktree(
+                Path::new(&project.path),
+                Path::new(&worktree.path),
+            )
+            .await
+        {
+            eprintln!(
+                "blongo-core: kept the worktree of an archived thread at {}: {err:#}",
+                worktree.path
+            );
+        }
     }
 
     /// Remove a worktree prepared for a command that was then refused.
@@ -597,12 +669,32 @@ impl Orchestrator {
         Ok((thread, cwd))
     }
 
+    fn is_busy(&self, thread_id: ThreadId) -> bool {
+        self.rt
+            .get(&thread_id)
+            .is_some_and(|rt| rt.run.is_some() || !rt.queue.is_empty())
+    }
+
+    /// Live threads other than `thread_id` whose folder is `cwd`, inside it
+    /// or around it (compared canonically): a restore of `cwd` changes their
+    /// files too.
+    fn folder_sharers(&self, thread_id: ThreadId, cwd: &str) -> Vec<Thread> {
+        let mine = canonical(cwd);
+        self.threads
+            .values()
+            .filter(|t| t.id != thread_id && !t.archived)
+            .filter(|t| {
+                self.projects.get(&t.project_id).is_some_and(|p| {
+                    let theirs = canonical(t.cwd(p));
+                    theirs.starts_with(&mine) || mine.starts_with(&theirs)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     fn ensure_idle(&self, thread: &Thread) -> Result<(), String> {
-        let busy = self
-            .rt
-            .get(&thread.id)
-            .is_some_and(|rt| rt.run.is_some() || !rt.queue.is_empty());
-        if busy {
+        if self.is_busy(thread.id) {
             Err("wait for the running turn (and queued messages) to finish".into())
         } else {
             Ok(())
@@ -762,9 +854,9 @@ impl Orchestrator {
                 // The next turn starts a session with the new settings.
                 self.post.push(Post::Release(*thread_id));
             }
-            Command::ThreadRollback { thread_id, run_id } => {
-                self.decide_rollback(&mut batch, *thread_id, *run_id, prepared.restored)?
-            }
+            Command::ThreadRollback {
+                thread_id, run_id, ..
+            } => self.decide_rollback(&mut batch, *thread_id, *run_id, &prepared)?,
             Command::ThreadRename { thread_id, title } => {
                 self.live_thread(*thread_id)?;
                 let title = title.trim();
@@ -1046,7 +1138,7 @@ impl Orchestrator {
         batch: &mut Batch,
         thread_id: ThreadId,
         run_id: RunId,
-        restored: Option<String>,
+        prepared: &Prepared,
     ) -> Result<(), String> {
         let thread = self.live_thread(thread_id)?.clone();
         self.ensure_idle(&thread)?;
@@ -1064,7 +1156,10 @@ impl Orchestrator {
                 error: None,
             });
         }
-        let keep_through = kept.last().and_then(|r| r.provider_turn_id.clone());
+        // The newest kept turn the provider can name (a failed turn may have
+        // none); without any, a native rewind would start from nothing.
+        let keep_through = kept.iter().rev().find_map(|r| r.provider_turn_id.clone());
+        let rewindable = kept.is_empty() || keep_through.is_some();
         let caps = thread.provider.capabilities();
         let live = self
             .rt
@@ -1089,7 +1184,7 @@ impl Orchestrator {
             },
             Some(PendingContext::Handoff) => (None, Some(PendingContext::Handoff)),
             _ => match (&thread.provider_thread_id, &target.provider_turn_id) {
-                (Some(pid), Some(drop_from)) if caps.native_rollback => {
+                (Some(pid), Some(drop_from)) if caps.native_rollback && rewindable => {
                     if caps.live_rollback && live {
                         live_rewind = Some(drop_from.clone());
                         (Some(pid.clone()), None)
@@ -1116,10 +1211,22 @@ impl Orchestrator {
             pending_context,
         });
         let turns = dropped.len();
-        let files = if restored.is_some() {
-            "Files were restored to how they were before it."
-        } else {
-            "No checkpoint was taken for it, so files were left as they are."
+        let files = match &prepared.pre_rollback {
+            Some(pre) if prepared.restored.is_some() => {
+                let others = match prepared.sharers {
+                    0 => String::new(),
+                    1 => " This also changed the files of 1 other thread in this folder.".into(),
+                    n => {
+                        format!(" This also changed the files of {n} other threads in this folder.")
+                    }
+                };
+                format!(
+                    "Files were restored to how they were before it.{others} The files as they \
+                     were just before the rollback are saved in {pre} \
+                     (`git restore --source={pre} --worktree -- .` brings them back)."
+                )
+            }
+            _ => "No checkpoint was taken for it, so files were left as they are.".into(),
         };
         let item = self
             .new_item(
@@ -1310,7 +1417,19 @@ impl Orchestrator {
                 run_id,
                 commit,
             }]),
-            Err(err) => eprintln!("blongo-core: checkpoint failed: {err:#}"),
+            Err(err) => {
+                eprintln!("blongo-core: checkpoint failed: {err:#}");
+                self.add_item(
+                    thread.id,
+                    run_id,
+                    ItemKind::SystemNotice {
+                        message: format!(
+                            "No checkpoint was taken for this turn, so rolling it back will \
+                             not restore files: {err:#}"
+                        ),
+                    },
+                );
+            }
         }
     }
 
@@ -2452,6 +2571,12 @@ fn close_item_event(item: &TurnItem) -> Option<EventKind> {
             item: Arc::new(item),
         }),
     }
+}
+
+fn canonical(path: &str) -> PathBuf {
+    Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path))
 }
 
 fn fork_title(title: &str) -> String {

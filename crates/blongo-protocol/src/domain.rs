@@ -457,7 +457,19 @@ pub enum Command {
     /// Undo `run_id` and every later run: restore the workspace to the
     /// checkpoint taken before it and drop the runs from the conversation.
     #[serde(rename = "thread.rollback")]
-    ThreadRollback { thread_id: ThreadId, run_id: RunId },
+    ///
+    /// The restore rewrites the whole folder the thread works in. Other
+    /// threads working in the same folder (or one inside or around it)
+    /// must all be idle, and the user must have been told how many there
+    /// are: `acknowledged_sharers` must equal that number. The files as
+    /// they are just before the restore are saved under
+    /// `refs/blongo/pre-rollback/<thread>/<run>`.
+    ThreadRollback {
+        thread_id: ThreadId,
+        run_id: RunId,
+        #[serde(default)]
+        acknowledged_sharers: u32,
+    },
     #[serde(rename = "thread.rename")]
     ThreadRename { thread_id: ThreadId, title: String },
     #[serde(rename = "thread.archive")]
