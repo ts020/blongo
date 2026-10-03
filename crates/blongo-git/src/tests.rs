@@ -181,3 +181,51 @@ async fn outside_git() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn restore_keeps_what_was_staged() {
+    let repo = Repo::new("staged", true).await;
+    // a.txt partially staged: "two" staged, "three" in the work tree.
+    repo.write("a.txt", "two\n");
+    git(&repo.0, &["add", "a.txt"]).await.unwrap();
+    repo.write("a.txt", "three\n");
+    repo.write("staged-new.txt", "s\n");
+    git(&repo.0, &["add", "staged-new.txt"]).await.unwrap();
+    let commit = capture_checkpoint(&repo.0, &checkpoint_ref("t", "r"))
+        .await
+        .unwrap();
+    // The agent changes everything and resets the index.
+    repo.write("a.txt", "agent\n");
+    repo.write("other.txt", "agent\n");
+    git(&repo.0, &["reset", "--quiet"]).await.unwrap();
+    restore_checkpoint(&repo.0, &commit).await.unwrap();
+    assert_eq!(repo.read("a.txt").as_deref(), Some("three\n"));
+    assert_eq!(repo.read("other.txt"), None);
+    assert_eq!(
+        git(&repo.0, &["show", ":a.txt"]).await.unwrap(),
+        "two",
+        "the staged version is back in the index"
+    );
+    assert_eq!(
+        git(&repo.0, &["diff", "--cached", "--name-only"])
+            .await
+            .unwrap(),
+        "a.txt\nstaged-new.txt"
+    );
+}
+
+#[tokio::test]
+async fn huge_untracked_files_skip_the_checkpoint() {
+    let repo = Repo::new("huge", true).await;
+    let file = std::fs::File::create(repo.0.join("big.bin")).unwrap();
+    file.set_len(MAX_UNTRACKED_FILE + 1).unwrap();
+    let err = capture_checkpoint(&repo.0, &checkpoint_ref("t", "r"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("big.bin"));
+    // Ignored, it is fine.
+    repo.write(".gitignore", "target/\nbig.bin\n");
+    capture_checkpoint(&repo.0, &checkpoint_ref("t", "r"))
+        .await
+        .unwrap();
+}
