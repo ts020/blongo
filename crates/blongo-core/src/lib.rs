@@ -126,7 +126,31 @@ pub struct CoreHandle {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A cheap, cloneable sender of commands (views hold these; only the owner
+/// of the [`CoreHandle`] can stop the core).
+#[derive(Clone)]
+pub struct CoreClient {
+    requests: mpsc::UnboundedSender<Request>,
+}
+
+impl CoreClient {
+    pub fn dispatch(&self, command: CommandEnvelope) {
+        let _ = self.requests.send(Request::Dispatch(command));
+    }
+
+    /// Ask for a thread's snapshot ([`CoreEvent::Thread`]).
+    pub fn open_thread(&self, thread_id: ThreadId) {
+        let _ = self.requests.send(Request::OpenThread(thread_id));
+    }
+}
+
 impl CoreHandle {
+    pub fn client(&self) -> CoreClient {
+        CoreClient {
+            requests: self.requests.clone(),
+        }
+    }
+
     pub fn dispatch(&self, command: CommandEnvelope) {
         let _ = self.requests.send(Request::Dispatch(command));
     }

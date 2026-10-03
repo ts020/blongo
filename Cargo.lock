@@ -647,13 +647,13 @@ name = "blongo"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "blongo-harness",
+ "blongo-core",
  "blongo-protocol",
  "gpui",
  "gpui_platform",
  "mimalloc",
- "serde_json",
  "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]
