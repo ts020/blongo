@@ -166,10 +166,24 @@ pub enum When {
     Or(Box<When>, Box<When>),
 }
 
+/// Longest when-clause accepted.
+const MAX_WHEN_LEN: usize = 512;
+/// Deepest nesting of `(` and `!` in a when-clause (the parser recurses).
+const MAX_WHEN_DEPTH: usize = 32;
+
 impl When {
     pub fn parse(text: &str) -> Result<Self, String> {
+        if text.len() > MAX_WHEN_LEN {
+            return Err(format!(
+                "when-clauses are limited to {MAX_WHEN_LEN} characters"
+            ));
+        }
         let tokens = tokenize(text)?;
-        let mut p = Parser { tokens, at: 0 };
+        let mut p = Parser {
+            tokens,
+            at: 0,
+            depth: 0,
+        };
         let expr = p.or()?;
         if p.at != p.tokens.len() {
             return Err(format!("unexpected `{}` in `{text}`", p.tokens[p.at]));
@@ -227,6 +241,7 @@ fn tokenize(text: &str) -> Result<Vec<String>, String> {
 struct Parser {
     tokens: Vec<String>,
     at: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -253,6 +268,16 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<When, String> {
+        self.depth += 1;
+        let result = self.unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn unary_inner(&mut self) -> Result<When, String> {
+        if self.depth > MAX_WHEN_DEPTH {
+            return Err(format!("when-clauses nest at most {MAX_WHEN_DEPTH} deep"));
+        }
         match self.peek() {
             Some("!") => {
                 self.at += 1;
@@ -455,6 +480,11 @@ mod tests {
         assert!(!t("busy"));
         assert!(t("threadOpen && !busy"));
         assert!(t("busy || view.diff"));
+        // Deep nesting and huge clauses are refused, not recursed into.
+        assert!(When::parse(&format!("{}a{}", "(".repeat(200), ")".repeat(200))).is_err());
+        assert!(When::parse(&"!".repeat(100).to_string()).is_err());
+        assert!(When::parse(&format!("{}a{}", "(".repeat(10), ")".repeat(10))).is_ok());
+        assert!(When::parse(&vec!["a"; 400].join(" && ")).is_err());
         assert!(!t("!(threadOpen && view.diff)"));
         assert!(t("busy || threadOpen && view.diff"));
         assert!(!t("(busy || threadOpen) && remote"));

@@ -162,12 +162,31 @@ pub fn unlisten(data_dir: &Path) {
 }
 
 /// Linux: a desktop entry that makes `blongo` the `blongo://` handler.
-pub fn desktop_entry(exe: &Path) -> String {
-    let exe = exe.display().to_string().replace('"', "\\\"");
-    format!(
-        "[Desktop Entry]\nType=Application\nName=Blongo\nExec=\"{exe}\" %u\n\
+/// `None` for a path a desktop entry cannot hold (control characters).
+pub fn desktop_entry(exe: &Path) -> Option<String> {
+    let exe = exe.display().to_string();
+    if exe.chars().any(char::is_control) {
+        return None;
+    }
+    // Inside a quoted Exec argument `"`, `` ` ``, `$` and `\` take a
+    // backslash and `%` is doubled; then the whole value is escaped as a
+    // desktop-entry string, where a backslash is written `\\`.
+    let mut quoted = String::new();
+    for c in exe.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            c => quoted.push(c),
+        }
+    }
+    let value = quoted.replace('\\', "\\\\");
+    Some(format!(
+        "[Desktop Entry]\nType=Application\nName=Blongo\nExec=\"{value}\" %u\n\
          Terminal=false\nNoDisplay=true\nMimeType=x-scheme-handler/blongo;\n"
-    )
+    ))
 }
 
 /// `blongo register-url-handler`: write the desktop entry and make it the
@@ -186,7 +205,9 @@ pub fn register() -> Result<String, String> {
         .join("applications");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let file = dir.join("blongo-url-handler.desktop");
-    std::fs::write(&file, desktop_entry(&exe)).map_err(|e| e.to_string())?;
+    let entry = desktop_entry(&exe)
+        .ok_or("the program's path has characters a desktop entry cannot hold")?;
+    std::fs::write(&file, entry).map_err(|e| e.to_string())?;
     let status = std::process::Command::new("xdg-mime")
         .args([
             "default",
@@ -259,8 +280,15 @@ mod tests {
 
     #[test]
     fn desktop_entry_names_the_scheme() {
-        let entry = desktop_entry(Path::new("/opt/blongo/blongo"));
+        let entry = desktop_entry(Path::new("/opt/blongo/blongo")).unwrap();
         assert!(entry.contains("Exec=\"/opt/blongo/blongo\" %u"));
         assert!(entry.contains("MimeType=x-scheme-handler/blongo;"));
+        // Exec quoting, then string escaping: `$` → `\$` → `\\$`; `%` → `%%`.
+        let entry = desktop_entry(Path::new("/opt/a\"b$c`d\\e%f/blongo")).unwrap();
+        assert!(
+            entry.contains(r#"Exec="/opt/a\\"b\\$c\\`d\\\\e%%f/blongo" %u"#),
+            "{entry}"
+        );
+        assert!(desktop_entry(Path::new("/opt/x\ny/blongo")).is_none());
     }
 }
