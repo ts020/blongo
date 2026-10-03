@@ -764,3 +764,72 @@ impl Render for Timeline {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blongo_protocol::{RunId, Timestamp};
+
+    fn item(ordinal: u32, kind: ItemKind, text: &str) -> Arc<TurnItem> {
+        Arc::new(TurnItem {
+            id: ItemId::new(),
+            thread_id: ThreadId::new(),
+            run_id: Some(RunId::new()),
+            ordinal,
+            created_at: Timestamp(0),
+            kind,
+            text: text.into(),
+        })
+    }
+
+    fn shape(t: &Timeline) -> Vec<String> {
+        t.rows
+            .iter()
+            .map(|r| match r {
+                Row::Item(e, p) => format!("{e}.{p}"),
+                Row::Footer => "F".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_follow_entries_and_footer() {
+        let snapshot = ThreadSnapshot {
+            thread_id: ThreadId::new(),
+            sequence: 1,
+            runs: vec![],
+            items: vec![
+                item(0, ItemKind::UserMessage, "hi"),
+                item(
+                    1,
+                    ItemKind::AssistantMessage { streaming: false },
+                    "# A\n\npara\n\n```\ncode\n```\n",
+                ),
+            ],
+        };
+        let mut t = Timeline::new(&snapshot, ThreadStatus::Idle, CoreClient::disconnected());
+        assert_eq!(shape(&t), ["0.0", "1.0", "1.1", "1.2"]);
+        // Assistant body is held once, in blocks, not in the item.
+        assert_eq!(&*t.entries[1].item.text, "");
+
+        // A run starts: footer appears after the last entry.
+        t.status = ThreadStatus::Running;
+        t.rebuild_rows(t.entries.len());
+        assert_eq!(shape(&t), ["0.0", "1.0", "1.1", "1.2", "F"]);
+
+        // A new entry is inserted before the footer, never after it.
+        let streaming = item(2, ItemKind::AssistantMessage { streaming: true }, "");
+        t.index.insert(streaming.id, 2);
+        t.entries.push(Entry::new(&streaming));
+        assert_eq!(t.first_row(2), 4);
+        t.entries[2].append("one\n\ntw");
+        t.rebuild_rows(2);
+        assert_eq!(shape(&t), ["0.0", "1.0", "1.1", "1.2", "2.0", "2.1", "F"]);
+
+        // Run ends: footer goes away.
+        t.status = ThreadStatus::Idle;
+        let from = t.entries.len();
+        t.rebuild_rows(from);
+        assert_eq!(shape(&t), ["0.0", "1.0", "1.1", "1.2", "2.0", "2.1"]);
+    }
+}

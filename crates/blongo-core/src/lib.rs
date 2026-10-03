@@ -134,6 +134,14 @@ pub struct CoreClient {
 }
 
 impl CoreClient {
+    /// A client connected to nothing (for view tests).
+    #[doc(hidden)]
+    pub fn disconnected() -> Self {
+        Self {
+            requests: mpsc::unbounded_channel().0,
+        }
+    }
+
     pub fn dispatch(&self, command: CommandEnvelope) {
         let _ = self.requests.send(Request::Dispatch(command));
     }
