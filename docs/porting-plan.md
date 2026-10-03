@@ -154,7 +154,7 @@ v1 は削除済みで、`apps/server/src/orchestration-v2/`（非テスト約7.9
 | プロバイダー | t3code の実装 | 通信方式 | Rust での方針 | 難易度 |
 |---|---|---|---|---|
 | Codex | `CodexAdapterV2.ts` 6.3k | `codex app-server` と stdio JSON-RPC | 上流 `codex-rs/app-server-protocol` を git 依存で使う | 低 |
-| Antigravity | `AntigravityAdapterV2.ts` + 汎用 `AcpAdapterV2.ts` 7.9k、`provider/acp/AntigravityAcpSupport.ts`, `AntigravityProtocol.ts`, `Drivers/AntigravityDriver.ts` | ACP（stdio JSON-RPC）。stdout の補正と session update の正規化が独自に入る。バイナリはリリースから zip をダウンロードして展開、認証は OAuth（`oauth-personal`） | `agent-client-protocol` 2.2.0（Zed が使用中、Apache-2.0）＋ Antigravity 固有の補正層。v2 alpha の `session/fork|resume` 対応状況を要確認 | 中 |
+| Antigravity | `AntigravityAdapterV2.ts` + 汎用 `AcpAdapterV2.ts` 7.9k、`provider/acp/AntigravityAcpSupport.ts`, `AntigravityProtocol.ts`, `Drivers/AntigravityDriver.ts` | ACP（stdio JSON-RPC）。stdout の補正と session update の正規化が独自に入る。バイナリはリリースから zip をダウンロードして展開、認証は OAuth（`oauth-personal`） | serde_json で手書きした ACP 層（Phase 0 で `agent-client-protocol` クレートは不採用と決定。107 クレートと独自ランタイムを持ち込むため）＋ Antigravity 固有の補正層。v2 alpha の `session/fork|resume` 対応状況を要確認 | 中 |
 | （後で検討）ACP 系の Grok / Devin / レジストリ | `AcpAdapterV2.ts` の薄いラッパー | ACP | Antigravity で作った ACP 層を再利用 | 低 |
 | （後で検討）Pi | `PiAdapterV2.ts` 3k | `pi --mode rpc` の行区切り JSON | 自前実装 | 低 |
 | Claude | `ClaudeAdapterV2.ts` 7.7k | JS の `@anthropic-ai/claude-agent-sdk` がプロセス内で `claude` CLI を stream-json で起動 | CLI の stream-json 入出力を直接話す実装。権限プロンプト、セッション再開、履歴読み込みを自前で | 中〜高 |
@@ -253,7 +253,10 @@ blongo (単一バイナリ)
 
 各フェーズは「動くもの」で終わる。期間は書かず、マイルストーンと完了条件で管理する。
 
-### Phase 0: 土台とベースライン
+### Phase 0: 土台とベースライン（2026-10-03 完了、結果は `docs/phase0/results.md`）
+
+> 結果の要点: 同じ負荷で idle PSS は Blongo 143 MiB / zeron 222 MiB / t3code 620 MiB（Linux ソフトウェア Vulkan）。GPUI は上流 `badfb8d` に固定。ACP と Codex の公式クレートは採用せず serde_json で手書き。Antigravity の実バイナリ確認と、実機（macOS）での計測は Phase 1 に持ち越し。
+
 
 - 実測ベースライン: **zeron**（主な比較対象）と t3code の両方について、起動時間、アイドル RSS（全プロセス合計）、長いスレッドのスクロール、ストリーミング中の CPU と RSS、ストリーミング保持量を測る。負荷は zeron の計測負荷に揃える
 - メモリ計測を CI に入れる（zeron の mem-smoke 相当。閾値は §0.5 の目標値）

@@ -148,7 +148,12 @@ impl Transcript {
         cx.notify();
     }
 
-    fn render_row(&mut self, ix: usize, _window: &mut Window, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
         let doc = &self.doc;
         let (kind, text) = match doc.blocks.get(ix) {
             Some(block) => (block.kind, block.text.clone()),
@@ -170,7 +175,9 @@ impl Transcript {
                 .pt_4()
                 .text_base()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(SharedString::from(text.trim_start_matches('#').trim().to_owned())),
+                .child(SharedString::from(
+                    text.trim_start_matches('#').trim().to_owned(),
+                )),
             BlockKind::Code => row.child(
                 div()
                     .p_3()
@@ -182,7 +189,10 @@ impl Transcript {
                     .text_xs()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .children(text.lines().map(|l| div().child(SharedString::from(l.to_owned())))),
+                    .children(
+                        text.lines()
+                            .map(|l| div().child(SharedString::from(l.to_owned()))),
+                    ),
             ),
         }
         .into_any_element()
@@ -265,10 +275,10 @@ fn load_replay(path: &PathBuf) -> anyhow::Result<Vec<String>> {
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let value: serde_json::Value = serde_json::from_str(line)?;
         let event = &value["event"];
-        if event["type"] == "textDelta" {
-            if let Some(text) = event["text"].as_str() {
-                out.push(text.to_owned());
-            }
+        if event["type"] == "textDelta"
+            && let Some(text) = event["text"].as_str()
+        {
+            out.push(text.to_owned());
         }
     }
     Ok(out)
@@ -279,7 +289,10 @@ mod tests {
     use super::*;
 
     fn kinds(doc: &BlockSplitter) -> Vec<(BlockKind, &str)> {
-        doc.blocks.iter().map(|b| (b.kind, b.text.as_ref())).collect()
+        doc.blocks
+            .iter()
+            .map(|b| (b.kind, b.text.as_ref()))
+            .collect()
     }
 
     #[test]

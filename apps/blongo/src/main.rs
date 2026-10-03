@@ -60,7 +60,11 @@ impl Render for Shell {
                     .py_1()
                     .rounded_md()
                     .text_sm()
-                    .text_color(if selected { rgb(0xf2f2f3) } else { rgb(0xb4b4b8) })
+                    .text_color(if selected {
+                        rgb(0xf2f2f3)
+                    } else {
+                        rgb(0xb4b4b8)
+                    })
                     .when(selected, |d| d.bg(rgb(0x26262b)))
                     .hover(|d| d.bg(rgb(0x202024)))
                     .on_click(cx.listener(move |this, _, _, cx| {

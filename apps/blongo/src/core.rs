@@ -34,13 +34,17 @@ pub fn spawn_claude(run: AgentRun) -> mpsc::UnboundedReceiver<AgentEvent> {
                 let mut session = match claude::start(config).await {
                     Ok(session) => session,
                     Err(err) => {
-                        let _ = tx.send(AgentEvent::Error { message: format!("{err:#}") });
+                        let _ = tx.send(AgentEvent::Error {
+                            message: format!("{err:#}"),
+                        });
                         return;
                     }
                 };
                 tokio::time::sleep(run.start_after).await;
                 if let Err(err) = session.prompt(run.prompt) {
-                    let _ = tx.send(AgentEvent::Error { message: format!("{err:#}") });
+                    let _ = tx.send(AgentEvent::Error {
+                        message: format!("{err:#}"),
+                    });
                     return;
                 }
                 while let Some(event) = session.next_event().await {
