@@ -37,9 +37,12 @@ dirs = "6"
 unicode-segmentation = "1"
 
 [profile.release]
-lto = "thin"
+# Fat LTO + one codegen unit: ~6 MB smaller binary and ~4 MiB less resident
+# code than thin LTO (docs/phase1/report.md), at the cost of slower release
+# builds.
+lto = "fat"
 strip = "symbols"
-codegen-units = 16
+codegen-units = 1
 
 [profile.dev]
 opt-level = 0
