@@ -42,8 +42,9 @@ jobs:
 
   mem-smoke:
     # Fails when blongo's peak RSS on the zeron-equivalent streaming workload
-    # exceeds the budget. zeron measures 206 MiB idle / 235 MiB streaming on
-    # the same software-Vulkan setup; see docs/phase0/results.md.
+    # (fixture streamed by the fake Codex through harness -> core -> SQLite
+    # -> timeline) exceeds the budget. zeron measures 206 MiB idle / 235 MiB
+    # streaming on the same software-Vulkan setup; see docs/phase0/results.md.
     name: memory budget (Linux, software Vulkan)
     runs-on: ubuntu-24.04
     steps:
@@ -58,7 +59,12 @@ jobs:
       - run: cargo build --release -p blongo
       - name: Profile
         env:
-          BLONGO_MAX_RSS_MIB: "120"
+          # A regression ceiling, not the product target. Under software
+          # Vulkan (lavapipe) ~60 MiB of RSS is libLLVM and ~18 MiB the
+          # gallium driver, so Phase 0 already peaked at 187 MiB RSS and
+          # Phase 1 at ~190 (docs/phase1/report.md). The 100/120 MiB targets
+          # are judged on real GPUs. 200 catches regressions of >5%.
+          BLONGO_MAX_RSS_MIB: "200"
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2

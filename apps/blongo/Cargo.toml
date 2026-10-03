@@ -11,10 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 blongo-protocol.workspace = true
-blongo-harness.workspace = true
+blongo-core.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-serde_json.workspace = true
+unicode-segmentation.workspace = true
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["x11", "wayland", "font-kit"] }
 mimalloc.workspace = true
