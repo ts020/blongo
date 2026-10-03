@@ -288,3 +288,89 @@ async fn thread_refs_still_used_are_kept() {
         ]
     );
 }
+
+#[tokio::test]
+async fn user_status_settings_cannot_hide_files_from_the_worktree_check() {
+    let repo = Repo::new("wt-config", true).await;
+    git(&repo.0, &["config", "status.showUntrackedFiles", "no"])
+        .await
+        .unwrap();
+    let path = repo.0.with_extension("wt");
+    add_worktree(&repo.0, &path, "blongo/config").await.unwrap();
+    std::fs::write(path.join("notes.txt"), "mine\n").unwrap();
+    // Hidden from a plain status by the user's setting...
+    assert_eq!(
+        git(&path, &["status", "--porcelain", "--ignored"])
+            .await
+            .unwrap(),
+        ""
+    );
+    // ...but not from the check.
+    let err = remove_pristine_worktree(&repo.0, &path).await.unwrap_err();
+    assert!(format!("{err:#}").contains("notes.txt"), "{err:#}");
+    assert!(path.join("notes.txt").exists());
+    // Called with a subfolder (a nested project), it checks and removes
+    // the whole worktree.
+    std::fs::remove_file(path.join("notes.txt")).unwrap();
+    std::fs::create_dir_all(path.join("sub")).unwrap();
+    std::fs::write(path.join("sub/new.txt"), "x").unwrap();
+    assert!(
+        remove_pristine_worktree(&repo.0, &path.join("sub"))
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir_all(path.join("sub")).unwrap();
+    std::fs::create_dir_all(path.join("sub")).unwrap();
+    remove_pristine_worktree(&repo.0, &path.join("sub"))
+        .await
+        .unwrap();
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn ignored_submodule_changes_keep_the_worktree() {
+    let repo = Repo::new("wt-submodule", true).await;
+    let sub = Repo::new("wt-submodule-inner", true).await;
+    let sub_url = sub.0.to_string_lossy().into_owned();
+    git(
+        &repo.0,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &sub_url,
+            "inner",
+        ],
+    )
+    .await
+    .unwrap();
+    git(&repo.0, &["commit", "--quiet", "-m", "submodule"])
+        .await
+        .unwrap();
+    let path = repo.0.with_extension("wt");
+    add_worktree(&repo.0, &path, "blongo/submodule")
+        .await
+        .unwrap();
+    git(
+        &path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--quiet",
+        ],
+    )
+    .await
+    .unwrap();
+    git(&path, &["config", "submodule.inner.ignore", "all"])
+        .await
+        .unwrap();
+    std::fs::write(path.join("inner/a.txt"), "changed in the submodule\n").unwrap();
+    assert!(remove_pristine_worktree(&repo.0, &path).await.is_err());
+    assert!(path.join("inner/a.txt").exists());
+    let _ = std::fs::remove_dir_all(&path);
+}

@@ -372,25 +372,42 @@ pub async fn remove_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove a worktree only when nothing in it would be lost: no
-/// uncommitted change, no untracked file and no ignored file (`git worktree
-/// remove` alone deletes ignored files such as `.env`). Returns why it was
-/// kept otherwise; its branch stays either way.
+/// Remove the worktree containing `path` (a project inside a larger
+/// repository works in a subfolder of it) only when nothing in it would be
+/// lost: no uncommitted change, no untracked file, no ignored file (`git
+/// worktree remove` alone deletes ignored files such as `.env`) and no
+/// modified submodule. The check passes its own flags so no user setting
+/// (`status.showUntrackedFiles=no`, `submodule.*.ignore`) can hide a file.
+/// Returns why it was kept otherwise; its branch stays either way.
+///
+/// The check and the removal are two steps: a process outside Blongo (the
+/// user's shell or editor) that writes into the folder in between can still
+/// lose that write. Blongo itself runs nothing there once the thread is
+/// archived.
 pub async fn remove_pristine_worktree(repo: &Path, path: &Path) -> anyhow::Result<()> {
-    let status = git(path, &["status", "--porcelain", "--ignored"]).await?;
+    let top = work_tree_root(path)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a git work tree", path.display()))?;
+    let status = git(
+        &top,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+    .await?;
     if !status.is_empty() {
         let first = status.lines().next().unwrap_or_default();
+        let n = status.lines().count();
         bail!(
-            "it has uncommitted, untracked or ignored files ({} entr{}, e.g. `{first}`)",
-            status.lines().count(),
-            if status.lines().count() == 1 {
-                "y"
-            } else {
-                "ies"
-            }
+            "it has uncommitted, untracked or ignored files ({n} entr{}, e.g. `{first}`)",
+            if n == 1 { "y" } else { "ies" }
         );
     }
-    git(repo, &["worktree", "remove", &path.to_string_lossy()]).await?;
+    git(repo, &["worktree", "remove", &top.to_string_lossy()]).await?;
     Ok(())
 }
 

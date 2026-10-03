@@ -683,7 +683,11 @@ impl Orchestrator {
         let Some(worktree) = &thread.worktree else {
             return;
         };
-        let top = canonical(&worktree.path);
+        // A nested project works in a subfolder: the worktree is its top.
+        let top = match blongo_git::work_tree_root(Path::new(&worktree.path)).await {
+            Some(top) => canonical(&top.to_string_lossy()),
+            None => canonical(&worktree.path),
+        };
         let users: Vec<&str> = live
             .iter()
             .filter(|t| {
