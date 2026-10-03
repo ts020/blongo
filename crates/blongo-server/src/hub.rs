@@ -59,11 +59,15 @@ pub enum HubMsg {
     ImportT3(Option<String>),
     /// Where a thread works (for server-side terminals).
     Cwd(ThreadId, oneshot::Sender<Option<String>>),
+    /// These devices were revoked: close their connections now.
+    Revoke(Vec<String>),
     Leave(ConnId),
 }
 
 struct Conn {
     outbox: Arc<Outbox>,
+    /// The paired device (`None`: a local transport).
+    device_id: Option<String>,
     shell_ready: bool,
     /// Subscribed threads → snapshot delivered.
     threads: HashMap<ThreadId, bool>,
@@ -87,7 +91,6 @@ pub struct Hub {
     ring_bytes: usize,
     ring_limits: RingLimits,
     conns: HashMap<ConnId, Conn>,
-    shell_requests: u32,
     pending_shell: Vec<ConnId>,
     pending_threads: HashMap<ThreadId, Vec<ConnId>>,
     /// Who sent a command, to route its rejection / duplicate notice.
@@ -111,7 +114,6 @@ impl Hub {
             ring_bytes: 0,
             ring_limits,
             conns: HashMap::new(),
-            shell_requests: 0,
             pending_shell: Vec::new(),
             pending_threads: HashMap::new(),
             commands: HashMap::new(),
@@ -132,7 +134,7 @@ impl Hub {
     pub async fn run(
         mut self,
         mut core_events: mpsc::UnboundedReceiver<CoreEvent>,
-        mut msgs: mpsc::UnboundedReceiver<HubMsg>,
+        mut msgs: mpsc::Receiver<HubMsg>,
     ) {
         loop {
             tokio::select! {
@@ -199,7 +201,6 @@ impl Hub {
     fn request_shell(&mut self, conn: ConnId) {
         if !self.pending_shell.contains(&conn) {
             self.pending_shell.push(conn);
-            self.shell_requests += 1;
             self.core.shell();
         }
     }
@@ -286,13 +287,17 @@ impl Hub {
                         (t.project_id, t.worktree.as_ref().map(|w| w.path.clone())),
                     );
                 }
-                let targets: Vec<ConnId> = if self.shell_requests > 0 {
-                    self.shell_requests -= 1;
-                    std::mem::take(&mut self.pending_shell)
-                } else {
-                    // Unrequested (after an import): everyone's sidebar.
-                    self.conns.keys().copied().collect()
-                };
+                // Every shell snapshot is current: it goes to whoever waits
+                // for one and to everyone who holds a sidebar (an
+                // unrequested one follows an import). No request counting,
+                // so a snapshot that failed in the core cannot shift which
+                // connection gets which.
+                let mut targets = std::mem::take(&mut self.pending_shell);
+                for (id, conn) in &self.conns {
+                    if conn.shell_ready && !targets.contains(id) {
+                        targets.push(*id);
+                    }
+                }
                 let seq = self.seq;
                 for id in targets {
                     if let Some(conn) = self.conns.get_mut(&id) {
@@ -386,7 +391,8 @@ impl Hub {
     // ------------------------------------------------------ connection side
 
     fn can_resume(&self, resume: &Resume) -> bool {
-        if resume.epoch != self.epoch || resume.last_seq > self.seq {
+        // last_seq 0: the client never got this epoch's shell snapshot.
+        if resume.epoch != self.epoch || resume.last_seq == 0 || resume.last_seq > self.seq {
             return false;
         }
         if resume.last_seq == self.seq {
@@ -407,6 +413,7 @@ impl Hub {
                 issued,
             } => {
                 let resumed = resume.as_ref().is_some_and(|r| self.can_resume(r));
+                let device_id_for_conn = device_id.clone();
                 outbox.push(ServerMsg::Welcome(Welcome {
                     device_id,
                     issued,
@@ -414,6 +421,7 @@ impl Hub {
                 }));
                 let mut entry = Conn {
                     outbox,
+                    device_id: device_id_for_conn,
                     shell_ready: false,
                     threads: HashMap::new(),
                     overflows: VecDeque::new(),
@@ -519,6 +527,24 @@ impl Hub {
                     .get(&thread_id)
                     .and_then(|(p, wt)| wt.clone().or_else(|| self.project_paths.get(p).cloned()));
                 let _ = reply.send(cwd);
+            }
+            HubMsg::Revoke(devices) => {
+                let gone: Vec<ConnId> = self
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| c.device_id.as_ref().is_some_and(|d| devices.contains(d)))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in gone {
+                    if let Some(c) = self.conns.get(&id) {
+                        eprintln!("blongo-serve: connection {id}: device revoked; closing it");
+                        // Sent before the close takes effect (the writer
+                        // drains what is queued); its terminals end with it.
+                        c.outbox.push(ServerMsg::DeviceRevoked);
+                        c.outbox.close();
+                    }
+                    self.on_msg(HubMsg::Leave(id));
+                }
             }
             HubMsg::Leave(conn) => {
                 if let Some(c) = self.conns.remove(&conn) {

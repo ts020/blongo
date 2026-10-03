@@ -26,7 +26,7 @@ pub const MAX_TERMINALS: usize = 4;
 const CHUNK: usize = 32 * 1024;
 
 struct Terminal {
-    writer: mpsc::Sender<Vec<u8>>,
+    writer: mpsc::SyncSender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
     closed: Arc<AtomicBool>,
@@ -85,7 +85,9 @@ impl Terminals {
         }
         let mut reader = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(dup) });
         let mut pty_writer = pty.master.take_writer()?;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // Bounded: a shell that stops reading its input cannot make the
+        // server buffer a client's keystrokes without limit.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(crate::conn::TERMINAL_INPUT_QUEUE);
         std::thread::Builder::new()
             .name("blongo-serve-pty-w".into())
             .spawn(move || {
@@ -138,9 +140,11 @@ impl Terminals {
         Ok(())
     }
 
+    /// Queue input for the shell. When the shell has not read the last
+    /// [`crate::conn::TERMINAL_INPUT_QUEUE`] chunks, this one is dropped.
     pub fn input(&mut self, id: u32, data: Vec<u8>) {
         if let Some(t) = self.open.get(&id) {
-            let _ = t.writer.send(data);
+            let _ = t.writer.try_send(data);
         }
     }
 

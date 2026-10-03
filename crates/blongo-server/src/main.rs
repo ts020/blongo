@@ -163,6 +163,7 @@ async fn serve(args: Args, core: CoreConfig, state_dir: PathBuf) -> i32 {
         };
     }
     let port = args.port.unwrap_or(blongo_client::target::DEFAULT_PORT);
+    config.tailscale_listen = args.tailscale;
     config.listen = Some(if args.tailscale {
         match blongo_server::tailscale_ip() {
             Ok(ip) => SocketAddr::new(ip, port),
@@ -244,8 +245,9 @@ fn pair(state_dir: &std::path::Path, ttl: u64) -> i32 {
         Ok(code) => {
             println!("{code}");
             eprintln!(
-                "blongo-serve: single-use pairing code, valid {} min. On the client: \
-                 blongo env add NAME ws://HOST:PORT {code}",
+                "blongo-serve: single-use pairing code, valid {} min. On the client run \
+                 `blongo env add NAME ws://HOST:PORT` and enter it (or use + Environment). \
+                 Whoever holds it can pair a device with full access to this server.",
                 ttl / 60
             );
             0
@@ -276,17 +278,34 @@ fn devices(state_dir: &std::path::Path) -> i32 {
 }
 
 fn revoke(state_dir: &std::path::Path, who: &str) -> i32 {
-    match AuthStore::open(state_dir)
-        .map_err(|e| e.to_string())
-        .and_then(|a| a.revoke(who).map_err(|e| e.to_string()))
-    {
-        Ok(0) => {
+    // A running server revokes and closes the device's live connections;
+    // without one, editing the device list is enough.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let result = match rt.block_on(blongo_server::revoke_via_socket(state_dir, who)) {
+        Ok(Some(n)) => Ok((n, true)),
+        Ok(None) => AuthStore::open(state_dir)
+            .map_err(|e| e.to_string())
+            .and_then(|a| a.revoke(who).map_err(|e| e.to_string()))
+            .map(|ids| (ids.len(), false)),
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok((0, _)) => {
             eprintln!("blongo-serve: no device {who:?}");
             1
         }
-        Ok(n) => {
+        Ok((n, live)) => {
             eprintln!(
-                "blongo-serve: revoked {n} device(s); new connections with their tokens fail"
+                "blongo-serve: revoked {n} device(s); {}",
+                if live {
+                    "their open connections were closed"
+                } else {
+                    "no server is running (a server started with --no-socket must be \
+                     restarted to drop open connections)"
+                }
             );
             0
         }

@@ -156,7 +156,6 @@ async fn bad_credentials_replayed_proofs_and_expired_codes_are_refused() {
     let key = blongo_client::secret::device_key_from_b64(&cred.device_key).unwrap();
     let captured = AuthRequest::Token {
         device_id: cred.device_id.clone(),
-        token: cred.token.clone(),
         proof: blongo_client::secret::make_proof(
             &key,
             blongo_protocol::wire::ProofPurpose::Token,
@@ -655,7 +654,17 @@ async fn ssh_tunnel_and_ssh_stdio_with_a_fake_ssh() {
 
     let log = std::fs::read_to_string(&log).unwrap();
     assert!(log.contains("\"-L\""), "{log}");
-    assert!(log.contains(&format!("127.0.0.1:{port}")), "{log}");
+    assert!(log.contains(&format!("t.sock:127.0.0.1:{port}")), "{log}");
+    assert!(log.contains("StreamLocalBindMask=0177"), "{log}");
+    // The destination always follows `--`.
+    for line in log.lines() {
+        let args: Vec<String> = serde_json::from_str(line).unwrap();
+        let at = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- before the host");
+        assert!(!args[at + 1].starts_with('-'), "{line}");
+    }
     assert!(log.contains("BatchMode=yes"), "{log}");
     assert!(log.contains("--stdio"), "{log}");
     server.stop();
@@ -829,4 +838,248 @@ fn tailscale_listen_uses_the_tailnet_address_and_refuses_others() {
     let out = run(&fake("192.168.1.10"), &["--listen", "0.0.0.0:0"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("refusing to listen"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_device_ends_its_live_connection_and_terminals() {
+    let dir = temp_dir("revoke");
+    let server = start(&dir);
+    let env = pair(&dir, &ws_target(server.addr.unwrap())).await;
+    let device_id = env.credential.as_ref().unwrap().device_id.clone();
+    let (backend, mut rx) = connect_on(&rt(), env.clone(), fast_options());
+    wait_connected(&mut rx).await;
+    let thread_id = project_and_thread(&backend, &mut rx, &dir).await;
+    // A shell on the server; learn its PID.
+    backend.terminal_open(1, thread_id, 80, 24);
+    backend.terminal_input(1, b"echo pid=$$=\r".to_vec());
+    let mut out = Vec::new();
+    let pid: i32 = wait_for(&mut rx, |e| match e {
+        CoreEvent::Terminal(blongo_protocol::client::TerminalEvent::Output { id: 1, data }) => {
+            out.extend_from_slice(data);
+            let text = String::from_utf8_lossy(&out);
+            let at = text.rfind("pid=")?;
+            let rest = &text[at + 4..];
+            let end = rest.find('=')?;
+            rest[..end].parse().ok()
+        }
+        _ => None,
+    })
+    .await;
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+    // Revoke from the command line while the device is connected: the
+    // CLI reaches the running server over its socket.
+    let state_dir = dir.join("data/server");
+    let cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_blongo-serve"))
+        .arg("revoke")
+        .arg(&device_id)
+        .arg("--data-dir")
+        .arg(dir.join("data"))
+        .output()
+        .await
+        .unwrap();
+    let said = String::from_utf8_lossy(&cli.stderr);
+    assert!(cli.status.success(), "{said}");
+    assert!(said.contains("open connections were closed"), "{said}");
+
+    // The client is told and stops for good (no reconnect loop).
+    let message = wait_for(&mut rx, |e| match e {
+        CoreEvent::Connection(ConnectionState::Failed(m)) => Some(m.clone()),
+        CoreEvent::Connection(ConnectionState::Reconnecting { error, .. }) => {
+            panic!("retried after revocation: {error}")
+        }
+        _ => None,
+    })
+    .await;
+    assert!(message.contains("revoked"), "{message}");
+    // Its server-side shell is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shell {pid} still running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // And the credential no longer authenticates.
+    let (_again, mut rx2) = connect_on(&rt(), env, fast_options());
+    wait_for(&mut rx2, |e| match e {
+        CoreEvent::Connection(ConnectionState::Failed(m)) => {
+            assert!(m.contains("Unauthorized"), "{m}");
+            Some(())
+        }
+        CoreEvent::Connection(ConnectionState::Connected { .. }) => panic!("connected"),
+        _ => None,
+    })
+    .await;
+    // An unknown device revokes nothing.
+    assert_eq!(
+        blongo_server::revoke_via_socket(&state_dir, "nobody").await,
+        Ok(Some(0))
+    );
+    drop(backend);
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_needs_the_local_socket() {
+    let dir = temp_dir("revoke-net");
+    let server = start(&dir);
+    let env = pair(&dir, &ws_target(server.addr.unwrap())).await;
+    let parsed = Target::parse(&ws_target(server.addr.unwrap())).unwrap();
+    let mut link = open(&parsed).await.unwrap();
+    handshake(
+        &mut link.reader,
+        &mut link.writer,
+        Hello::new("t", None),
+        ClientAuth::Credential(env.credential.as_ref().unwrap()),
+    )
+    .await
+    .unwrap();
+    send_msg(
+        &mut link.writer,
+        &ClientMsg::Revoke {
+            device: env.credential.as_ref().unwrap().device_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let answer = loop {
+        let msgs = recv(&mut link.reader).await.unwrap();
+        if let Some(r) = msgs.into_iter().find_map(|m| match m {
+            ServerMsg::Revoked(r) => Some(r),
+            _ => None,
+        }) {
+            break r;
+        }
+    };
+    assert!(answer.unwrap_err().contains("local socket"));
+    server.stop();
+}
+
+/// Read an HTTP response's status line from a raw upgrade request.
+async fn upgrade_status(addr: std::net::SocketAddr, extra_headers: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra_headers}\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_origins_are_refused_and_unauthenticated_connections_are_capped() {
+    let dir = temp_dir("origin");
+    let server = start(&dir);
+    let addr = server.addr.unwrap();
+    assert!(upgrade_status(addr, "").await.contains("101"));
+    let status = upgrade_status(addr, "Origin: https://example.invalid\r\n").await;
+    assert!(status.contains("403"), "{status}");
+
+    // Four idle unauthenticated connections from one address fill its
+    // share; a fifth is closed at once.
+    let mut idle = Vec::new();
+    for _ in 0..4 {
+        idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    use tokio::io::AsyncReadExt;
+    let mut fifth = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut b = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), fifth.read(&mut b))
+        .await
+        .expect("the fifth connection was not closed");
+    assert!(matches!(n, Ok(0) | Err(_)));
+    // Once they go, new ones are accepted again.
+    drop(idle);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(upgrade_status(addr, "").await.contains("101"));
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_connections_are_closed() {
+    let dir = temp_dir("idle");
+    let mut cfg = config(&dir);
+    cfg.limits.idle_timeout = Duration::from_millis(400);
+    let server = blongo_server::start(cfg).unwrap();
+    let env = pair(&dir, &ws_target(server.addr.unwrap())).await;
+    let parsed = Target::parse(&ws_target(server.addr.unwrap())).unwrap();
+    let mut link = open(&parsed).await.unwrap();
+    handshake(
+        &mut link.reader,
+        &mut link.writer,
+        Hello::new("t", None),
+        ClientAuth::Credential(env.credential.as_ref().unwrap()),
+    )
+    .await
+    .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if recv(&mut link.reader).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "a silent connection stayed open");
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_lost_before_the_shell_starts_fresh() {
+    let dir = temp_dir("noshell");
+    let server = start(&dir);
+    let env = pair(&dir, &ws_target(server.addr.unwrap())).await;
+    let parsed = Target::parse(&ws_target(server.addr.unwrap())).unwrap();
+    // Welcome, then the link drops before the shell snapshot was read.
+    let mut link = open(&parsed).await.unwrap();
+    let session = handshake(
+        &mut link.reader,
+        &mut link.writer,
+        Hello::new("t", None),
+        ClientAuth::Credential(env.credential.as_ref().unwrap()),
+    )
+    .await
+    .unwrap();
+    let epoch = session.challenge.epoch;
+    drop(link);
+    // A client that would resume at seq 0 of that epoch is refused the
+    // resume and sent the shell.
+    let mut link = open(&parsed).await.unwrap();
+    let session = handshake(
+        &mut link.reader,
+        &mut link.writer,
+        Hello::new(
+            "t",
+            Some(Resume {
+                epoch,
+                last_seq: 0,
+                threads: vec![],
+            }),
+        ),
+        ClientAuth::Credential(env.credential.as_ref().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(!session.welcome.resumed);
+    let mut msgs = session.rest;
+    while !msgs
+        .iter()
+        .any(|m| matches!(m, ServerMsg::Seq(s) if matches!(s.payload, Payload::Shell(_))))
+    {
+        msgs = recv(&mut link.reader).await.unwrap();
+    }
+    server.stop();
 }

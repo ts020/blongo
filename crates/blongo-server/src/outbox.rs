@@ -5,8 +5,11 @@
 //! they wait (a slow reader gets fewer, larger deltas). When state messages
 //! would push the queue past its bound, the state backlog is dropped
 //! instead ([`Push::Overflow`]): the hub then tells the client to expect
-//! fresh snapshots. Control and terminal messages are never dropped;
-//! terminal readers wait for room instead ([`Outbox::wait_room`]).
+//! fresh snapshots. Only a state push can overflow (so only the hub, which
+//! answers with `Resnapshot`, ever sees state dropped), and only state
+//! counts against the state bound. Control and terminal messages are never
+//! dropped: terminal readers wait for room ([`Outbox::wait_room`]) and a
+//! newer `Pong` replaces a queued one.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -32,6 +35,9 @@ pub enum Push {
 struct State {
     queue: VecDeque<(ServerMsg, usize)>,
     bytes: usize,
+    /// Bytes and count of queued state (`Seq`) messages.
+    state_bytes: usize,
+    state_msgs: usize,
     /// Bytes of queued snapshots: they replace the client's state, so they
     /// do not count against the bound (a thread larger than the bound
     /// could otherwise never be sent).
@@ -73,6 +79,8 @@ impl Outbox {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 bytes: 0,
+                state_bytes: 0,
+                state_msgs: 0,
                 snapshot_bytes: 0,
                 peak_bytes: 0,
             }),
@@ -124,13 +132,27 @@ impl Outbox {
     }
 
     /// Queue a message. State messages (`Seq`) may overflow the bound;
-    /// everything else is always queued.
+    /// everything else is always queued and never causes state to drop.
     pub fn push(&self, msg: ServerMsg) -> Push {
         if self.is_closed() {
             return Push::Closed;
         }
         let mut st = self.state.lock().expect("outbox");
         let size = size_of(&msg);
+        let is_state = matches!(msg, ServerMsg::Seq(_));
+        // A newer pong replaces a waiting one (a client pinging a stalled
+        // writer cannot grow the queue).
+        if let ServerMsg::Pong { at } = &msg
+            && let Some((ServerMsg::Pong { at: queued }, _)) = st
+                .queue
+                .iter_mut()
+                .find(|(m, _)| matches!(m, ServerMsg::Pong { .. }))
+        {
+            *queued = *at;
+            drop(st);
+            self.wake.notify_one();
+            return Push::Queued;
+        }
         // Merge a text delta into a waiting delta of the same item.
         if let ServerMsg::Seq(Sequenced {
             seq,
@@ -157,23 +179,31 @@ impl Outbox {
             *last_seq = *seq;
             *last_size += chunk.len();
             st.bytes += chunk.len();
+            st.state_bytes += chunk.len();
         } else {
             if is_snapshot(&msg) {
                 st.snapshot_bytes += size;
+            } else if is_state {
+                st.state_bytes += size;
+            }
+            if is_state {
+                st.state_msgs += 1;
             }
             st.queue.push_back((msg, size));
             st.bytes += size;
         }
-        let overflow = st.bytes - st.snapshot_bytes > self.limits.max_bytes
-            || st.queue.len() > self.limits.max_msgs;
+        let overflow = is_state
+            && (st.state_bytes > self.limits.max_bytes || st.state_msgs > self.limits.max_msgs);
         if overflow {
             // Keep control and terminal messages; drop the state backlog
             // (snapshots included: fresh ones follow).
             st.queue.retain(|(m, _)| !matches!(m, ServerMsg::Seq(_)));
             st.bytes = st.queue.iter().map(|(_, s)| s).sum();
             st.snapshot_bytes = 0;
+            st.state_bytes = 0;
+            st.state_msgs = 0;
         }
-        st.peak_bytes = st.peak_bytes.max(st.bytes - st.snapshot_bytes);
+        st.peak_bytes = st.peak_bytes.max(st.state_bytes);
         drop(st);
         self.wake.notify_one();
         if overflow {
@@ -222,6 +252,8 @@ impl Outbox {
                     let mut out = Vec::new();
                     let mut taken = 0;
                     let mut snapshots = 0;
+                    let mut state = 0;
+                    let mut state_msgs = 0;
                     while let Some((_, size)) = st.queue.front() {
                         if !out.is_empty() && taken + size > max_bytes {
                             break;
@@ -230,11 +262,18 @@ impl Outbox {
                         taken += size;
                         if is_snapshot(&msg) {
                             snapshots += size;
+                        } else if matches!(msg, ServerMsg::Seq(_)) {
+                            state += size;
+                        }
+                        if matches!(msg, ServerMsg::Seq(_)) {
+                            state_msgs += 1;
                         }
                         out.push(msg);
                     }
                     st.bytes -= taken;
                     st.snapshot_bytes -= snapshots;
+                    st.state_bytes -= state;
+                    st.state_msgs -= state_msgs;
                     if st.queue.is_empty() && st.queue.capacity() > 256 {
                         st.queue.shrink_to(64);
                     }
@@ -317,6 +356,78 @@ mod tests {
         let msgs = out.drain(1 << 20).await.unwrap();
         assert_eq!(msgs, vec![ServerMsg::Pong { at: 1 }]);
         assert!(out.peak_bytes() <= 2000 + 300);
+    }
+
+    #[tokio::test]
+    async fn control_and_terminal_pushes_never_drop_state() {
+        let out = Outbox::new(OutboxLimits {
+            max_bytes: 8000,
+            max_msgs: 20,
+        });
+        // State close to its bound, interleaved with lots of terminal
+        // output, pongs and other control messages.
+        for i in 0..15u64 {
+            assert_eq!(
+                out.push(delta(i, ItemId::new(), &"s".repeat(50))),
+                Push::Queued
+            );
+            for _ in 0..10 {
+                assert_eq!(
+                    out.push(ServerMsg::TerminalOutput {
+                        id: 1,
+                        data: vec![b't'; 400],
+                    }),
+                    Push::Queued
+                );
+            }
+            assert_eq!(out.push(ServerMsg::Pong { at: i }), Push::Queued);
+            assert_eq!(
+                out.push(ServerMsg::TerminalFailed {
+                    id: 2,
+                    message: "x".into(),
+                }),
+                Push::Queued
+            );
+        }
+        let msgs = out.drain(usize::MAX).await.unwrap();
+        let seqs: Vec<u64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Seq(s) => Some(s.seq),
+                _ => None,
+            })
+            .collect();
+        // Every state message survived, in order.
+        assert_eq!(seqs, (0..15).collect::<Vec<_>>());
+        // Pongs coalesced into one carrying the newest time.
+        let pongs: Vec<u64> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Pong { at } => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pongs, vec![14]);
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, ServerMsg::TerminalOutput { .. }))
+                .count(),
+            150
+        );
+        // A state push past the bound still overflows (and only state goes).
+        out.push(ServerMsg::TerminalExited { id: 1 });
+        let mut overflowed = false;
+        for i in 100..200u64 {
+            if out.push(delta(i, ItemId::new(), &"s".repeat(200))) == Push::Overflow {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(overflowed);
+        assert_eq!(
+            out.drain(usize::MAX).await.unwrap(),
+            vec![ServerMsg::TerminalExited { id: 1 }]
+        );
     }
 
     #[tokio::test]
