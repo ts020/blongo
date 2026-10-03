@@ -269,7 +269,9 @@ blongo (単一バイナリ)
 
 完了条件: ベースラインの数値表、空の GPUI アプリがビルドできる CI、4つのスパイクの結論。
 
-### Phase 1: 縦に一本通す（コア＋UI、Codex のみ）
+### Phase 1: 縦に一本通す（コア＋UI、Codex のみ）（2026-10-03 完了、結果は `docs/phase1/report.md`）
+
+> 結果の要点: Node・Electron なしで、Codex スレッドの作成・ストリーミング・承認・中断・再起動後の SQLite 復元まで通った（フェイク Codex での GUI e2e）。idle PSS 151 / stream 166 MiB（Phase 0: 143 / 164）、idle CPU 0.3%。実 Codex でのターンと実機（macOS）計測は未確認。
 
 Node なし・Electron なしで、1プロバイダーのスレッドが最後まで動く最小構成を作る。
 
