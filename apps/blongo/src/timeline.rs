@@ -668,7 +668,13 @@ impl Timeline {
                 .justify_center()
                 .text_xs()
                 .text_color(theme::text_muted())
-                .child(SharedString::from(message.clone()))
+                // Long notices (a rollback's ref and command) wrap.
+                .child(
+                    div()
+                        .max_w(px(760.))
+                        .text_center()
+                        .child(SharedString::from(message.clone())),
+                )
                 .into_any_element(),
             (ItemKind::Error { message }, _) => div()
                 .my_1()

@@ -770,31 +770,37 @@ impl Shell {
             div()
                 .id("rollback-confirm")
                 .flex()
-                .items_center()
+                .flex_col()
                 .gap_2()
                 .px_3()
                 .py_2()
                 .rounded_md()
                 .bg(theme::warning_bg())
                 .text_xs()
-                .child(div().flex_1().text_color(theme::text()).child(text))
-                .child(button(
-                    "rollback-cancel".into(),
-                    "Cancel",
-                    theme::surface_hover(),
-                    theme::text(),
-                    cx.listener(|this, _, _, cx| {
-                        this.confirm_rollback = None;
-                        cx.notify();
-                    }),
-                ))
-                .child(button(
-                    "rollback-confirm-button".into(),
-                    "Undo",
-                    theme::danger_bg(),
-                    theme::danger(),
-                    cx.listener(|this, _, _, cx| this.confirm_rollback(cx)),
-                )),
+                .child(div().w_full().text_color(theme::text()).child(text))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(button(
+                            "rollback-cancel".into(),
+                            "Cancel",
+                            theme::surface_hover(),
+                            theme::text(),
+                            cx.listener(|this, _, _, cx| {
+                                this.confirm_rollback = None;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(button(
+                            "rollback-confirm-button".into(),
+                            "Undo",
+                            theme::danger_bg(),
+                            theme::danger(),
+                            cx.listener(|this, _, _, cx| this.confirm_rollback(cx)),
+                        )),
+                ),
         )
     }
 
