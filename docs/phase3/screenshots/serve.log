@@ -1,19 +1,19 @@
-blongo-serve: listening on ws://127.0.0.1:42327/ws
+blongo-serve: listening on ws://127.0.0.1:40909/ws
 blongo-serve: pairing code (valid 10 min, single use): XXXXX-XXXXX (redacted)
-blongo-serve: paired device "vm" (01a10217-bf18-72ca-b05e-1976a3ecf3ca)
-blongo-serve: connection 1: device "vm" (01a10217-bf18-72ca-b05e-1976a3ecf3ca)
+blongo-serve: paired device "vm" (01a10256-08df-74c1-a061-331894803627)
+blongo-serve: connection 1: device "vm" (01a10256-08df-74c1-a061-331894803627)
 blongo-serve: connection 1 closed
-blongo-serve: connection 2: device "vm" (01a10217-bf18-72ca-b05e-1976a3ecf3ca)
-blongo: run 01a10217-d50b-749e-bfb0-c195d5059086 finished (Completed)
-blongo: run 01a10217-e62c-7360-93a8-28539c949100 finished (Interrupted)
+blongo-serve: connection 2: device "vm" (01a10256-08df-74c1-a061-331894803627)
+blongo: run 01a10256-1eec-76fc-b298-cd90163fc867 finished (Completed)
+blongo: run 01a10256-3009-7455-a2bf-9b5e17461810 finished (Interrupted)
 blongo-serve: connection 2 closed
-blongo: run 01a10217-f623-7301-bd39-e2118526032a finished (Completed)
-blongo-serve: connection 3: device "vm" (01a10217-bf18-72ca-b05e-1976a3ecf3ca)
-blongo-serve: connection 3: resumed after seq 166, replaying 22
+blongo: run 01a10256-4014-73bd-9b3a-03a0af31dabd finished (Completed)
+blongo-serve: connection 3: device "vm" (01a10256-08df-74c1-a061-331894803627)
+blongo-serve: connection 3: resumed after seq 165, replaying 22
 blongo-serve: connection 3 closed
 blongo-serve: stopped (1 connections, 0 resnapshots, 22 replayed, 0 refused)
-blongo-serve: listening on ws://127.0.0.1:42327/ws
-blongo-serve: connection 1: device "vm" (01a10217-bf18-72ca-b05e-1976a3ecf3ca)
+blongo-serve: listening on ws://127.0.0.1:40909/ws
+blongo-serve: connection 1: device "vm" (01a10256-08df-74c1-a061-331894803627)
 blongo-serve: connection 1: cannot resume (other epoch or too old); sending snapshots
-blongo: run 01a10218-42da-7553-a6c2-b788e97ffbf3 finished (Completed)
+blongo: run 01a10256-8c93-743d-99ff-707cadc63fd4 finished (Completed)
 blongo-serve: connection 1 closed

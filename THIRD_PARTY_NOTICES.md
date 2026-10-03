@@ -105,7 +105,28 @@ Linked, not copied: tokio-tungstenite and tungstenite (MIT), futures-util
 (MIT OR Apache-2.0), rmp-serde (MIT), serde_bytes (MIT OR Apache-2.0),
 ed25519-dalek and curve25519-dalek (BSD-3-Clause), subtle (BSD-3-Clause),
 sha2 (MIT OR Apache-2.0), getrandom (MIT OR Apache-2.0), base64
-(MIT OR Apache-2.0) and libc (MIT OR Apache-2.0). Binary distributions must
+(MIT OR Apache-2.0) and libc (MIT OR Apache-2.0).
+
+Crates these pull in that Blongo did not use before Phase 3 (from
+`Cargo.lock`; licenses as declared by each crate):
+
+| Crate | License |
+|---|---|
+| base64ct, const-oid, der, pkcs8, spki | Apache-2.0 OR MIT |
+| curve25519-dalek, ed25519-dalek | BSD-3-Clause |
+| curve25519-dalek-derive | MIT OR Apache-2.0 |
+| data-encoding | MIT |
+| ed25519, signature | Apache-2.0 OR MIT |
+| fiat-crypto | MIT OR Apache-2.0 OR BSD-1-Clause |
+| httparse | MIT OR Apache-2.0 |
+| rmp, rmp-serde | MIT |
+| sha1 | MIT OR Apache-2.0 |
+| socket2 | MIT OR Apache-2.0 |
+| tokio-tungstenite | MIT |
+| tungstenite | MIT OR Apache-2.0 |
+| utf-8 | MIT OR Apache-2.0 |
+
+Binary distributions must
 carry each linked crate's license text; this repository does not yet
 generate that bundle (for example with `cargo about`), see
 `docs/phase3/report.md`.
