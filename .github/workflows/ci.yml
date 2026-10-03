@@ -68,9 +68,11 @@ jobs:
           # A regression ceiling, not the product target. Under software
           # Vulkan (lavapipe) ~60 MiB of RSS is libLLVM and ~18 MiB the
           # gallium driver, so Phase 0 already peaked at 187 MiB RSS and
-          # Phase 1 at ~190 (docs/phase1/report.md). The 100/120 MiB targets
-          # are judged on real GPUs. 200 catches regressions of >5%.
-          BLONGO_MAX_RSS_MIB: "200"
+          # Phase 1 at ~190 (docs/phase1/report.md). After Phase 4 the
+          # streaming peak is ~200 MiB RSS locally and 197-202 on the runner
+          # (docs/final/report.md), so 210 keeps ~5% headroom over it. The
+          # 100/120 MiB targets are judged on real GPUs.
+          BLONGO_MAX_RSS_MIB: "210"
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
