@@ -70,6 +70,11 @@ fn size_of(msg: &ServerMsg) -> usize {
         ServerMsg::Seq(s) => s.payload.approx_size(),
         ServerMsg::TerminalOutput { data, .. } => 32 + data.len(),
         ServerMsg::Models { models, .. } => 64 + 64 * models.len(),
+        // Query answers can be megabytes (diffs): their real size, so the
+        // writer sends a big one in a frame of its own.
+        ServerMsg::Reply { .. } => {
+            blongo_protocol::wire::encode(msg, usize::MAX).map_or(128, |b| b.len())
+        }
         _ => 128,
     }
 }

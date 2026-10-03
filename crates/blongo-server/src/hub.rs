@@ -23,6 +23,7 @@ use blongo_core::{CoreClient, CoreEvent};
 use blongo_protocol::wire::{
     IssuedCredential, Payload, Resume, Sequenced, ServerMsg, Welcome, WireEvent, WireThread,
 };
+use blongo_protocol::workspace::{QueryId, QueryReply};
 use blongo_protocol::{CommandId, EventKind, ModelInfo, ProjectId, ProviderKind, ThreadId};
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,6 +34,26 @@ pub type ConnId = u64;
 
 /// A connection that overflows more often than this within
 /// [`OVERFLOW_WINDOW`] is dropped (it can never catch up).
+/// Largest encoded query answer sent (half a server frame: the rest is
+/// room for messages drained into the same frame).
+pub(crate) const MAX_REPLY_BYTES: usize = blongo_protocol::wire::MAX_SERVER_FRAME / 2;
+
+/// A query answer for the wire. One that would not fit in a frame (with
+/// room for what shares it) becomes an error, so the client is never left
+/// waiting for a reply the writer would drop.
+fn reply_msg(id: QueryId, result: Result<QueryReply, String>) -> ServerMsg {
+    let msg = ServerMsg::Reply { id, result };
+    match blongo_protocol::wire::encode(&msg, MAX_REPLY_BYTES) {
+        Ok(_) => msg,
+        Err(e) => ServerMsg::Reply {
+            id,
+            result: Err(format!(
+                "the answer is too large to send over the connection ({e}); ask for less \
+                 (fewer lines or files)"
+            )),
+        },
+    }
+}
 const MAX_OVERFLOWS: usize = 5;
 const OVERFLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_ROUTED_COMMANDS: usize = 4096;
@@ -407,13 +428,7 @@ impl Hub {
             }
             CoreEvent::Reply { id, result } => {
                 if let Some((conn, client_id)) = self.queries.remove(&id) {
-                    self.push(
-                        conn,
-                        ServerMsg::Reply {
-                            id: client_id,
-                            result,
-                        },
-                    );
+                    self.push(conn, reply_msg(client_id, result));
                 }
             }
             CoreEvent::Connection(_) | CoreEvent::Terminal(_) => {}
@@ -624,6 +639,38 @@ impl Hub {
                     .connections
                     .store(self.conns.len(), Ordering::Relaxed);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blongo_protocol::workspace::FileContent;
+
+    #[test]
+    fn answers_too_large_for_a_frame_become_errors() {
+        let file = |len: usize| {
+            Ok(QueryReply::File(FileContent {
+                path: "big".into(),
+                text: "x".repeat(len),
+                truncated: false,
+                binary: false,
+            }))
+        };
+        assert!(matches!(
+            reply_msg(1, file(1 << 20)),
+            ServerMsg::Reply {
+                id: 1,
+                result: Ok(_)
+            }
+        ));
+        match reply_msg(2, file(MAX_REPLY_BYTES + 1)) {
+            ServerMsg::Reply {
+                id: 2,
+                result: Err(e),
+            } => assert!(e.contains("too large"), "{e}"),
+            other => panic!("{other:?}"),
         }
     }
 }

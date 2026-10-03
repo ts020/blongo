@@ -406,8 +406,25 @@ pub async fn read_file(cwd: &Path, path: &str, max_bytes: u32) -> anyhow::Result
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || -> anyhow::Result<FileContent> {
         use std::io::Read;
-        let file = std::fs::File::open(&full)?;
-        let len = file.metadata()?.len();
+        // Only regular files: a FIFO or device would block the read (or
+        // never end). Opened non-blocking so even a FIFO swapped in after
+        // the check cannot hang the open.
+        if !std::fs::metadata(&full)?.is_file() {
+            anyhow::bail!("{path} is not a regular file");
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(&full)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            anyhow::bail!("{path} is not a regular file");
+        }
+        let len = meta.len();
         let mut buf = Vec::new();
         file.take(max).read_to_end(&mut buf)?;
         let binary = buf.iter().take(8000).any(|b| *b == 0);
@@ -629,6 +646,24 @@ mod tests {
         {
             std::os::unix::fs::symlink("/etc", dir.join("out")).unwrap();
             assert!(read_file(&dir, "out/hostname", 100).await.is_err());
+            // A FIFO is refused at once instead of blocking the read.
+            let fifo = dir.join("pipe");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_file(&dir, "pipe", 100),
+            )
+            .await
+            .expect("reading a FIFO hung");
+            assert!(read.unwrap_err().to_string().contains("not a regular file"));
+            // Folders too.
+            assert!(read_file(&dir, "src", 100).await.is_err());
         }
         let content = read_file(&dir, "keep.txt", 3).await.unwrap();
         assert!(content.truncated);

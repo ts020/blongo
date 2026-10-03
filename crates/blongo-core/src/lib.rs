@@ -128,7 +128,7 @@ impl CoreConfig {
         config.codex_executable = exe("BLONGO_CODEX_EXE");
         config.claude_executable = exe("BLONGO_CLAUDE_EXE");
         config.antigravity_executable = exe("BLONGO_ANTIGRAVITY_EXE");
-        config.acp_executable = exe("BLONGO_ACP_EXE");
+        config.acp_executable = exe(blongo_harness::acp::ACP_EXECUTABLE_ENV);
         config.acp_args = std::env::var("BLONGO_ACP_ARGS")
             .map(|a| a.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();

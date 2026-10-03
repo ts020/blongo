@@ -134,7 +134,7 @@ pub fn antigravity() -> AcpAgent {
 }
 
 /// Env var naming a generic ACP agent's executable.
-pub const ACP_EXECUTABLE_ENV: &str = "BLONGO_ACP_EXECUTABLE";
+pub const ACP_EXECUTABLE_ENV: &str = "BLONGO_ACP_EXE";
 
 /// Any other agent speaking ACP over stdio (Grok, OpenCode's `acp`
 /// subcommand, ...): its executable comes from the session config (or
@@ -314,6 +314,11 @@ pub(crate) struct Driver {
     queued: VecDeque<String>,
     permissions: HashMap<String, PendingPermission>,
     permission_seq: u64,
+    /// ACP reports session totals (context tokens, cost so far): the
+    /// latest totals, and those when the current turn started, so each
+    /// turn records only its own share and turns add up correctly.
+    usage_now: (u64, Option<u64>),
+    usage_at_turn: (u64, Option<u64>),
 }
 
 impl Driver {
@@ -328,6 +333,8 @@ impl Driver {
             queued: VecDeque::new(),
             permissions: HashMap::new(),
             permission_seq: 0,
+            usage_now: (0, None),
+            usage_at_turn: (0, None),
         }
     }
 
@@ -346,6 +353,7 @@ impl Driver {
         self.prompt_request = Some(id);
         self.cancel_sent = false;
         self.interrupting = false;
+        self.usage_at_turn = self.usage_now;
     }
 
     /// Handle a host command; returns events it causes right away.
@@ -487,7 +495,19 @@ impl Driver {
         if self.sanitize {
             sanitize_update(&mut update);
         }
+        let from = out.len();
         map_update(&update, out);
+        for event in &mut out[from..] {
+            if let AgentEvent::Usage(usage) = event {
+                // Session totals in, this turn's share out.
+                self.usage_now = (usage.input_tokens, usage.cost_micros);
+                let (base_tokens, base_cost) = self.usage_at_turn;
+                usage.input_tokens = usage.input_tokens.saturating_sub(base_tokens);
+                usage.cost_micros = usage
+                    .cost_micros
+                    .map(|c| c.saturating_sub(base_cost.unwrap_or(0)));
+            }
+        }
     }
 
     fn permission(&mut self, id: Value, params: Value, out: &mut Vec<AgentEvent>) {
@@ -1235,6 +1255,39 @@ mod tests {
             method: "session/update".into(),
             params: json!({ "sessionId": "s1", "update": update }),
         }
+    }
+
+    #[test]
+    fn usage_totals_become_per_turn_shares() {
+        let (mut d, mut rpc, mut rx) = harness();
+        let usage = |used: u64, usd: f64| {
+            update(
+                json!({"sessionUpdate": "usage_update", "used": used, "size": 200000,
+                          "cost": {"amount": usd, "currency": "USD"}}),
+            )
+        };
+        let mut out = Vec::new();
+        d.command(&mut rpc, Command::Prompt("one".into()));
+        d.incoming(&mut rpc, usage(1000, 0.10), &mut out);
+        let id = sent(&mut rx)[0]["id"].clone();
+        d.incoming(
+            &mut rpc,
+            Incoming::Response {
+                id: id.as_i64().unwrap(),
+                result: Ok(json!({"stopReason": "end_turn"})),
+            },
+            &mut out,
+        );
+        d.command(&mut rpc, Command::Prompt("two".into()));
+        d.incoming(&mut rpc, usage(1500, 0.25), &mut out);
+        let shares: Vec<(u64, Option<u64>)> = out
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage(u) => Some((u.input_tokens, u.cost_micros)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shares, vec![(1000, Some(100_000)), (500, Some(150_000))]);
     }
 
     #[test]
