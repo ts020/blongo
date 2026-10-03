@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/blongo-protocol", "crates/blongo-harness", "apps/blongo"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+blongo-protocol = { path = "crates/blongo-protocol" }
+blongo-harness = { path = "crates/blongo-harness" }
+
+# GPUI: Zed's Apache-2.0 UI crates only, pinned to one rev.
+# Never depend on Zed's GPL-3.0 crates (editor, terminal, markdown, ui, ...).
+# See docs/phase0/gpui-choice.md for why this rev and not the zui fork.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "badfb8d31f2a03d0e3d996897bb93779003f4607", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "badfb8d31f2a03d0e3d996897bb93779003f4607" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "sync", "time"] }
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 16
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+# gpui is unusably slow unoptimized
+opt-level = 2
