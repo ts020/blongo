@@ -579,6 +579,31 @@ async fn streamed_text_is_coalesced_not_written_per_delta() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Quitting while an agent streams must not wait for the stop timeout: the
+/// forwarders are detached first, so every driver reaps its child at once.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_while_streaming_is_prompt() {
+    let dir = temp_dir("quit-streaming");
+    let (mut core, _) = TestCore::start(&dir);
+    let (_, thread_id) = core.project_and_thread(&dir).await;
+    core.send(thread_id, "loop");
+    let mut deltas = 0;
+    core.until(|e| {
+        if matches!(e, CoreEvent::TextDelta { .. }) {
+            deltas += 1;
+        }
+        (deltas >= 20).then_some(())
+    })
+    .await;
+    // Let the agent keep writing while nobody drains the core's channel.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    core.shutdown();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 // ------------------------------------------------------------------------
 // Recorded real Codex sessions (t3code replay fixtures, codex-cli 0.156.1)
 // played by crates/blongo-harness/tests/fixtures/replay_codex.py.

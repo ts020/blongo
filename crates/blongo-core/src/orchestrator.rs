@@ -36,6 +36,19 @@ struct SessionMsg {
 struct LiveSession {
     session: Session,
     generation: u64,
+    /// Task copying the session's events into the core loop. Aborted
+    /// before the session is shut down: a forwarder blocked on a full core
+    /// channel would otherwise keep the driver blocked on its own send, and
+    /// the shutdown would wait for the timeout.
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
+impl LiveSession {
+    /// Detach from the core loop and reap the agent in the background.
+    fn release(self) {
+        self.forwarder.abort();
+        tokio::spawn(self.session.shutdown());
+    }
 }
 
 const SESSION_CHANNEL_CAPACITY: usize = 256;
@@ -136,10 +149,13 @@ pub(crate) async fn run(
                 Some(Request::Dispatch(command)) => core.dispatch(command).await,
                 Some(Request::OpenThread(thread_id)) => core.open_thread(thread_id),
                 Some(Request::Abort) => {
+                    // No forwarder may block on a full channel now.
+                    session_rx.close();
                     core.abort().await;
                     return;
                 }
                 Some(Request::Shutdown) | None => {
+                    session_rx.close();
                     core.shutdown().await;
                     return;
                 }
@@ -726,7 +742,7 @@ impl Orchestrator {
         // released session's stragglers are ignored.
         let mut events = std::mem::replace(&mut session.events, mpsc::channel(1).1);
         let tx = self.session_tx.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 let msg = SessionMsg {
                     thread_id,
@@ -748,6 +764,7 @@ impl Orchestrator {
         self.rt(thread_id)?.session = Some(LiveSession {
             session,
             generation,
+            forwarder,
         });
         Ok(())
     }
@@ -798,7 +815,7 @@ impl Orchestrator {
                     }
                 }
                 if let Some(live) = session {
-                    tokio::spawn(live.session.shutdown());
+                    live.release();
                 }
             }
         }
@@ -1199,7 +1216,7 @@ impl Orchestrator {
 
     fn release_session(&mut self, thread_id: ThreadId) {
         if let Some(live) = self.rt.get_mut(&thread_id).and_then(|rt| rt.session.take()) {
-            tokio::spawn(live.session.shutdown());
+            live.release();
         }
     }
 
@@ -1248,30 +1265,35 @@ impl Orchestrator {
     }
 
     async fn stop_sessions(&mut self) {
-        let sessions: Vec<Session> = self
+        let sessions: Vec<LiveSession> = self
             .rt
             .values_mut()
             .filter_map(|rt| rt.session.take())
-            .map(|live| live.session)
             .collect();
-        let pids: Vec<u32> = sessions.iter().filter_map(Session::pid).collect();
-        let all = futures_join(sessions.into_iter().map(Session::shutdown).collect());
-        if tokio::time::timeout(Duration::from_secs(5), all)
-            .await
-            .is_err()
-        {
-            // Do not leave an agent (or its tool processes) behind.
-            for pid in pids {
+        // Forwarders first: once they are gone the drivers' event sends fail
+        // and each driver goes straight to closing stdin and reaping.
+        let mut shutdowns = Vec::with_capacity(sessions.len());
+        for live in sessions {
+            live.forwarder.abort();
+            let pid = live.session.pid();
+            shutdowns.push((pid, tokio::spawn(live.session.shutdown())));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for (_, handle) in &mut shutdowns {
+            if tokio::time::timeout_at(deadline, &mut *handle).await.is_err() {
+                break;
+            }
+        }
+        // Do not leave an agent (or its tool processes) behind. A finished
+        // shutdown task has reaped its child, so its pid (and group id) may
+        // already belong to an unrelated process: never signal those.
+        for (pid, handle) in shutdowns {
+            if !handle.is_finished()
+                && let Some(pid) = pid
+            {
                 blongo_harness::process::kill_group(pid);
             }
         }
-    }
-}
-
-async fn futures_join(futures: Vec<impl std::future::Future<Output = ()> + Send + 'static>) {
-    let handles: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
-    for handle in handles {
-        let _ = handle.await;
     }
 }
 

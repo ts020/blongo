@@ -280,11 +280,20 @@ pub async fn terminate(child: &mut Child, grace: Duration) {
     let _ = child.wait().await;
 }
 
-/// Linux: the agent gets SIGKILL when the thread that spawned it exits, so
-/// a crashed or `kill -9`-ed Blongo does not leave Codex running. (The core
-/// spawns agents from its own long-lived thread.) Grandchildren in the
-/// agent's process group are not covered; the agent normally takes them down
-/// itself when its stdin closes.
+/// Linux: the agent gets SIGKILL when its parent goes away, so a crashed or
+/// `kill -9`-ed Blongo does not leave an agent running.
+///
+/// Caveat: `PR_SET_PDEATHSIG` tracks the *OS thread* that forked the child,
+/// not the process. If that thread exits, the agent is killed even though
+/// Blongo is still running. Every spawn in Blongo therefore happens on the
+/// core's single long-lived thread (`blongo-core`, a current-thread tokio
+/// runtime that lives as long as the process): harness `start` functions,
+/// the Antigravity sign-in flow and git helpers all run there. Never call
+/// [`spawn`] from a tokio blocking-pool thread or another short-lived thread
+/// (the blocking pool retires idle threads after 10 s, which would kill the
+/// agent). The terminal's shells are spawned by portable-pty without this
+/// hook. Grandchildren in the agent's process group are not covered; the
+/// agent normally takes them down itself when its stdin closes.
 #[cfg(target_os = "linux")]
 fn die_with_parent(cmd: &mut Command) {
     // SAFETY: getpid is async-signal-safe; the pre_exec closure only calls
@@ -305,7 +314,9 @@ fn die_with_parent(cmd: &mut Command) {
 }
 
 /// SIGKILL a process group created by [`spawn`] (its leader's pid), for
-/// callers that gave up waiting on an orderly shutdown.
+/// callers that gave up waiting on an orderly shutdown. Only call it while
+/// the leader has not been reaped yet: once it is, the pid (and the group
+/// id) can be reused by an unrelated process.
 pub fn kill_group(pid: u32) {
     #[cfg(unix)]
     signal_group(pid, libc::SIGKILL);
