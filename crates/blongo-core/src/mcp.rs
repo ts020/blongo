@@ -18,6 +18,13 @@
 //!   `delegate_task` children are capped in depth and number.
 //! - Tokens die with their session (released, idle-stopped, or the core
 //!   stopping); the files are removed then, and the folder at start.
+//! - The folder is `-wx------` once the socket is bound: a session knows
+//!   its own token file's (random) name, but cannot list the folder to
+//!   find the others'. Processes of the same user can still change that
+//!   mode; real isolation between agents needs separate users.
+//! - Per connection at most [`MAX_CALLS_PER_CONN`] tool calls run at once
+//!   and answers queue in a bounded channel (an agent that stops reading
+//!   stops being read); at most [`MAX_CONNECTIONS`] bridges are served.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +43,12 @@ const MAX_LINE: usize = 1 << 20;
 pub const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_WAIT: Duration = Duration::from_secs(10 * 60);
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Tool calls one connection may have running at once.
+pub const MAX_CALLS_PER_CONN: usize = 8;
+/// Bridges served at once (all sessions together).
+pub const MAX_CONNECTIONS: usize = 64;
+/// Answers waiting to be written to one connection.
+const OUT_QUEUE: usize = 32;
 
 /// One tool call, for the orchestrator to answer.
 pub(crate) struct McpCall {
@@ -79,7 +92,11 @@ impl McpServer {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random: {e}"))?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let file = self.dir.join(format!("{}.token", &token[..16]));
+        // The file's name is random too (not derived from the token).
+        let mut name = [0u8; 16];
+        getrandom::fill(&mut name).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+        let name: String = name.iter().map(|b| format!("{b:02x}")).collect();
+        let file = self.dir.join(format!("{name}.token"));
         write_private(&file, token.as_bytes())?;
         self.tokens
             .lock()
@@ -136,8 +153,12 @@ type Listener = ();
 #[cfg(unix)]
 fn bind(dir: &Path) -> anyhow::Result<(PathBuf, Listener)> {
     use std::os::unix::fs::PermissionsExt;
-    // Leftovers of an earlier process (tokens of sessions that are gone).
-    let _ = std::fs::remove_dir_all(dir);
+    // Leftovers of an earlier process (tokens of sessions that are gone);
+    // the folder is unlistable then, so make it ours to clear first.
+    if dir.exists() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(dir);
+    }
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let socket = dir.join("s");
@@ -147,6 +168,8 @@ fn bind(dir: &Path) -> anyhow::Result<(PathBuf, Listener)> {
     let listener = tokio::net::UnixListener::bind(&socket)?;
     // The folder is private already; the socket too, for good measure.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    // Owner may create, open and remove by name, but not list.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))?;
     Ok((socket, listener))
 }
 
@@ -161,15 +184,22 @@ async fn accept(
     tokens: Arc<Mutex<HashMap<String, ThreadId>>>,
     calls: mpsc::UnboundedSender<McpCall>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             return;
+        };
+        // Over the limit the connection is closed at once.
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
         };
         let tokens = tokens.clone();
         let calls = calls.clone();
         tokio::spawn(async move {
             let (read, write) = stream.into_split();
             serve(BufReader::new(read), write, tokens, calls).await;
+            drop(slot);
         });
     }
 }
@@ -228,8 +258,11 @@ async fn serve<R, W>(
             .await;
         return;
     };
-    // Responses from concurrent tool calls go through one writer.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    // Responses from concurrent tool calls go through one writer, in a
+    // bounded queue: an agent that stops reading blocks its own calls and
+    // then its reader, nothing grows.
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_QUEUE);
+    let running = Arc::new(tokio::sync::Semaphore::new(MAX_CALLS_PER_CONN));
     let writer_task = tokio::spawn(async move {
         while let Some(mut line) = out_rx.recv().await {
             line.push('\n');
@@ -244,7 +277,9 @@ async fn serve<R, W>(
             break;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            let _ = out_tx.send(error_line(Value::Null, -32700, "parse error"));
+            let _ = out_tx
+                .send(error_line(Value::Null, -32700, "parse error"))
+                .await;
             continue;
         };
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
@@ -261,21 +296,25 @@ async fn serve<R, W>(
                     .and_then(Value::as_str)
                     .filter(|v| PROTOCOL_VERSIONS.contains(v))
                     .unwrap_or(PROTOCOL_VERSIONS[0]);
-                let _ = out_tx.send(result_line(
-                    id,
-                    json!({
-                        "protocolVersion": asked,
-                        "capabilities": { "tools": { "listChanged": false } },
-                        "serverInfo": { "name": "blongo", "version": env!("CARGO_PKG_VERSION") },
-                        "instructions": INSTRUCTIONS,
-                    }),
-                ));
+                let _ = out_tx
+                    .send(result_line(
+                        id,
+                        json!({
+                            "protocolVersion": asked,
+                            "capabilities": { "tools": { "listChanged": false } },
+                            "serverInfo": { "name": "blongo", "version": env!("CARGO_PKG_VERSION") },
+                            "instructions": INSTRUCTIONS,
+                        }),
+                    ))
+                    .await;
             }
             "ping" => {
-                let _ = out_tx.send(result_line(id, json!({})));
+                let _ = out_tx.send(result_line(id, json!({}))).await;
             }
             "tools/list" => {
-                let _ = out_tx.send(result_line(id, json!({ "tools": tools() })));
+                let _ = out_tx
+                    .send(result_line(id, json!({ "tools": tools() })))
+                    .await;
             }
             "tools/call" => {
                 let tool = params
@@ -285,9 +324,22 @@ async fn serve<R, W>(
                     .to_owned();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let wait = wait_budget(&tool, &args);
+                let Ok(permit) = running.clone().try_acquire_owned() else {
+                    let _ = out_tx
+                        .send(result_line(
+                            id,
+                            tool_result(Err(format!(
+                                "{MAX_CALLS_PER_CONN} tool calls are already running on this \
+                                 connection; wait for their answers"
+                            ))),
+                        ))
+                        .await;
+                    continue;
+                };
                 let calls = calls.clone();
                 let out_tx = out_tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let (reply, rx) = oneshot::channel();
                     let sent = calls.send(McpCall {
                         thread_id,
@@ -303,11 +355,13 @@ async fn serve<R, W>(
                         },
                         (Ok(()), None) => rx.await.unwrap_or_else(|_| Err("Blongo stopped".into())),
                     };
-                    let _ = out_tx.send(result_line(id, tool_result(result)));
+                    let _ = out_tx.send(result_line(id, tool_result(result))).await;
                 });
             }
             _ => {
-                let _ = out_tx.send(error_line(id, -32601, &format!("unknown method {method}")));
+                let _ = out_tx
+                    .send(error_line(id, -32601, &format!("unknown method {method}")))
+                    .await;
             }
         }
     }
@@ -615,6 +669,54 @@ mod tests {
             .unwrap();
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("unknown session"));
+    }
+
+    #[tokio::test]
+    async fn one_connection_runs_a_bounded_number_of_calls() {
+        let tokens: Arc<Mutex<HashMap<String, ThreadId>>> = Arc::default();
+        tokens.lock().unwrap().insert("tok".into(), ThreadId::new());
+        // An orchestrator that holds every call (never answers).
+        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel::<McpCall>();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(call) = calls_rx.recv().await {
+                held.push(call);
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let mut input = String::from("blongo-mcp tok\n");
+        for id in 0..MAX_CALLS_PER_CONN + 3 {
+            input.push_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"t3_thread_list\"}}}}\n"
+            ));
+        }
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (sr, sw) = tokio::io::split(server);
+        let task = tokio::spawn(serve(BufReader::new(sr), sw, tokens, calls_tx));
+        let (cr, mut cw) = tokio::io::split(client);
+        cw.write_all(input.as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(cr).lines();
+        for _ in 0..3 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(line.contains("tool calls are already running"), "{line}");
+        }
+        let load = || count.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..500 {
+            if load() >= MAX_CALLS_PER_CONN {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(load(), MAX_CALLS_PER_CONN);
+        task.abort();
+        held.abort();
     }
 
     #[test]

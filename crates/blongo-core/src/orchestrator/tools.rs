@@ -7,8 +7,15 @@ use super::*;
 const MAX_TOOL_TEXT: usize = 16_000;
 /// How deep delegation goes (a child's child is the last level).
 const MAX_DELEGATION_DEPTH: usize = 2;
-/// Children of one thread running at once.
+/// Children of one thread live at once (running, queued or still being
+/// created).
 const MAX_ACTIVE_CHILDREN: usize = 4;
+/// Agent-created threads live at once in one project, whoever made them.
+const MAX_PROJECT_AGENT_THREADS: usize = 8;
+/// Schedules agents may have waiting for approval in one project.
+const MAX_PROPOSALS: usize = 10;
+/// Shortest time between two runs of a schedule an agent proposes.
+const MIN_PROPOSED_INTERVAL_MS: i64 = 15 * 60 * 1000;
 
 /// A git object id as `snapshot_tree` / checkpoints print them (never an
 /// option or a revision expression).
@@ -240,6 +247,126 @@ impl Orchestrator {
 
     // ------------------------------------------------------------------ MCP
 
+    /// How many parents `thread` has (stops counting past the limit).
+    fn depth(&self, thread: &Thread) -> usize {
+        let mut depth = 0;
+        let mut cursor = thread.parent_thread_id;
+        while let Some(parent) = cursor {
+            depth += 1;
+            if depth > MAX_DELEGATION_DEPTH {
+                break;
+            }
+            cursor = self.threads.get(&parent).and_then(|t| t.parent_thread_id);
+        }
+        depth
+    }
+
+    /// Agent-created threads that are live: running, holding a job, with
+    /// a message or their creation still waiting in line. Each entry is
+    /// (thread, parent, project); creations count before they commit, so
+    /// calls made while the line is held (a global job) cannot slip past
+    /// the limits.
+    fn live_agent_threads(&self) -> Vec<(ThreadId, ThreadId, ProjectId)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for t in self.threads.values() {
+            if let Some(parent) = t.parent_thread_id
+                && !t.archived
+                && (self.is_busy(t.id) || self.busy.contains(&t.id))
+                && seen.insert(t.id)
+            {
+                out.push((t.id, parent, t.project_id));
+            }
+        }
+        for item in &self.deferred {
+            let Deferred::Dispatch(pending) = item else {
+                continue;
+            };
+            match &pending.command.command {
+                Command::ThreadCreate {
+                    thread_id,
+                    project_id,
+                    parent_thread_id: Some(parent),
+                    ..
+                } if seen.insert(*thread_id) => out.push((*thread_id, *parent, *project_id)),
+                Command::MessageDispatch { thread_id, .. } => {
+                    if let Some(t) = self.threads.get(thread_id)
+                        && let Some(parent) = t.parent_thread_id
+                        && seen.insert(t.id)
+                    {
+                        out.push((t.id, parent, t.project_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// May `caller` start one more thread? Depth, its own live children
+    /// and the project's live agent threads are all bounded.
+    fn check_spawn(&self, caller: &Thread) -> Result<(), String> {
+        if self.depth(caller) >= MAX_DELEGATION_DEPTH {
+            return Err(format!(
+                "threads started by agents are limited to {MAX_DELEGATION_DEPTH} levels; do \
+                 this task yourself"
+            ));
+        }
+        let live = self.live_agent_threads();
+        if live.iter().filter(|(_, p, _)| *p == caller.id).count() >= MAX_ACTIVE_CHILDREN {
+            return Err(format!(
+                "{MAX_ACTIVE_CHILDREN} threads this thread started are still working; wait for \
+                 one (task_status / t3_thread_wait) before starting another"
+            ));
+        }
+        if live
+            .iter()
+            .filter(|(_, _, project)| *project == caller.project_id)
+            .count()
+            >= MAX_PROJECT_AGENT_THREADS
+        {
+            return Err(format!(
+                "{MAX_PROJECT_AGENT_THREADS} agent-started threads are already working in this \
+                 project; wait for some to finish"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A schedule proposed by an agent in `agent`: its own project, a
+    /// bounded number waiting, and runs at least 15 minutes apart.
+    pub(super) fn check_proposal(
+        &self,
+        agent: ThreadId,
+        project_id: ProjectId,
+        cron: &str,
+    ) -> Result<(), String> {
+        if self.live_thread(agent)?.project_id != project_id {
+            return Err("the proposing thread is in another project".into());
+        }
+        let waiting = self
+            .schedules
+            .values()
+            .filter(|s| s.project_id == project_id && s.proposed_by.is_some())
+            .count();
+        if waiting >= MAX_PROPOSALS {
+            return Err(format!(
+                "{MAX_PROPOSALS} proposed schedules already wait for the user's approval"
+            ));
+        }
+        let parsed = Cron::parse(cron)?;
+        if let Some(gap) = parsed.min_gap(Timestamp::now(), 500)
+            && gap < MIN_PROPOSED_INTERVAL_MS
+        {
+            return Err(format!(
+                "`{cron}` runs more often than every {} minutes; agents may only propose \
+                 schedules with runs at least that far apart",
+                MIN_PROPOSED_INTERVAL_MS / 60_000
+            ));
+        }
+        Ok(())
+    }
+
     /// Answer `tx` once `thread_id`'s work (run and queued messages) is
     /// done; at once when it is idle.
     pub(super) fn wait_for(
@@ -404,6 +531,11 @@ impl Orchestrator {
                     Ok(p) => p,
                     Err(e) => return answer(tx, Err(e)),
                 };
+                // An agent's thread is the caller's child, under the same
+                // depth and concurrency limits as delegation.
+                if let Err(e) = self.check_spawn(caller) {
+                    return answer(tx, Err(e));
+                }
                 let thread_id = ThreadId::new();
                 let create = Command::ThreadCreate {
                     thread_id,
@@ -416,7 +548,7 @@ impl Orchestrator {
                     provider,
                     model: None,
                     worktree: false,
-                    parent_thread_id: None,
+                    parent_thread_id: Some(caller.id),
                 };
                 let value = json!({ "threadId": thread_id.to_string() });
                 let then = match args.get("message").and_then(Value::as_str) {
@@ -515,38 +647,8 @@ impl Orchestrator {
                     Ok(p) => p,
                     Err(e) => return answer(tx, Err(e)),
                 };
-                // Depth: how many parents the caller has.
-                let mut depth = 0;
-                let mut cursor = caller.parent_thread_id;
-                while let Some(parent) = cursor {
-                    depth += 1;
-                    cursor = self.threads.get(&parent).and_then(|t| t.parent_thread_id);
-                    if depth > MAX_DELEGATION_DEPTH {
-                        break;
-                    }
-                }
-                if depth >= MAX_DELEGATION_DEPTH {
-                    return answer(
-                        tx,
-                        Err(format!(
-                            "delegation is limited to {MAX_DELEGATION_DEPTH} levels; do this \
-                             task yourself"
-                        )),
-                    );
-                }
-                let active = self
-                    .threads
-                    .values()
-                    .filter(|t| t.parent_thread_id == Some(caller.id) && self.is_busy(t.id))
-                    .count();
-                if active >= MAX_ACTIVE_CHILDREN {
-                    return answer(
-                        tx,
-                        Err(format!(
-                            "{MAX_ACTIVE_CHILDREN} delegated tasks are already running; wait \
-                             for one (task_status) before starting another"
-                        )),
-                    );
+                if let Err(e) = self.check_spawn(caller) {
+                    return answer(tx, Err(e));
                 }
                 let child = ThreadId::new();
                 let title = args
@@ -617,6 +719,7 @@ impl Orchestrator {
                             "cron": s.cron,
                             "prompt": cut(&s.prompt, 2000),
                             "enabled": s.enabled,
+                            "awaitingApproval": s.proposed_by.is_some(),
                             "threadId": s.thread_id.map(|t| t.to_string()),
                             "nextRunAt": s.next_run_at.map(|t| t.0),
                             "lastRunAt": s.last_run_at.map(|t| t.0),
@@ -634,10 +737,11 @@ impl Orchestrator {
                     .get("bindToCurrentThread")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
+                // Checked now too, so the agent hears why at once.
+                if let Err(e) = self.check_proposal(caller.id, caller.project_id, &cron) {
+                    return answer(tx, Err(e));
+                }
                 let schedule_id = ScheduleId::new();
-                let next = Cron::parse(&cron)
-                    .ok()
-                    .and_then(|c| c.next_after(Timestamp::now()));
                 self.deferred.push_back(Deferred::Dispatch(Pending::new(
                     Command::ScheduleCreate {
                         schedule_id,
@@ -646,12 +750,15 @@ impl Orchestrator {
                         cron,
                         prompt,
                         provider: caller.provider,
+                        proposed_by: Some(caller.id),
                     },
                     Reply::Mcp {
                         tx,
                         then: Then::Value(json!({
                             "scheduleId": schedule_id.to_string(),
-                            "nextRunAt": next.map(|t| t.0),
+                            "enabled": false,
+                            "note": "Proposed: it runs only after the user turns it on in \
+                                     Blongo's settings (Scheduled runs).",
                         })),
                     },
                 )));

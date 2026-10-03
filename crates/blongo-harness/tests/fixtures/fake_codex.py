@@ -297,10 +297,31 @@ MCP = None
 def mcp_turn(turn_id, text):
     """`mcp: TOOL JSON-ARGS`: call one of Blongo's MCP tools through the
     bridge named in thread/start (as a real agent would) and stream the
-    tool's text answer."""
+    tool's text answer. `mcp*N after=S: ...` sleeps S seconds, then sends
+    N copies of the call at once (without waiting for answers) and streams
+    the N answers, one per line, in id order."""
     import subprocess
-    _, rest = text.split(":", 1)
+    head, rest = text.split(":", 1)
     tool, _, args = rest.strip().partition(" ")
+    count, delay = 1, 0.0
+    for word in head.split():
+        if word.startswith("mcp*"):
+            count = int(word[4:])
+        elif word.startswith("after="):
+            delay = float(word[6:])
+    if delay:
+        time.sleep(delay)
+
+    def text_of(line):
+        try:
+            result = json.loads(line)
+            if "result" in result:
+                r = result["result"]
+                return ("ERROR " if r.get("isError") else "") + r["content"][0]["text"]
+            return "ERROR " + result["error"]["message"]
+        except Exception as e:  # noqa: BLE001
+            return f"bad answer {line!r}: {e}"
+
     if MCP is None:
         answer = "no MCP server configured"
     else:
@@ -314,20 +335,19 @@ def mcp_turn(turn_id, text):
                          "clientInfo": {"name": "fake-codex", "version": "0"}}})
         proc.stdout.readline()
         call({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-              "params": {"name": tool, "arguments": json.loads(args or "{}")}})
-        line = proc.stdout.readline()
+        for i in range(count):
+            call({"jsonrpc": "2.0", "id": 2 + i, "method": "tools/call",
+                  "params": {"name": tool, "arguments": json.loads(args or "{}")}})
+        answers = {}
+        for _ in range(count):
+            line = proc.stdout.readline()
+            try:
+                answers[json.loads(line).get("id")] = line
+            except Exception:  # noqa: BLE001
+                answers[len(answers) + 1000] = line
         proc.stdin.close()
         proc.wait()
-        try:
-            result = json.loads(line)
-            if "result" in result:
-                r = result["result"]
-                answer = ("ERROR " if r.get("isError") else "") + r["content"][0]["text"]
-            else:
-                answer = "ERROR " + result["error"]["message"]
-        except Exception as e:  # noqa: BLE001
-            answer = f"bad answer {line!r}: {e}"
+        answer = "\n".join(text_of(answers[k]) for k in sorted(answers))
     notify("item/agentMessage/delta",
            {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": answer})
     complete(turn_id, "completed")
@@ -348,7 +368,7 @@ def main():
         respond(msg, {"turn": turn_obj(turn_id, "inProgress")})
         notify("turn/started", {"threadId": THREAD, "turn": turn_obj(turn_id, "inProgress")})
         text = msg["params"]["input"][0]["text"]
-        if text.startswith("mcp:"):
+        if text.startswith("mcp:") or text.startswith("mcp*"):
             mcp_turn(turn_id, text)
         elif "echo:" in text:
             notify("item/agentMessage/delta",

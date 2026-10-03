@@ -620,10 +620,14 @@ impl Render for SettingsView {
         for (ix, sch) in self.info.schedules.iter().enumerate() {
             let id = sch.id;
             let enabled = sch.enabled;
-            let next = sch
-                .next_run_at
-                .map(|t| format!("next {}", crate::shell::local_time(t)))
-                .unwrap_or_else(|| "not scheduled".into());
+            let proposed = sch.proposed_by.is_some();
+            let next = if proposed {
+                "proposed by an agent: approve to run it".to_owned()
+            } else {
+                sch.next_run_at
+                    .map(|t| format!("next {}", crate::shell::local_time(t)))
+                    .unwrap_or_else(|| "not scheduled".into())
+            };
             let last = sch
                 .last_run_at
                 .map(|t| format!(" · last {}", crate::shell::local_time(t)))
@@ -643,13 +647,23 @@ impl Render for SettingsView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme::text_faint())
+                            .text_color(if proposed {
+                                gpui::Hsla::from(theme::warning())
+                            } else {
+                                theme::text_faint()
+                            })
                             .child(format!("{next}{last}")),
                     )
                     .child(
                         choice(
                             ("sch-toggle", ix).into_element_id_string(),
-                            if enabled { "On" } else { "Off" },
+                            if proposed {
+                                "Approve"
+                            } else if enabled {
+                                "On"
+                            } else {
+                                "Off"
+                            },
                             enabled,
                         )
                         .on_click(cx.listener(move |_, _, _, cx| {

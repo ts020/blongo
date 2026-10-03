@@ -480,7 +480,7 @@ impl Store {
     pub fn schedules(&self) -> anyhow::Result<Vec<Schedule>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, project_id, thread_id, cron, prompt, provider, enabled, created_at,
-                    next_run_at, last_run_at, last_thread_id
+                    next_run_at, last_run_at, last_thread_id, proposed_by
              FROM schedules ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -496,6 +496,7 @@ impl Store {
                 next_run_at: r.get::<_, Option<i64>>(8)?.map(Timestamp),
                 last_run_at: r.get::<_, Option<i64>>(9)?.map(Timestamp),
                 last_thread_id: opt_uuid_col(r, 10)?.map(ThreadId),
+                proposed_by: opt_uuid_col(r, 11)?.map(ThreadId),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -789,13 +790,15 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
         EventKind::ScheduleCreated { schedule } | EventKind::ScheduleUpdated { schedule } => {
             tx.prepare_cached(
                 "INSERT INTO schedules (id, project_id, thread_id, cron, prompt, provider, enabled,
-                                        created_at, next_run_at, last_run_at, last_thread_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                        created_at, next_run_at, last_run_at, last_thread_id,
+                                        proposed_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (id) DO UPDATE SET
                      thread_id = excluded.thread_id, cron = excluded.cron,
                      prompt = excluded.prompt, provider = excluded.provider,
                      enabled = excluded.enabled, next_run_at = excluded.next_run_at,
-                     last_run_at = excluded.last_run_at, last_thread_id = excluded.last_thread_id",
+                     last_run_at = excluded.last_run_at, last_thread_id = excluded.last_thread_id,
+                     proposed_by = excluded.proposed_by",
             )?
             .execute(params![
                 schedule.id.to_string(),
@@ -809,6 +812,7 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 schedule.next_run_at.map(|t| t.0),
                 schedule.last_run_at.map(|t| t.0),
                 schedule.last_thread_id.map(|t| t.to_string()),
+                schedule.proposed_by.map(|t| t.to_string()),
             ])?;
         }
         EventKind::ScheduleDeleted { schedule_id } => {

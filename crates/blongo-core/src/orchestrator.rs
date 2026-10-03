@@ -202,7 +202,7 @@ enum PrepPlan {
 /// A job finished off the loop.
 enum JobDone {
     Prepared {
-        pending: Pending,
+        pending: Box<Pending>,
         key: Key,
         result: Result<Prepared, String>,
     },
@@ -683,6 +683,32 @@ impl Orchestrator {
     }
 
     async fn on_job_done(&mut self, done: JobDone) {
+        // The thread whose job ended: its `t3_thread_wait` callers are
+        // answered once nothing else holds it (a wait registered while
+        // only a job ran would never be answered otherwise).
+        let settled = match &done {
+            JobDone::Prepared {
+                key: Key::Thread(t),
+                ..
+            }
+            | JobDone::Mutation {
+                key: Key::Thread(t),
+                ..
+            }
+            | JobDone::Released(Key::Thread(t)) => Some(*t),
+            JobDone::Checkpoint { thread_id, .. } => Some(*thread_id),
+            _ => None,
+        };
+        self.handle_job_done(done).await;
+        if let Some(t) = settled
+            && !self.is_busy(t)
+            && !self.busy.contains(&t)
+        {
+            self.resolve_waiters(t);
+        }
+    }
+
+    async fn handle_job_done(&mut self, done: JobDone) {
         match done {
             JobDone::Prepared {
                 pending,
@@ -691,8 +717,8 @@ impl Orchestrator {
             } => {
                 self.release_key(key);
                 match result {
-                    Ok(prepared) => self.decide_and_commit(pending, prepared).await,
-                    Err(reason) => self.refuse(pending, reason),
+                    Ok(prepared) => self.decide_and_commit(*pending, prepared).await,
+                    Err(reason) => self.refuse(*pending, reason),
                 }
             }
             JobDone::Checkpoint {
@@ -805,7 +831,7 @@ impl Orchestrator {
                 self.spawn_job(key, async move {
                     let result = run_prep(plan).await;
                     JobDone::Prepared {
-                        pending,
+                        pending: Box::new(pending),
                         key,
                         result,
                     }
@@ -1511,9 +1537,13 @@ impl Orchestrator {
                 cron,
                 prompt,
                 provider,
+                proposed_by,
             } => {
                 if self.schedules.contains_key(schedule_id) {
                     return Err("schedule already exists".into());
+                }
+                if let Some(agent) = proposed_by {
+                    self.check_proposal(*agent, *project_id, cron)?;
                 }
                 if !self.projects.contains_key(project_id) {
                     return Err("unknown project".into());
@@ -1539,11 +1569,13 @@ impl Orchestrator {
                         cron: cron.trim().to_owned(),
                         prompt: prompt.trim().to_owned(),
                         provider: *provider,
-                        enabled: true,
+                        // A proposal waits for the user to turn it on.
+                        enabled: proposed_by.is_none(),
                         created_at: now,
-                        next_run_at,
+                        next_run_at: next_run_at.filter(|_| proposed_by.is_none()),
                         last_run_at: None,
                         last_thread_id: None,
+                        proposed_by: *proposed_by,
                     },
                 });
             }
@@ -1570,9 +1602,13 @@ impl Orchestrator {
                 }
                 if let Some(enabled) = enabled {
                     schedule.enabled = *enabled;
+                    // Turning a proposal on is the user's approval.
+                    if *enabled {
+                        schedule.proposed_by = None;
+                    }
                 }
                 schedule.next_run_at = if schedule.enabled {
-                    Cron::parse(&schedule.cron)?.next_after(now)
+                    Cron::parse(&schedule.cron)?.next_run(now, schedule.last_run_at)
                 } else {
                     None
                 };
@@ -2974,9 +3010,10 @@ impl Orchestrator {
             .filter_map(|s| s.next_run_at)
             .min()
         {
-            // Wall-clock time: re-checked at least every minute, so a
-            // clock change or suspend does not leave it far off.
-            let ms = (due.0 - Timestamp::now().0).clamp(0, 60_000) as u64;
+            // Sleep until it is due, but re-check the wall clock at least
+            // every 15 minutes: the monotonic clock stops during suspend
+            // and does not follow clock changes.
+            let ms = (due.0 - Timestamp::now().0).clamp(0, 15 * 60_000) as u64;
             consider(Instant::now() + Duration::from_millis(ms));
         }
         for rt in self.rt.values() {

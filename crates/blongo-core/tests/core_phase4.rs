@@ -7,7 +7,7 @@ mod common;
 
 use blongo_core::{ApprovalPolicy, CoreSettings};
 use blongo_protocol::workspace::{DiffScope, LineKind, Query, QueryReply};
-use blongo_protocol::{Schedule, ScheduleId, Timestamp};
+use blongo_protocol::{Schedule, ScheduleId, Thread, Timestamp};
 use common::*;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -82,6 +82,15 @@ impl TestCore {
         self.handle().client().query(id, query);
         self.until(|e| match e {
             CoreEvent::Reply { id: got, result } if *got == id => Some(result.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    async fn shell(&mut self) -> Arc<ShellSnapshot> {
+        self.handle().client().shell();
+        self.until(|e| match e {
+            CoreEvent::Shell(s) => Some(s.clone()),
             _ => None,
         })
         .await
@@ -455,6 +464,7 @@ async fn schedules_fire_persist_and_catch_up_after_a_restart() {
         cron: "61 * * * *".into(),
         prompt: "x".into(),
         provider: ProviderKind::Codex,
+        proposed_by: None,
     });
     assert!(core.rejected(&c).await.contains("out of range"));
 
@@ -467,6 +477,7 @@ async fn schedules_fire_persist_and_catch_up_after_a_restart() {
         cron: "0 9 * * 1-5".into(),
         prompt: "echo: scheduled".into(),
         provider: ProviderKind::Codex,
+        proposed_by: None,
     });
     core.ok(&c).await;
     core.dispatch(Command::ScheduleRunNow {
@@ -498,6 +509,7 @@ async fn schedules_fire_persist_and_catch_up_after_a_restart() {
         cron: "@daily".into(),
         prompt: "echo: daily".into(),
         provider: ProviderKind::Codex,
+        proposed_by: None,
     });
     core.ok(&c).await;
     core.shutdown();
@@ -664,5 +676,205 @@ async fn mcp_tools_see_only_their_project_and_delegate_to_children() {
     )
     .await;
     assert!(core.last_answer(sibling).await.starts_with("ERROR"));
+    core.shutdown();
+}
+
+/// Collect events until `runs` runs finished; returns the threads created
+/// meanwhile.
+async fn threads_created_until_runs(core: &mut TestCore, runs: usize) -> Vec<Thread> {
+    let mut created = Vec::new();
+    let mut finished = 0;
+    while finished < runs {
+        match core.next().await {
+            CoreEvent::Event(ev) => {
+                if let EventKind::ThreadCreated { thread } = &ev.kind {
+                    created.push(thread.clone());
+                }
+            }
+            CoreEvent::RunFinished { .. } => finished += 1,
+            _ => {}
+        }
+    }
+    created
+}
+
+#[tokio::test]
+async fn agents_cannot_escape_the_spawn_limits() {
+    let dir = temp_dir("p4-mcp-limits");
+    std::fs::create_dir_all(dir.join("project")).unwrap();
+    let (mut core, _) = start_mcp(&dir);
+    let project = core.new_project(&dir.join("project")).await;
+    let caller = core.new_thread(project).await;
+
+    // 1. t3_thread_create is no way around the depth limit: the threads
+    // it makes are the caller's children, and a grandchild may not start
+    // another thread.
+    let l3 = "mcp: t3_thread_create {}";
+    let l2 = format!(
+        "mcp: t3_thread_create {}",
+        serde_json::json!({ "message": l3 })
+    );
+    let l1 = format!(
+        "mcp: t3_thread_create {}",
+        serde_json::json!({ "message": l2 })
+    );
+    core.send(caller, &l1);
+    let created = threads_created_until_runs(&mut core, 3).await;
+    assert_eq!(created.len(), 2, "{created:?}");
+    let (c1, c2) = (&created[0], &created[1]);
+    assert_eq!(c1.parent_thread_id, Some(caller));
+    assert_eq!(c2.parent_thread_id, Some(c1.id));
+    let refused = core.last_answer(c2.id).await;
+    assert!(
+        refused.starts_with("ERROR threads started by agents are limited to 2 levels"),
+        "{refused}"
+    );
+    // Delegation from there is refused the same way.
+    core.turn(c2.id, "mcp: delegate_task {\"prompt\": \"echo: deeper\"}")
+        .await;
+    assert!(
+        core.last_answer(c2.id)
+            .await
+            .starts_with("ERROR threads started by agents")
+    );
+
+    // 2. Concurrency counts creations still waiting in line: while a
+    // global job (a branch switch whose hook takes seconds) holds the line,
+    // six simultaneous delegations get four children and two refusals.
+    let other = dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "--quiet", "-b", "main"]);
+    git(&other, &["config", "user.name", "Test"]);
+    git(&other, &["config", "user.email", "test@localhost"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(other.join("a"), "a\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "--quiet", "-m", "init"]);
+    git(&other, &["branch", "b2"]);
+    let hook = other.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 4\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let other_project = core.new_project(&other).await;
+    let other_thread = core.new_thread(other_project).await;
+    let spawner = core.new_thread(project).await;
+    core.send(
+        spawner,
+        "mcp*6 after=1.5: delegate_task {\"prompt\": \"echo: job\", \"mode\": \"async\"}",
+    );
+    core.handle().client().query(
+        7_000_001,
+        Query::GitSwitch {
+            thread_id: other_thread,
+            branch: "b2".into(),
+            create: false,
+        },
+    );
+    let mut switched = false;
+    loop {
+        match core.next().await {
+            CoreEvent::Reply {
+                id: 7_000_001,
+                result,
+            } => {
+                assert!(result.is_ok(), "{result:?}");
+                switched = true;
+            }
+            CoreEvent::RunFinished { thread_id, .. } if thread_id == spawner => break,
+            _ => {}
+        }
+    }
+    // The accepted calls were answered only after the global job.
+    assert!(switched);
+    let answer = core.last_answer(spawner).await;
+    let started = answer.matches("\"childThreadId\"").count();
+    let refused = answer
+        .matches("ERROR 4 threads this thread started are still working")
+        .count();
+    assert_eq!((started, refused), (4, 2), "{answer}");
+    // Let the four children finish.
+    threads_created_until_runs(&mut core, 4).await;
+
+    // 3. Schedules from agents: too frequent ones are refused, the rest
+    // wait disabled until the user turns them on.
+    core.turn(
+        caller,
+        "mcp: schedule_task {\"cron\": \"* * * * *\", \"prompt\": \"echo: tick\"}",
+    )
+    .await;
+    let answer = core.last_answer(caller).await;
+    assert!(
+        answer.starts_with("ERROR `* * * * *` runs more often than every 15 minutes"),
+        "{answer}"
+    );
+    core.turn(
+        caller,
+        "mcp: schedule_task {\"cron\": \"*/30 * * * *\", \"prompt\": \"echo: tick\", \"bindToCurrentThread\": false}",
+    )
+    .await;
+    let answer = core.last_answer(caller).await;
+    let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(v["enabled"], false, "{answer}");
+    let schedule_id = ScheduleId::parse(v["scheduleId"].as_str().unwrap()).unwrap();
+    let shell = core.shell().await;
+    let proposal = shell
+        .schedules
+        .iter()
+        .find(|s| s.id == schedule_id)
+        .unwrap()
+        .clone();
+    assert!(!proposal.enabled);
+    assert_eq!(proposal.next_run_at, None);
+    assert_eq!(proposal.proposed_by, Some(caller));
+    // The user's approval: turning it on.
+    let c = core.dispatch(Command::ScheduleUpdate {
+        schedule_id,
+        enabled: Some(true),
+        cron: None,
+        prompt: None,
+    });
+    core.ok(&c).await;
+    let shell = core.shell().await;
+    let approved = shell
+        .schedules
+        .iter()
+        .find(|s| s.id == schedule_id)
+        .unwrap();
+    assert!(approved.enabled && approved.next_run_at.is_some());
+    assert_eq!(approved.proposed_by, None);
+
+    // 4. A session's token dies with the session: once the thread is
+    // archived, its old token no longer opens the MCP socket.
+    let starts = std::fs::read_to_string(dir.join("starts.jsonl")).unwrap();
+    let start: serde_json::Value = serde_json::from_str(starts.lines().next().unwrap()).unwrap();
+    let args = start["config"]["mcp_servers"]["blongo"]["args"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let socket = PathBuf::from(args[1].as_str().unwrap());
+    let token_file = PathBuf::from(args[2].as_str().unwrap());
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let c = core.dispatch(Command::ThreadArchive { thread_id: caller });
+    core.ok(&c).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!token_file.exists(), "the token file outlived the session");
+    let reply = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t3_thread_list","arguments":{}}}"#;
+        let _ = write!(s, "blongo-mcp {}\n{call}\n", token.trim());
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    })
+    .await
+    .unwrap();
+    assert!(
+        !reply.contains("threads"),
+        "a revoked token was served: {reply}"
+    );
     core.shutdown();
 }

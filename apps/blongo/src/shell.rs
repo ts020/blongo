@@ -119,6 +119,9 @@ pub struct Shell {
     picker: Option<Picker>,
     /// A rollback waiting for the user's confirmation.
     confirm_rollback: Option<RollbackConfirm>,
+    /// A `blongo://project` link for a folder that is not a project yet:
+    /// added only when the user confirms.
+    confirm_link_project: Option<String>,
     /// Last rejected command's reason.
     notice: Option<SharedString>,
     /// Sign-in / install progress.
@@ -246,6 +249,7 @@ impl Shell {
             open_file: None,
             inbox: None,
             settings_view: None,
+            confirm_link_project: None,
             palette: None,
             bindings: options.bindings,
             keybinding_problems: options.keybinding_problems,
@@ -1446,6 +1450,24 @@ impl Shell {
     fn open_profile_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.set_view(view, cx);
         eprintln!("blongo: view opened");
+        // `BLONGO_PROFILE_CLOSE_MS`: back to the chat after that long
+        // (memory once the view is closed).
+        if let Some(ms) = std::env::var("BLONGO_PROFILE_CLOSE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(ms))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.set_view(View::Chat, cx);
+                    eprintln!("blongo: view closed");
+                })
+                .ok();
+            })
+            .detach();
+        }
         if view == View::Files
             && let Some((env, thread_id)) = self.selected(cx)
         {
@@ -1482,6 +1504,19 @@ impl Shell {
             if let Some(diff) = &self.diff {
                 diff.update(cx, |d, cx| d.reload(cx));
             }
+        }
+        // Leaving the diff view frees what it loaded (patches can be tens
+        // of MiB), unless it holds comments the user is still writing.
+        if self.view == View::Diff
+            && view != View::Diff
+            && self
+                .diff
+                .as_ref()
+                .is_some_and(|d| d.read(cx).comments.is_empty())
+        {
+            self.diff = None;
+            self.diff_for = None;
+            trim_heap_soon(cx);
         }
         self.view = view;
         self.palette = None;
@@ -1653,6 +1688,7 @@ impl Shell {
                     cron: cron.clone(),
                     prompt: prompt.clone(),
                     provider: thread.provider,
+                    proposed_by: None,
                 });
                 self.pending_schedule = Some((env, envelope.command_id));
                 self.backend(env).dispatch(envelope);
@@ -1934,30 +1970,127 @@ impl Shell {
                     self.notice = Some(format!("No thread {id} here").into());
                 }
             }
+            // Links only navigate: a known project is selected (its newest
+            // thread), an unknown folder is added only after the user says
+            // so. No thread is created by a link.
             Link::Project(path) => {
                 let wanted = canonical(&path);
-                let existing = self.sidebar.read(cx).envs[LOCAL]
+                let env = &self.sidebar.read(cx).envs[LOCAL];
+                let existing = env
                     .projects
                     .iter()
                     .find(|p| canonical(&p.path) == wanted)
                     .map(|p| p.id);
                 match existing {
-                    Some(project_id) => self.new_thread(LOCAL, project_id, false, cx),
-                    None => {
-                        let envelope = CommandEnvelope::new(Command::ProjectCreate {
-                            project_id: ProjectId::new(),
-                            name: String::new(),
-                            path,
-                        });
-                        self.pending_project = Some((LOCAL, envelope.command_id));
-                        self.backend(LOCAL).dispatch(envelope);
+                    Some(project_id) => {
+                        let newest = env
+                            .threads
+                            .iter()
+                            .find(|t| t.project_id == project_id && !t.archived)
+                            .map(|t| t.id);
+                        match newest {
+                            Some(thread_id) => {
+                                self.select(LOCAL, thread_id, cx);
+                                self.view = View::Chat;
+                            }
+                            None => {
+                                self.notice = Some(
+                                    format!("{path} has no threads yet: start one with + New")
+                                        .into(),
+                                )
+                            }
+                        }
                     }
+                    None => self.confirm_link_project = Some(path),
                 }
-                self.view = View::Chat;
             }
             Link::Settings => self.view = View::Settings,
             Link::Inbox => self.view = View::Inbox,
         }
+        cx.notify();
+    }
+
+    /// The question for a `blongo://project` link to a new folder.
+    fn render_link_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let path = self.confirm_link_project.clone()?;
+        Some(
+            div()
+                .absolute()
+                .top(px(60.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("link-project-confirm")
+                        .occlude()
+                        .w(px(520.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::surface())
+                        .text_sm()
+                        .child(div().child("A blongo:// link asks to add this folder as a project:"))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme::code_bg())
+                                .text_xs()
+                                .child(path),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child("Only add folders you trust: agents you start there can read and change them."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(button(
+                                    "link-project-cancel".into(),
+                                    "Cancel",
+                                    theme::surface_hover(),
+                                    theme::text(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm_link_project = None;
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(button(
+                                    "link-project-add".into(),
+                                    "Add project",
+                                    theme::accent_bg(),
+                                    theme::text(),
+                                    cx.listener(|this, _, _, cx| this.add_linked_project(cx)),
+                                )),
+                        ),
+                ),
+        )
+    }
+
+    /// The user confirmed a `blongo://project` link: add the folder (no
+    /// thread is started; the user does that).
+    fn add_linked_project(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.confirm_link_project.take() else {
+            return;
+        };
+        let envelope = CommandEnvelope::new(Command::ProjectCreate {
+            project_id: ProjectId::new(),
+            name: String::new(),
+            path,
+        });
+        self.backend(LOCAL).dispatch(envelope);
+        self.view = View::Chat;
         cx.notify();
     }
 
@@ -2662,6 +2795,7 @@ impl Render for Shell {
             // Cached: re-rendered only when the sidebar itself is notified.
             .child(self.sidebar.clone().cached(sidebar_style))
             .child(self.render_main(window, cx))
+            .when_some(self.render_link_confirm(cx), |d, confirm| d.child(confirm))
             .when_some(self.palette.clone(), |d, palette| {
                 d.child(
                     div()
@@ -2685,6 +2819,27 @@ struct RollbackConfirm {
     turns: usize,
     /// Titles of the other threads working in the same folder.
     sharers: Vec<(ThreadId, String)>,
+}
+
+/// Give memory freed by a closed view back to the OS: glibc keeps freed
+/// heap pages otherwise. Once the view's entity is gone (next frame or
+/// so), on a background thread.
+fn trim_heap_soon(cx: &mut Context<Shell>) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    cx.spawn(async move |_, cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(500))
+            .await;
+        cx.background_executor()
+            .spawn(async {
+                // SAFETY: malloc_trim has no preconditions.
+                unsafe { libc::malloc_trim(0) };
+            })
+            .await;
+    })
+    .detach();
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = cx;
 }
 
 /// "Completed", "Failed", … for notifications.

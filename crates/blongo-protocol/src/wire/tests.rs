@@ -123,6 +123,7 @@ fn snapshots_and_deltas_round_trip() {
             next_run_at: Some(Timestamp(5)),
             last_run_at: None,
             last_thread_id: None,
+            proposed_by: None,
         }],
     };
     let run = Run::new(

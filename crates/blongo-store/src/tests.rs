@@ -567,6 +567,7 @@ fn usage_parent_thread_and_schedules_round_trip() {
         next_run_at: Some(Timestamp(7)),
         last_run_at: None,
         last_thread_id: None,
+        proposed_by: None,
     };
     store
         .commit(Batch {
@@ -599,6 +600,7 @@ fn usage_parent_thread_and_schedules_round_trip() {
         next_run_at: None,
         last_run_at: Some(Timestamp(8)),
         last_thread_id: Some(child.id),
+        proposed_by: Some(fx.thread.id),
         ..schedule.clone()
     };
     store

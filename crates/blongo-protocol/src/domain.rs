@@ -341,6 +341,11 @@ pub struct Schedule {
     pub last_run_at: Option<Timestamp>,
     /// Thread the last run went to.
     pub last_thread_id: Option<ThreadId>,
+    /// An agent in this thread proposed the schedule (MCP `schedule_task`):
+    /// it stays disabled until the user turns it on, which approves it and
+    /// clears this.
+    #[serde(default)]
+    pub proposed_by: Option<ThreadId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -572,6 +577,9 @@ pub enum Command {
         prompt: String,
         #[serde(default)]
         provider: ProviderKind,
+        /// Proposed by an agent in this thread: created disabled.
+        #[serde(default)]
+        proposed_by: Option<ThreadId>,
     },
     /// Change a schedule (`None` fields stay as they are).
     #[serde(rename = "schedule.update")]

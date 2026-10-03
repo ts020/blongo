@@ -118,6 +118,12 @@ CREATE TABLE schedules (
 );
 "#,
     ),
+    (
+        4,
+        r#"
+ALTER TABLE schedules ADD COLUMN proposed_by TEXT;
+"#,
+    ),
 ];
 
 pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;
