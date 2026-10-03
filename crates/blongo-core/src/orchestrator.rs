@@ -138,6 +138,8 @@ pub(crate) struct Orchestrator {
     post: Vec<Post>,
     /// Threads whose run just ended and whose queue may start.
     ready: Vec<ThreadId>,
+    /// An Antigravity install is running (one at a time).
+    installing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) async fn run(
@@ -177,6 +179,7 @@ pub(crate) async fn run(
         flush_deadline: None,
         post: Vec::new(),
         ready: Vec::new(),
+        installing: Default::default(),
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");
@@ -1720,7 +1723,20 @@ impl Orchestrator {
     }
 
     fn import_t3(&mut self, source: &Path) {
-        let result = crate::t3_import::import(&mut self.store, source);
+        let busy: Vec<ThreadId> = self
+            .rt
+            .iter()
+            .filter(|(_, rt)| rt.run.is_some() || !rt.queue.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        let result = crate::t3_import::import(&mut self.store, source, &|id| busy.contains(&id));
+        // Threads that got turns the provider never saw start a fresh
+        // provider conversation.
+        if let Ok(report) = &result {
+            for thread_id in &report.updated_threads {
+                self.release_session(*thread_id);
+            }
+        }
         let reload = (|| -> anyhow::Result<()> {
             self.projects = self
                 .store
@@ -1759,9 +1775,22 @@ impl Orchestrator {
     }
 
     fn install_antigravity(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.installing.swap(true, Ordering::AcqRel) {
+            // A second click while installing: the running install reports.
+            return;
+        }
+        let installing = self.installing.clone();
         let out = self.out.clone();
         let target = self.config.antigravity_install.clone();
         tokio::spawn(async move {
+            struct Done(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _done = Done(installing);
             let fail = |message: String| {
                 let _ = out.send(CoreEvent::Install(InstallState::Failed(message)));
             };

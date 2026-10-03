@@ -34,7 +34,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "sync", "time"] }
 mimalloc = { version = "0.1", default-features = false }
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 dirs = "6"
 unicode-segmentation = "1"
 sha2 = "0.10"

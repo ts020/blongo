@@ -45,10 +45,14 @@ fn scratch() -> PathBuf {
 }
 
 fn synthetic_db(dir: &Path, workspace: &Path) -> PathBuf {
+    synthetic_db_with(dir, workspace, SCHEMA, true)
+}
+
+fn synthetic_db_with(dir: &Path, workspace: &Path, schema: &str, keep_open: bool) -> PathBuf {
     let path = dir.join("statev2.sqlite");
     let conn = Connection::open(&path).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-    conn.execute_batch(SCHEMA).unwrap();
+    conn.execute_batch(schema).unwrap();
     let now = "2026-05-01T12:00:00.000Z";
     conn.execute(
         "INSERT INTO projection_projects VALUES ('p1', 'Demo', ?1, NULL, '[]', ?2, ?2, NULL)",
@@ -173,8 +177,10 @@ fn synthetic_db(dir: &Path, workspace: &Path) -> PathBuf {
         )
         .unwrap();
     }
-    // Leave the last writes in the WAL (no checkpoint), like a running t3.
-    std::mem::forget(conn);
+    if keep_open {
+        // Leave the last writes in the WAL (no checkpoint), like a running t3.
+        std::mem::forget(conn);
+    }
     path
 }
 
@@ -198,7 +204,7 @@ fn imports_projects_threads_runs_and_items_read_only() {
     let (db_before, wal_before) = (digest(&source), digest(&wal));
 
     let mut store = Store::open(&dir.join("blongo.sqlite")).unwrap();
-    let report = import(&mut store, &source).unwrap();
+    let report = import(&mut store, &source, &|_| false).unwrap();
     assert_eq!(
         report,
         ImportReport {
@@ -206,7 +212,7 @@ fn imports_projects_threads_runs_and_items_read_only() {
             threads: 2,
             runs: 3,
             items: 10,
-            skipped_threads: 0,
+            ..ImportReport::default()
         }
     );
     // The source is byte-for-byte unchanged and no files appeared next to
@@ -276,7 +282,7 @@ fn imports_projects_threads_runs_and_items_read_only() {
     );
 
     // Importing again adds nothing.
-    let again = import(&mut store, &source).unwrap();
+    let again = import(&mut store, &source, &|_| false).unwrap();
     assert_eq!(
         again,
         ImportReport {
@@ -291,13 +297,96 @@ fn imports_projects_threads_runs_and_items_read_only() {
 fn rejects_files_that_are_not_t3code_databases() {
     let dir = scratch();
     let mut store = Store::open(&dir.join("blongo.sqlite")).unwrap();
-    assert!(import(&mut store, &dir.join("missing.sqlite")).is_err());
+    assert!(import(&mut store, &dir.join("missing.sqlite"), &|_| false).is_err());
     let other = dir.join("other.sqlite");
     Connection::open(&other)
         .unwrap()
         .execute_batch("CREATE TABLE x (a)")
         .unwrap();
-    let err = import(&mut store, &other).unwrap_err();
+    let err = import(&mut store, &other, &|_| false).unwrap_err();
     assert!(err.to_string().contains("not a t3code"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn reimport_adds_new_turns_and_skips_unreadable_rows() {
+    let dir = scratch();
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source_dir = dir.join("t3");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    // t3code closed cleanly (no -wal / -shm left), with a schema loose
+    // enough to hold NULLs.
+    let loose = SCHEMA.replace(" NOT NULL", "");
+    let source = synthetic_db_with(&source_dir, &workspace, &loose, false);
+    let conn = Connection::open(&source).unwrap();
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title,
+         default_provider, created_at, updated_at) VALUES ('t9', 'p1', NULL, NULL, NULL, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items (turn_item_id, thread_id, ordinal,
+         type, payload_json) VALUES (NULL, 't1', 99, 'user_message', '{}')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let mut store = Store::open(&dir.join("blongo.sqlite")).unwrap();
+    let report = import(&mut store, &source, &|_| false).unwrap();
+    assert_eq!(
+        report.threads, 3,
+        "the NULL-titled thread is still imported"
+    );
+    assert_eq!(report.bad_rows, 1, "the item without an id is skipped");
+    let threads = store.threads(true).unwrap();
+    let fix = threads
+        .iter()
+        .find(|t| t.title == "Fix the build")
+        .unwrap()
+        .clone();
+    assert!(threads.iter().any(|t| t.title == "Imported thread"));
+    let before = store.items(fix.id).unwrap().len();
+
+    // t3code goes on with the thread.
+    let conn = Connection::open(&source).unwrap();
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_runs (run_id, thread_id, ordinal, provider,
+         status, requested_at, payload_json) VALUES
+         ('r4', 't1', 3, 'codex', 'completed', '2026-05-02T00:00:00.000Z', '{}')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items (turn_item_id, thread_id, run_id,
+         ordinal, type, status, updated_at, payload_json) VALUES
+         ('i20', 't1', 'r4', 20, 'user_message', 'completed', '2026-05-02T00:00:00.000Z',
+          '{\"text\":\"one more thing\"}')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    // Busy in Blongo: left alone this time.
+    let busy = import(&mut store, &source, &|id| id == fix.id).unwrap();
+    assert!(busy.updated_threads.is_empty());
+    assert_eq!(store.items(fix.id).unwrap().len(), before);
+    let again = import(&mut store, &source, &|_| false).unwrap();
+    assert_eq!(again.updated_threads, vec![fix.id]);
+    assert_eq!((again.threads, again.runs, again.items), (0, 1, 1));
+    let items = store.items(fix.id).unwrap();
+    assert_eq!(items.len(), before + 1);
+    let last = items.last().unwrap();
+    assert_eq!(&*last.text, "one more thing");
+    assert!(last.ordinal > items[items.len() - 2].ordinal);
+    let runs = store.runs(fix.id).unwrap();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(last.run_id, Some(runs[2].id));
+    // Nothing was left next to the source.
+    let names: Vec<_> = std::fs::read_dir(&source_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["statev2.sqlite"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

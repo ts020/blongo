@@ -1,9 +1,12 @@
 //! One-way, read-only import of t3code's local history (`statev2.sqlite`).
 //!
-//! t3code's database is never opened in place: the file (and its `-wal`
-//! when present) is copied to a temporary directory and the copy is opened
-//! read-only, so neither the database nor its WAL/SHM files can be touched
-//! even by SQLite's own recovery. Tables read (t3code migration
+//! Everything is read from a snapshot in a private (0700) temporary
+//! directory. While t3code is running (its `-wal` exists), the snapshot is
+//! taken with SQLite's online backup API through a read-only connection,
+//! which sees one committed state even while t3code keeps writing. When
+//! there is no `-wal` (t3code closed cleanly), opening the file at all
+//! would make SQLite create `-wal`/`-shm` next to it, so the file is copied
+//! instead and the copy integrity-checked. Tables read (t3code migration
 //! 005_Projections and 055_OrchestrationV2):
 //!
 //! - `projection_projects` (project_id, title, workspace_root, deleted_at)
@@ -16,10 +19,14 @@
 //!   file changes, todo lists, notices and errors; other kinds are skipped.
 //!
 //! Ids are derived from t3code's (UUID v5), so importing again only adds
-//! what is new. Imported threads have no provider session: their next
-//! message hands the conversation over as context.
+//! what is new: new threads, and new turns and items of threads imported
+//! before (appended after what the thread already has; a thread that is
+//! running in Blongo is left alone until the next import). Rows Blongo
+//! cannot read (NULLs in required columns) are skipped and counted.
+//! Imported threads have no provider session: their next message hands the
+//! conversation over as context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,8 +49,12 @@ pub struct ImportReport {
     pub threads: usize,
     pub runs: usize,
     pub items: usize,
-    /// Threads already imported earlier.
+    /// Threads already imported earlier with nothing new.
     pub skipped_threads: usize,
+    /// Threads imported earlier that got new turns or items.
+    pub updated_threads: Vec<ThreadId>,
+    /// Rows skipped because they could not be read.
+    pub bad_rows: usize,
 }
 
 /// t3code's default database location (`~/.t3/userdata/statev2.sqlite`).
@@ -55,39 +66,98 @@ fn derived(kind: &str, id: &str) -> Uuid {
     Uuid::new_v5(&NAMESPACE, format!("t3code:{kind}:{id}").as_bytes())
 }
 
-/// Copy `source` (+ `-wal`) into a private temp dir and open the copy.
-fn open_copy(source: &Path) -> anyhow::Result<(Connection, PathBuf)> {
+/// A private (0700) temporary directory, removed on drop.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn new() -> anyhow::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = std::env::temp_dir();
+        for attempt in 0..16u32 {
+            let dir = base.join(format!(
+                "blongo-t3-import-{}-{}-{attempt}",
+                std::process::id(),
+                Timestamp::now().0
+            ));
+            // `create` (not `create_all`): fails if someone else made it.
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).context("creating a temporary directory"),
+            }
+        }
+        bail!("could not create a private temporary directory")
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Snapshot `source` with the online backup API into `dir` and open the
+/// snapshot.
+fn open_snapshot(source: &Path, dir: &PrivateDir) -> anyhow::Result<Connection> {
     if !source.is_file() {
         bail!("{} does not exist", source.display());
     }
-    let dir = std::env::temp_dir().join(format!(
-        "blongo-t3-import-{}-{}",
-        std::process::id(),
-        Timestamp::now().0
-    ));
-    std::fs::create_dir_all(&dir)?;
-    let copy = dir.join("statev2.sqlite");
-    std::fs::copy(source, &copy).with_context(|| format!("copying {}", source.display()))?;
+    let copy = dir.0.join("statev2.sqlite");
     let wal = PathBuf::from(format!("{}-wal", source.display()));
-    if wal.is_file() {
-        std::fs::copy(&wal, dir.join("statev2.sqlite-wal"))?;
+    if !wal.exists() {
+        std::fs::copy(source, &copy).with_context(|| format!("copying {}", source.display()))?;
+        let conn = Connection::open(&copy)?;
+        let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if check != "ok" {
+            bail!(
+                "{} changed while it was read (is t3code starting?); try again",
+                source.display()
+            );
+        }
+        return Ok(conn);
     }
-    // The copy may need its WAL replayed, so it is opened writable; the
-    // original is never opened at all.
-    let conn = Connection::open_with_flags(
-        &copy,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    Ok((conn, dir))
+    let original = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", source.display()))?;
+    original.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mut conn = Connection::open(&copy)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&original, &mut conn)?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(5), None)
+            .with_context(|| format!("reading {}", source.display()))?;
+    }
+    drop(original);
+    Ok(conn)
 }
 
-/// Import everything new from `source` into `store`.
-pub fn import(store: &mut Store, source: &Path) -> anyhow::Result<ImportReport> {
-    let (conn, tmp) = open_copy(source)?;
-    let result = import_from(store, &conn);
+/// Import everything new from `source` into `store`. `busy` threads (a run
+/// or queue in Blongo) do not get new turns this time.
+pub fn import(
+    store: &mut Store,
+    source: &Path,
+    busy: &dyn Fn(ThreadId) -> bool,
+) -> anyhow::Result<ImportReport> {
+    let dir = PrivateDir::new()?;
+    let conn = open_snapshot(source, &dir)?;
+    let result = import_from(store, &conn, busy);
     drop(conn);
-    let _ = std::fs::remove_dir_all(&tmp);
+    drop(dir);
     result
+}
+
+/// Collect readable rows; count the rest.
+fn rows<T>(iter: impl Iterator<Item = rusqlite::Result<Option<T>>>, bad: &mut usize) -> Vec<T> {
+    let mut out = Vec::new();
+    for row in iter {
+        match row {
+            Ok(Some(row)) => out.push(row),
+            Ok(None) | Err(_) => *bad += 1,
+        }
+    }
+    out
 }
 
 struct T3Project {
@@ -96,7 +166,11 @@ struct T3Project {
     root: String,
 }
 
-fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportReport> {
+fn import_from(
+    store: &mut Store,
+    conn: &Connection,
+    busy: &dyn Fn(ThreadId) -> bool,
+) -> anyhow::Result<ImportReport> {
     let mut report = ImportReport::default();
     let has = |table: &str| -> anyhow::Result<bool> {
         Ok(conn
@@ -116,14 +190,17 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
             "SELECT project_id, title, workspace_root FROM projection_projects
              WHERE deleted_at IS NULL ORDER BY created_at",
         )?;
-        stmt.query_map([], |r| {
-            Ok(T3Project {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                root: r.get(2)?,
-            })
-        })?
-        .collect::<Result<_, _>>()?
+        let iter = stmt.query_map([], |r| {
+            let (Some(id), Some(root)) = (r.get::<_, Option<String>>(0)?, r.get(2)?) else {
+                return Ok(None);
+            };
+            Ok(Some(T3Project {
+                id,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                root,
+            }))
+        })?;
+        rows(iter, &mut report.bad_rows)
     } else {
         Vec::new()
     };
@@ -181,63 +258,109 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
         String,
         Option<String>,
     );
-    let threads: Vec<Row> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        })?
-        .collect::<Result<_, _>>()?;
+    let iter = stmt.query_map([], |r| {
+        let (Some(id), Some(project)) = (
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ) else {
+            return Ok(None);
+        };
+        let text = |i: usize| -> rusqlite::Result<String> {
+            Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
+        };
+        Ok(Some((
+            id,
+            project,
+            text(2)?,
+            text(3)?,
+            text(4)?,
+            text(5)?,
+            r.get(6)?,
+        )))
+    })?;
+    let threads: Vec<Row> = rows(iter, &mut report.bad_rows);
+    drop(stmt);
     for (t3_id, t3_project, title, provider, created, updated, archived) in threads {
         let Some(project_id) = project_ids.get(&t3_project).copied() else {
             continue;
         };
         let thread_id = ThreadId(derived("thread", &t3_id));
-        if store.thread(thread_id)?.is_some() {
-            report.skipped_threads += 1;
-            continue;
-        }
         let mut events = Vec::new();
-        let mut thread = Thread::new(
-            thread_id,
-            project_id,
-            if title.trim().is_empty() {
-                "Imported thread"
-            } else {
-                title.trim()
-            },
-            parse_time(&created),
-        );
-        thread.updated_at = parse_time(&updated);
-        thread.provider = provider_kind(&provider);
-        thread.archived = archived.is_some();
-        // No provider session to resume: the next message carries the
-        // conversation.
-        thread.pending_context = Some(PendingContext::Handoff);
-        events.push(EventKind::ThreadCreated { thread });
+        let existing = store.thread(thread_id)?;
+        // What an earlier import (or Blongo itself) already has.
+        let (known_runs, known_items, mut ordinal, mut last_created) = match &existing {
+            Some(_) if busy(thread_id) => {
+                report.skipped_threads += 1;
+                continue;
+            }
+            Some(_) => {
+                let runs = store.runs(thread_id)?;
+                let items = store.items(thread_id)?;
+                let last = runs
+                    .iter()
+                    .map(|r| r.created_at.0)
+                    .max()
+                    .unwrap_or(i64::MIN);
+                let next = items.iter().map(|i| i.ordinal + 1).max().unwrap_or(0);
+                (
+                    runs.into_iter().map(|r| r.id).collect::<HashSet<_>>(),
+                    items.into_iter().map(|i| i.id).collect::<HashSet<_>>(),
+                    next,
+                    last,
+                )
+            }
+            None => {
+                let mut thread = Thread::new(
+                    thread_id,
+                    project_id,
+                    if title.trim().is_empty() {
+                        "Imported thread"
+                    } else {
+                        title.trim()
+                    },
+                    parse_time(&created),
+                );
+                thread.updated_at = parse_time(&updated);
+                thread.provider = provider_kind(&provider);
+                thread.archived = archived.is_some();
+                // No provider session to resume: the next message carries
+                // the conversation.
+                thread.pending_context = Some(PendingContext::Handoff);
+                events.push(EventKind::ThreadCreated { thread });
+                (HashSet::new(), HashSet::new(), 0u32, i64::MIN)
+            }
+        };
 
         let mut runs_stmt = conn.prepare_cached(
             "SELECT run_id, provider, status, requested_at, completed_at
              FROM orchestration_v2_projection_runs WHERE thread_id = ?1 ORDER BY ordinal",
         )?;
-        let runs: Vec<(String, String, String, String, Option<String>)> = runs_stmt
-            .query_map([&t3_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<Result<_, _>>()?;
+        let iter = runs_stmt.query_map([&t3_id], |r| {
+            let Some(id) = r.get::<_, Option<String>>(0)? else {
+                return Ok(None);
+            };
+            let text = |i: usize| -> rusqlite::Result<String> {
+                Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
+            };
+            Ok(Some((
+                id,
+                text(1)?,
+                text(2)?,
+                text(3)?,
+                r.get::<_, Option<String>>(4)?,
+            )))
+        })?;
+        let runs = rows(iter, &mut report.bad_rows);
         let mut run_ids = HashMap::new();
-        let mut last_created = i64::MIN;
+        let mut new_runs = 0;
         for (t3_run, run_provider, status, requested, completed) in runs {
             let id = RunId(derived("run", &t3_run));
             run_ids.insert(t3_run, id);
+            if known_runs.contains(&id) {
+                continue;
+            }
             // Runs are listed by creation time: keep t3code's order even
-            // when timestamps tie.
+            // when timestamps tie, after the runs the thread already has.
             let created = parse_time(&requested).0.max(last_created.saturating_add(1));
             last_created = created;
             let mut run = Run::new(
@@ -249,7 +372,7 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
             );
             run.ended_at = completed.as_deref().map(parse_time);
             events.push(EventKind::RunCreated { run });
-            report.runs += 1;
+            new_runs += 1;
         }
 
         let mut items_stmt = conn.prepare_cached(
@@ -257,13 +380,28 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
              FROM orchestration_v2_projection_turn_items
              WHERE thread_id = ?1 ORDER BY ordinal, turn_item_id",
         )?;
-        let rows: Vec<(String, Option<String>, String, String, String)> = items_stmt
-            .query_map([&t3_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        let mut ordinal = 0u32;
-        for (t3_item, t3_run, kind, updated_at, payload) in rows {
+        let iter = items_stmt.query_map([&t3_id], |r| {
+            let (Some(id), Some(kind)) = (
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(2)?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some((
+                id,
+                r.get::<_, Option<String>>(1)?,
+                kind,
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            )))
+        })?;
+        let item_rows = rows(iter, &mut report.bad_rows);
+        let mut new_items = 0;
+        for (t3_item, t3_run, kind, updated_at, payload) in item_rows {
+            let id = ItemId(derived("item", &t3_item));
+            if known_items.contains(&id) {
+                continue;
+            }
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
             let Some((kind, text)) = item_kind(&kind, &payload) else {
                 continue;
@@ -271,7 +409,7 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
             let run_id = t3_run.and_then(|r| run_ids.get(&r).copied());
             events.push(EventKind::ItemAdded {
                 item: Arc::new(TurnItem {
-                    id: ItemId(derived("item", &t3_item)),
+                    id,
                     thread_id,
                     run_id,
                     ordinal,
@@ -281,14 +419,37 @@ fn import_from(store: &mut Store, conn: &Connection) -> anyhow::Result<ImportRep
                 }),
             });
             ordinal += 1;
-            report.items += 1;
+            new_items += 1;
         }
+        if let Some(thread) = &existing {
+            if new_runs == 0 && new_items == 0 {
+                report.skipped_threads += 1;
+                continue;
+            }
+            // The provider never saw these turns: the next message hands
+            // the whole conversation over again.
+            if thread.provider_thread_id.is_some()
+                || thread.pending_context != Some(PendingContext::Handoff)
+            {
+                events.push(EventKind::ThreadProviderChanged {
+                    thread_id,
+                    provider: thread.provider,
+                    model: thread.model.clone(),
+                    provider_thread_id: None,
+                    pending_context: Some(PendingContext::Handoff),
+                });
+            }
+            report.updated_threads.push(thread_id);
+        } else {
+            report.threads += 1;
+        }
+        report.runs += new_runs;
+        report.items += new_items;
         store.commit(Batch {
             command_id: None,
             events,
             effects: vec![],
         })?;
-        report.threads += 1;
     }
     Ok(report)
 }

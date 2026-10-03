@@ -144,13 +144,15 @@ fn import_t3(config: CoreConfig, source: Option<std::path::PathBuf>) -> i32 {
         match events.blocking_recv() {
             Some(blongo_core::CoreEvent::Imported(Ok(r))) => {
                 println!(
-                    "imported from {}: {} projects, {} threads, {} runs, {} items ({} threads already imported)",
+                    "imported from {}: {} projects, {} threads, {} runs, {} items ({} threads updated, {} unchanged, {} unreadable rows skipped)",
                     source.display(),
                     r.projects,
                     r.threads,
                     r.runs,
                     r.items,
-                    r.skipped_threads
+                    r.updated_threads.len(),
+                    r.skipped_threads,
+                    r.bad_rows
                 );
                 break 0;
             }
