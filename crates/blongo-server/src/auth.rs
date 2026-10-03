@@ -18,12 +18,11 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use blongo_client::handshake::normalize_code;
 use blongo_client::secret::{
     ProofError, b64, ct_eq, new_token, private_dir, random, sha256, unb64, unix_now, verify_proof,
     write_private,
 };
-use blongo_protocol::wire::{PROOF_MAX_AGE_SECS, PROOF_MAX_SKEW_SECS, Proof, ProofPurpose};
+use blongo_protocol::wire::{PROOF_REPLAY_WINDOW_SECS, Proof, ProofPurpose};
 use serde::{Deserialize, Serialize};
 
 /// Pairing codes: unambiguous characters, 10 of them (~49 bits).
@@ -74,7 +73,6 @@ struct PairingCodes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthError {
     UnknownDevice,
-    BadToken,
     BadProof(ProofError),
     ReplayedProof,
     BadCode,
@@ -86,7 +84,6 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownDevice => write!(f, "unknown device"),
-            Self::BadToken => write!(f, "bad token"),
             Self::BadProof(e) => write!(f, "bad proof ({e:?})"),
             Self::ReplayedProof => write!(f, "replayed proof"),
             Self::BadCode => write!(f, "unknown, used or expired pairing code"),
@@ -108,7 +105,7 @@ impl ReplayCache {
     /// `false`: this jti was seen within the proof lifetime.
     fn insert(&mut self, jti: &[u8], now: u64) -> bool {
         while let Some((_, at)) = self.order.front() {
-            if now.saturating_sub(*at) > PROOF_MAX_AGE_SECS + PROOF_MAX_SKEW_SECS
+            if now.saturating_sub(*at) > PROOF_REPLAY_WINDOW_SECS
                 || self.order.len() >= MAX_REMEMBERED_PROOFS
             {
                 let (old, _) = self.order.pop_front().expect("front");
@@ -212,11 +209,17 @@ impl AuthStore {
     /// Create a one-time pairing code valid for `ttl_secs`. Only its hash
     /// is stored; the returned text is shown once.
     pub fn add_pairing_code(&self, ttl_secs: u64) -> Result<String, AuthError> {
-        let bytes = random::<CODE_LEN>();
-        let code: String = bytes
-            .iter()
-            .map(|b| CODE_ALPHABET[*b as usize % CODE_ALPHABET.len()] as char)
-            .collect();
+        // Rejection sampling: only bytes below the largest multiple of the
+        // alphabet size, so every character is equally likely.
+        let limit = 256 - 256 % CODE_ALPHABET.len();
+        let mut code = String::with_capacity(CODE_LEN);
+        while code.len() < CODE_LEN {
+            for b in random::<16>() {
+                if (b as usize) < limit && code.len() < CODE_LEN {
+                    code.push(CODE_ALPHABET[b as usize % CODE_ALPHABET.len()] as char);
+                }
+            }
+        }
         let now = self.now();
         self.locked(|| {
             let mut codes: PairingCodes = self.read("pairing.json")?;
@@ -254,12 +257,11 @@ impl AuthStore {
         }
     }
 
-    /// Authenticate a paired device: its token (constant-time against the
-    /// stored hash) and a fresh proof made with its bound key.
+    /// Authenticate a paired device: a proof made with its bound key over
+    /// the SHA-256 of its token, which is all the server keeps of it.
     pub fn verify_token(
         &self,
         device_id: &str,
-        token: &str,
         proof: &Proof,
         nonce: &[u8],
     ) -> Result<Device, AuthError> {
@@ -271,10 +273,7 @@ impl AuthStore {
             .find(|d| ct_eq(d.id.as_bytes(), device_id.as_bytes()))
             .ok_or(AuthError::UnknownDevice)?
             .clone();
-        let stored = unb64(&device.token_sha256).unwrap_or_default();
-        if !ct_eq(&stored, &sha256(token.as_bytes())) {
-            return Err(AuthError::BadToken);
-        }
+        let stored = unb64(&device.token_sha256).ok_or(AuthError::KeyMismatch)?;
         let public_key = unb64(&device.public_key).ok_or(AuthError::KeyMismatch)?;
         verify_proof(
             proof,
@@ -282,10 +281,7 @@ impl AuthStore {
             ProofPurpose::Token,
             &self.server_id,
             nonce,
-            token,
-            now,
-            PROOF_MAX_AGE_SECS,
-            PROOF_MAX_SKEW_SECS,
+            &stored,
         )
         .map_err(AuthError::BadProof)?;
         self.check_replay(proof, now)?;
@@ -301,46 +297,43 @@ impl AuthStore {
     }
 
     /// Trade a pairing code for a device credential bound to `public_key`.
-    /// The code is consumed on success. Returns the device and its token.
+    /// The code itself is not presented: the proof signs its SHA-256, and
+    /// the server tries the proof against every outstanding code. The code
+    /// is consumed on success. Returns the device and its token.
     pub fn pair(
         &self,
-        code: &str,
         device_name: &str,
         public_key: &[u8],
         proof: &Proof,
         nonce: &[u8],
     ) -> Result<(Device, String), AuthError> {
         let now = self.now();
-        let code = normalize_code(code);
         if public_key.len() != 32 {
             return Err(AuthError::KeyMismatch);
         }
         let result = self.locked(|| {
             let mut codes: PairingCodes = self.read("pairing.json")?;
             codes.codes.retain(|c| c.expires_at > now);
-            let hash = sha256(code.as_bytes());
-            // Compare against every code (no early exit on a match).
+            // Every code is tried (no early exit on a match).
             let mut found = None;
             for (i, c) in codes.codes.iter().enumerate() {
-                if ct_eq(&unb64(&c.code_sha256).unwrap_or_default(), &hash) {
+                let hash = unb64(&c.code_sha256).unwrap_or_default();
+                if verify_proof(
+                    proof,
+                    public_key,
+                    ProofPurpose::Pair,
+                    &self.server_id,
+                    nonce,
+                    &hash,
+                )
+                .is_ok()
+                {
                     found = Some(i);
                 }
             }
             let Some(index) = found else {
                 return Err(AuthError::BadCode);
             };
-            verify_proof(
-                proof,
-                public_key,
-                ProofPurpose::Pair,
-                &self.server_id,
-                nonce,
-                &code,
-                now,
-                PROOF_MAX_AGE_SECS,
-                PROOF_MAX_SKEW_SECS,
-            )
-            .map_err(AuthError::BadProof)?;
             self.check_replay(proof, now)?;
             codes.codes.remove(index);
             self.write("pairing.json", &codes)?;
@@ -358,10 +351,7 @@ impl AuthStore {
             self.write("devices.json", &devices)?;
             Ok((device, token))
         });
-        if matches!(
-            result,
-            Err(AuthError::BadCode) | Err(AuthError::BadProof(_))
-        ) {
+        if matches!(result, Err(AuthError::BadCode)) {
             self.pair_failed(now);
         }
         result
@@ -388,18 +378,20 @@ impl AuthStore {
             .unwrap_or_default()
     }
 
-    /// Remove a device by id or name. New connections with its token fail
-    /// from now on.
-    pub fn revoke(&self, id_or_name: &str) -> Result<usize, AuthError> {
+    /// Remove devices by id or name; returns the ids removed. New
+    /// connections with their tokens fail from now on; a running server
+    /// also closes their live connections when asked through its socket
+    /// (`ClientMsg::Revoke`).
+    pub fn revoke(&self, id_or_name: &str) -> Result<Vec<String>, AuthError> {
         self.locked(|| {
             let mut devices: Devices = self.read("devices.json")?;
-            let before = devices.devices.len();
-            devices
+            let (gone, kept): (Vec<Device>, Vec<Device>) = devices
                 .devices
-                .retain(|d| d.id != id_or_name && d.name != id_or_name);
-            let removed = before - devices.devices.len();
+                .into_iter()
+                .partition(|d| d.id == id_or_name || d.name == id_or_name);
+            devices.devices = kept;
             self.write("devices.json", &devices)?;
-            Ok(removed)
+            Ok(gone.into_iter().map(|d| d.id).collect())
         })
     }
 }
@@ -410,6 +402,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use blongo_client::handshake::normalize_code;
     use blongo_client::secret::{make_proof, new_device_key};
 
     fn temp() -> PathBuf {
@@ -430,13 +423,7 @@ mod tests {
             &normalize_code(code),
         );
         store
-            .pair(
-                code,
-                "laptop",
-                &key.verifying_key().to_bytes(),
-                &proof,
-                &nonce,
-            )
+            .pair("laptop", &key.verifying_key().to_bytes(), &proof, &nonce)
             .map(|(d, t)| (d, t, key))
     }
 
@@ -446,6 +433,10 @@ mod tests {
         let store = AuthStore::open(&dir).unwrap();
         let code = store.add_pairing_code(600).unwrap();
         assert_eq!(code.len(), 11);
+        assert!(
+            code.chars()
+                .all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8)))
+        );
         // Case and separators do not matter.
         let typed = code.to_lowercase().replace('-', " ");
         let (device, token, key) = pair_new(&store, &typed).unwrap();
@@ -455,23 +446,17 @@ mod tests {
 
         let nonce = random::<32>();
         let proof = make_proof(&key, ProofPurpose::Token, store.server_id(), &nonce, &token);
-        assert!(
-            store
-                .verify_token(&device.id, &token, &proof, &nonce)
-                .is_ok()
-        );
+        assert!(store.verify_token(&device.id, &proof, &nonce).is_ok());
 
         // Same proof again (replay): refused even on the same nonce.
         assert_eq!(
-            store
-                .verify_token(&device.id, &token, &proof, &nonce)
-                .unwrap_err(),
+            store.verify_token(&device.id, &proof, &nonce).unwrap_err(),
             AuthError::ReplayedProof
         );
         // A proof for another connection's nonce fails the signature.
         let proof = make_proof(&key, ProofPurpose::Token, store.server_id(), &nonce, &token);
         assert!(matches!(
-            store.verify_token(&device.id, &token, &proof, &random::<32>()),
+            store.verify_token(&device.id, &proof, &random::<32>()),
             Err(AuthError::BadProof(ProofError::BadSignature))
         ));
         // A stolen token without the key.
@@ -484,21 +469,17 @@ mod tests {
             &token,
         );
         assert!(matches!(
-            store.verify_token(&device.id, &token, &proof, &nonce),
+            store.verify_token(&device.id, &proof, &nonce),
             Err(AuthError::BadProof(ProofError::BadSignature))
         ));
-        // A wrong token with the right key.
+        // The key without the token.
         let proof = make_proof(&key, ProofPurpose::Token, store.server_id(), &nonce, "nope");
+        assert!(matches!(
+            store.verify_token(&device.id, &proof, &nonce),
+            Err(AuthError::BadProof(ProofError::BadSignature))
+        ));
         assert_eq!(
-            store
-                .verify_token(&device.id, "nope", &proof, &nonce)
-                .unwrap_err(),
-            AuthError::BadToken
-        );
-        assert_eq!(
-            store
-                .verify_token("someone", &token, &proof, &nonce)
-                .unwrap_err(),
+            store.verify_token("someone", &proof, &nonce).unwrap_err(),
             AuthError::UnknownDevice
         );
 
@@ -519,19 +500,18 @@ mod tests {
         }
 
         // Revoked: the token stops working.
-        assert_eq!(store.revoke("laptop").unwrap(), 1);
+        assert_eq!(store.revoke("laptop").unwrap(), vec![device.id.clone()]);
+        assert!(store.revoke("laptop").unwrap().is_empty());
         let proof = make_proof(&key, ProofPurpose::Token, store.server_id(), &nonce, &token);
         assert_eq!(
-            store
-                .verify_token(&device.id, &token, &proof, &nonce)
-                .unwrap_err(),
+            store.verify_token(&device.id, &proof, &nonce).unwrap_err(),
             AuthError::UnknownDevice
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn expired_codes_and_stale_proofs_fail() {
+    fn expired_codes_fail_and_client_clock_skew_does_not_matter() {
         let dir = temp();
         let clock = Arc::new(AtomicU64::new(unix_now()));
         let c = clock.clone();
@@ -543,16 +523,17 @@ mod tests {
         assert_eq!(pair_new(&store, &code).unwrap_err(), AuthError::BadCode);
         assert_eq!(store.pending_codes(), 0);
 
-        // A proof made 10 minutes before the server's clock.
+        // A client whose clock is an hour off still pairs and connects:
+        // the per-connection nonce makes proofs fresh, not `iat`.
         let code = store.add_pairing_code(3600).unwrap();
-        clock.fetch_add(600, Ordering::SeqCst);
-        assert!(matches!(
-            pair_new(&store, &code).unwrap_err(),
-            AuthError::BadProof(ProofError::TimeWindow)
-        ));
-        // A failed proof does not consume the code.
-        clock.store(unix_now(), Ordering::SeqCst);
-        assert!(pair_new(&store, &code).is_ok());
+        clock.fetch_add(3600, Ordering::SeqCst);
+        let code2 = store.add_pairing_code(3600).unwrap();
+        let (device, token, key) = pair_new(&store, &code2).unwrap();
+        let nonce = random::<32>();
+        let proof = make_proof(&key, ProofPurpose::Token, store.server_id(), &nonce, &token);
+        assert!(store.verify_token(&device.id, &proof, &nonce).is_ok());
+        // The first code expired meanwhile (server clock).
+        assert_eq!(pair_new(&store, &code).unwrap_err(), AuthError::BadCode);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -569,6 +550,27 @@ mod tests {
         }
         assert_eq!(store.pending_codes(), 0);
         assert_eq!(pair_new(&store, &code).unwrap_err(), AuthError::BadCode);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn code_characters_are_uniform() {
+        let dir = temp();
+        let store = AuthStore::open(&dir).unwrap();
+        let mut counts = [0usize; 30];
+        for _ in 0..400 {
+            for c in store
+                .add_pairing_code(600)
+                .unwrap()
+                .chars()
+                .filter(|c| *c != '-')
+            {
+                counts[CODE_ALPHABET.iter().position(|a| *a as char == c).unwrap()] += 1;
+            }
+        }
+        // 4000 draws over 30 characters: ~133 each. Modulo bias would
+        // give the first 16 characters ~9% more; allow wide noise only.
+        assert!(counts.iter().all(|&n| (70..200).contains(&n)), "{counts:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

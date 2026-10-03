@@ -6,7 +6,7 @@ use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use blongo_protocol::wire::{Proof, ProofPurpose, proof_message};
+use blongo_protocol::wire::{Proof, ProofPurpose, proof_message, secret_sha256};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -69,7 +69,15 @@ pub fn make_proof(
     let iat = unix_now();
     let jti = random::<16>();
     let public = key.verifying_key().to_bytes();
-    let message = proof_message(purpose, server_id, nonce, iat, &jti, secret, &public);
+    let message = proof_message(
+        purpose,
+        server_id,
+        nonce,
+        iat,
+        &jti,
+        &secret_sha256(secret),
+        &public,
+    );
     Proof {
         iat,
         jti: jti.to_vec(),
@@ -82,23 +90,20 @@ pub fn make_proof(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofError {
     Malformed,
-    TimeWindow,
     BadSignature,
 }
 
-/// Check a proof's shape, time window and signature against `public_key`.
-/// Replay of the `jti` is the caller's business (it keeps the cache).
-#[allow(clippy::too_many_arguments)]
+/// Check a proof's shape and signature against `public_key`, for the
+/// secret whose SHA-256 the server stored. Freshness comes from the
+/// connection's nonce (`iat` is signed but not compared with this clock);
+/// replay of the `jti` is the caller's business (it keeps the cache).
 pub fn verify_proof(
     proof: &Proof,
     public_key: &[u8],
     purpose: ProofPurpose,
     server_id: &str,
     nonce: &[u8],
-    secret: &str,
-    now: u64,
-    max_age: u64,
-    max_skew: u64,
+    secret_sha256: &[u8],
 ) -> Result<(), ProofError> {
     let key: [u8; 32] = public_key.try_into().map_err(|_| ProofError::Malformed)?;
     let key = VerifyingKey::from_bytes(&key).map_err(|_| ProofError::Malformed)?;
@@ -110,11 +115,14 @@ pub fn verify_proof(
     if proof.jti.len() != 16 {
         return Err(ProofError::Malformed);
     }
-    if proof.iat > now + max_skew || now.saturating_sub(proof.iat) > max_age {
-        return Err(ProofError::TimeWindow);
-    }
     let message = proof_message(
-        purpose, server_id, nonce, proof.iat, &proof.jti, secret, public_key,
+        purpose,
+        server_id,
+        nonce,
+        proof.iat,
+        &proof.jti,
+        secret_sha256,
+        public_key,
     );
     key.verify(&message, &Signature::from_bytes(&signature))
         .map_err(|_| ProofError::BadSignature)?;
@@ -170,9 +178,9 @@ mod tests {
         let public = key.verifying_key().to_bytes();
         let nonce = random::<32>();
         let proof = make_proof(&key, ProofPurpose::Token, "srv", &nonce, "tok");
-        let now = unix_now();
-        let check = |p: &Proof, purpose, server: &str, nonce: &[u8], secret: &str, now| {
-            verify_proof(p, &public, purpose, server, nonce, secret, now, 300, 5)
+        let now = ();
+        let check = |p: &Proof, purpose, server: &str, nonce: &[u8], secret: &str, _now: ()| {
+            verify_proof(p, &public, purpose, server, nonce, &secret_sha256(secret))
         };
         assert_eq!(
             check(&proof, ProofPurpose::Token, "srv", &nonce, "tok", now),
@@ -194,13 +202,12 @@ mod tests {
             check(&proof, ProofPurpose::Token, "srv", &nonce, "tok2", now),
             Err(ProofError::BadSignature)
         );
+        // A changed timestamp breaks the signature.
+        let mut late = proof.clone();
+        late.iat += 1;
         assert_eq!(
-            check(&proof, ProofPurpose::Token, "srv", &nonce, "tok", now + 301),
-            Err(ProofError::TimeWindow)
-        );
-        assert_eq!(
-            check(&proof, ProofPurpose::Token, "srv", &nonce, "tok", now - 6),
-            Err(ProofError::TimeWindow)
+            check(&late, ProofPurpose::Token, "srv", &nonce, "tok", now),
+            Err(ProofError::BadSignature)
         );
         // Another key's signature.
         let other = make_proof(&new_device_key(), ProofPurpose::Token, "srv", &nonce, "tok");

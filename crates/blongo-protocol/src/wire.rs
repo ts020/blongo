@@ -53,10 +53,11 @@ pub mod caps {
     pub const ALL: [&str; 3] = [TERMINAL, PROVIDER_SETUP, IMPORT];
 }
 
-/// Seconds a proof's `iat` may lag behind the server clock.
-pub const PROOF_MAX_AGE_SECS: u64 = 300;
-/// Seconds a proof's `iat` may run ahead of the server clock.
-pub const PROOF_MAX_SKEW_SECS: u64 = 5;
+/// How long a server remembers a proof's `jti` (defence in depth: every
+/// proof also signs the connection's fresh nonce, which is what makes it
+/// single-use; `iat` is signed but not checked against the server clock,
+/// so clock skew between the machines never locks a client out).
+pub const PROOF_REPLAY_WINDOW_SECS: u64 = 600;
 
 // ------------------------------------------------------------------ client
 
@@ -101,6 +102,13 @@ pub enum ClientMsg {
     TerminalClose {
         id: u32,
     },
+    /// Administration, accepted only on transports the operating system
+    /// authenticated (the server's private Unix socket, SSH stdio): remove
+    /// a paired device and close its live connections. Answered with
+    /// [`ServerMsg::Revoked`].
+    Revoke {
+        device: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,17 +145,14 @@ pub struct Resume {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthRequest {
-    /// A paired device: its bearer token plus a proof made with the key
-    /// bound to it at pairing.
-    Token {
-        device_id: String,
-        token: String,
-        proof: Proof,
-    },
+    /// A paired device: a proof made with the key bound to it at pairing,
+    /// over the SHA-256 of its bearer token. The token itself never
+    /// crosses the wire after pairing.
+    Token { device_id: String, proof: Proof },
     /// Trade a one-time pairing code for a long-lived credential bound to
-    /// `public_key` (Ed25519).
+    /// `public_key` (Ed25519). The code is not sent: the proof covers its
+    /// SHA-256, which the server checks against each outstanding code.
     Pair {
-        code: String,
         device_name: String,
         #[serde(with = "serde_bytes")]
         public_key: Vec<u8>,
@@ -182,13 +187,19 @@ pub enum ProofPurpose {
 /// (`sha256(token)` or `sha256(code)`, never the secret itself) and the
 /// device key, so a captured proof is useless on another connection,
 /// server or credential.
+///
+/// It is not bound to the transport channel: an active man in the middle
+/// who relays the server's challenge to the client and the client's proof
+/// back (possible only where the link is unencrypted and unauthenticated,
+/// e.g. `--insecure-listen` without a TLS proxy) is authenticated as that
+/// device on its own connection. Loopback, Tailscale and SSH rule that out.
 pub fn proof_message(
     purpose: ProofPurpose,
     server_id: &str,
     nonce: &[u8],
     iat: u64,
     jti: &[u8],
-    secret: &str,
+    secret_sha256: &[u8],
     public_key: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(160 + server_id.len());
@@ -202,8 +213,13 @@ pub fn proof_message(
         out.extend_from_slice(part);
     }
     out.extend_from_slice(&iat.to_be_bytes());
-    out.extend_from_slice(&Sha256::digest(secret.as_bytes()));
+    out.extend_from_slice(secret_sha256);
     out
+}
+
+/// SHA-256 of a proof's secret (token or normalized pairing code).
+pub fn secret_sha256(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
 }
 
 // ------------------------------------------------------------------ server
@@ -269,6 +285,11 @@ pub enum ServerMsg {
         id: u32,
         message: String,
     },
+    /// Answer to [`ClientMsg::Revoke`]: devices removed (0: none matched),
+    /// or why it failed.
+    Revoked(Result<usize, String>),
+    /// This connection's device was revoked; the server closes it.
+    DeviceRevoked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

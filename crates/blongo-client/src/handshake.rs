@@ -135,7 +135,6 @@ async fn handshake_inner(
             })?;
             AuthRequest::Token {
                 device_id: cred.device_id.clone(),
-                token: cred.token.clone(),
                 proof: make_proof(
                     &key,
                     ProofPurpose::Token,
@@ -150,7 +149,6 @@ async fn handshake_inner(
             device_name,
             key,
         } => AuthRequest::Pair {
-            code: code.to_owned(),
             device_name: device_name.to_owned(),
             public_key: key.verifying_key().to_bytes().to_vec(),
             proof: make_proof(

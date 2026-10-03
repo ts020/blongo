@@ -203,7 +203,6 @@ fn client_messages_round_trip() {
         )),
         ClientMsg::Auth(AuthRequest::Token {
             device_id: "d".into(),
-            token: "t".into(),
             proof: Proof {
                 iat: 5,
                 jti: vec![1; 16],
@@ -229,6 +228,9 @@ fn client_messages_round_trip() {
         ClientMsg::TerminalInput {
             id: 3,
             data: b"ls\r".to_vec(),
+        },
+        ClientMsg::Revoke {
+            device: "laptop".into(),
         },
     ];
     for msg in msgs {
@@ -344,7 +346,7 @@ fn proof_message_binds_every_input() {
         &[1; 32],
         100,
         &[2; 16],
-        "token",
+        &secret_sha256("token"),
         &[3; 32],
     );
     let variants = [
@@ -354,7 +356,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             100,
             &[2; 16],
-            "token",
+            &secret_sha256("token"),
             &[3; 32],
         ),
         proof_message(
@@ -363,7 +365,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             100,
             &[2; 16],
-            "token",
+            &secret_sha256("token"),
             &[3; 32],
         ),
         proof_message(
@@ -372,7 +374,7 @@ fn proof_message_binds_every_input() {
             &[9; 32],
             100,
             &[2; 16],
-            "token",
+            &secret_sha256("token"),
             &[3; 32],
         ),
         proof_message(
@@ -381,7 +383,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             101,
             &[2; 16],
-            "token",
+            &secret_sha256("token"),
             &[3; 32],
         ),
         proof_message(
@@ -390,7 +392,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             100,
             &[8; 16],
-            "token",
+            &secret_sha256("token"),
             &[3; 32],
         ),
         proof_message(
@@ -399,7 +401,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             100,
             &[2; 16],
-            "token2",
+            &secret_sha256("token2"),
             &[3; 32],
         ),
         proof_message(
@@ -408,7 +410,7 @@ fn proof_message_binds_every_input() {
             &[1; 32],
             100,
             &[2; 16],
-            "token",
+            &secret_sha256("token"),
             &[4; 32],
         ),
     ];
@@ -417,7 +419,15 @@ fn proof_message_binds_every_input() {
     }
     // The secret itself never appears in what is signed.
     let secret = "a-very-distinctive-secret";
-    let msg = proof_message(ProofPurpose::Token, "s", &[], 0, &[], secret, &[]);
+    let msg = proof_message(
+        ProofPurpose::Token,
+        "s",
+        &[],
+        0,
+        &[],
+        &secret_sha256(secret),
+        &[],
+    );
     assert!(!msg.windows(secret.len()).any(|w| w == secret.as_bytes()));
 }
 
