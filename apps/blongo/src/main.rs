@@ -36,7 +36,8 @@
 //! - Profiling (tools/profile.py): `BLONGO_PROFILE_PROMPT` is sent in a
 //!   project for `BLONGO_PROFILE_PROJECT` (default: cwd) after
 //!   `BLONGO_PROFILE_START_MS`; "blongo: replay done" is printed when the
-//!   run ends.
+//!   run ends. `BLONGO_PROFILE_VIEW=diff|files` then opens that view
+//!   (with an empty prompt: right after the delay).
 
 mod deeplink;
 mod diff;
@@ -164,9 +165,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let profile_view = match std::env::var("BLONGO_PROFILE_VIEW").as_deref() {
+        Ok("diff") => Some(shell::View::Diff),
+        Ok("files") => Some(shell::View::Files),
+        _ => None,
+    };
     let auto_prompt = std::env::var("BLONGO_PROFILE_PROMPT")
         .ok()
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.is_empty() || profile_view.is_some())
         .map(|prompt| shell::AutoPrompt {
             prompt,
             delay: Duration::from_millis(
@@ -180,6 +186,7 @@ fn main() {
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| ".".into()),
             terminal: std::env::var_os("BLONGO_PROFILE_TERMINAL").is_some(),
+            view: profile_view,
         });
     let client: Arc<dyn blongo_client::Backend> =
         Arc::new(blongo_client::LocalBackend(core.client()));

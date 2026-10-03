@@ -100,13 +100,32 @@ def main():
     ap.add_argument("--settled", type=float, default=15.0)
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--environments", help="environments.json to give the app")
+    ap.add_argument("--prompt", default="replay",
+                    help="what to send (\"\" for nothing; \"bigdiff\" writes 200 x 500 lines)")
+    ap.add_argument("--view", choices=["diff", "files"],
+                    help="open this view after the run (or after the idle phase without a prompt)")
+    ap.add_argument("--project", help="project folder (default: a new git repo in OUTPUT)")
     args = ap.parse_args()
+    # The stream phase ends at this line of the app's log.
+    marker = "view opened" if args.view and not args.prompt else "replay done"
+    if args.view == "files" and not args.prompt:
+        marker = "search done"
 
     os.makedirs(args.output)
     binary = os.path.join(args.output, "blongo-profiled")
     shutil.copy(args.binary, binary)
-    project = os.path.join(args.output, "project")
-    os.makedirs(project)
+    project = args.project or os.path.join(args.output, "project")
+    if not args.project:
+        os.makedirs(project)
+    if not args.project and args.view == "diff":
+        # A repository, so runs get checkpoints and the diff panel has data
+        # (the default profile keeps a plain folder, like earlier phases).
+        subprocess.run(["git", "init", "-q", project], check=True)
+        with open(os.path.join(project, "README.md"), "w") as f:
+            f.write("# profile\n")
+        git = ["git", "-C", project, "-c", "user.email=p@blongo", "-c", "user.name=p"]
+        subprocess.run(git + ["add", "README.md"], check=True)
+        subprocess.run(git + ["commit", "-qm", "init"], check=True)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     startup = 2.0
     config = os.path.join(os.path.abspath(args.output), "config")
@@ -119,7 +138,8 @@ def main():
         BLONGO_DATA_DIR=os.path.join(os.path.abspath(args.output), "data"),
         BLONGO_CONFIG_DIR=config,
         BLONGO_CODEX_EXE=os.path.join(root, "crates/blongo-harness/tests/fixtures/fake_codex.py"),
-        BLONGO_PROFILE_PROMPT="replay",
+        BLONGO_PROFILE_PROMPT=args.prompt,
+        BLONGO_PROFILE_VIEW=args.view or "",
         BLONGO_PROFILE_PROJECT=os.path.abspath(project),
         BLONGO_PROFILE_START_MS=str(int((startup + args.idle) * 1000)),
         FAKE_CODEX_REPLAY=os.path.abspath(args.fixture),
@@ -148,7 +168,7 @@ def main():
             if phase == "stream":
                 log.flush()
                 with open(log.name) as f:
-                    if "replay done" in f.read():
+                    if marker in f.read():
                         phase, done_at = "settled", now
                 if now - t0 > args.timeout:
                     sys.exit("replay did not finish in time")
@@ -164,7 +184,14 @@ def main():
     finally:
         os.killpg(child.pid, signal.SIGTERM)
 
-    summary = {"binary": os.path.abspath(args.binary), "fixture": args.fixture, "phases": {}}
+    summary = {
+        "binary": os.path.abspath(args.binary),
+        "fixture": args.fixture,
+        "prompt": args.prompt,
+        "view": args.view,
+        "project": os.path.abspath(project),
+        "phases": {},
+    }
     for p in ("idle", "stream", "settled"):
         rows = [s for s in samples if s["phase"] == p]
         summary["phases"][p] = {

@@ -378,6 +378,21 @@ def main():
             notify("item/agentMessage/delta",
                    {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "planned"})
             complete(turn_id, "completed")
+        elif text.startswith("bigdiff"):
+            # A large change for the diff panel's profile: FILES files of
+            # LINES lines each (default 200 x 500).
+            parts = text.split()
+            files = int(parts[1]) if len(parts) > 1 else 200
+            lines = int(parts[2]) if len(parts) > 2 else 500
+            os.makedirs("big", exist_ok=True)
+            for k in range(files):
+                with open(f"big/file{k:04}.txt", "w") as f:
+                    for n in range(lines):
+                        f.write(f"line {n} of file {k}: the quick brown fox jumps over the lazy dog\n")
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1",
+                    "delta": f"wrote {files} files"})
+            complete(turn_id, "completed")
         elif text.startswith("write "):
             _, name, body = text.split(" ", 2)
             with open(name, "w") as f:

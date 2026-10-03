@@ -53,6 +53,9 @@ pub struct AutoPrompt {
     pub project_dir: PathBuf,
     /// Also open the terminal panel (memory with a terminal open).
     pub terminal: bool,
+    /// Open this view after the run (or after `delay` when `prompt` is
+    /// empty): memory of the diff panel / file browser.
+    pub view: Option<View>,
 }
 
 /// What the main area shows.
@@ -646,9 +649,12 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::RunFinished { thread_id, status } => {
-                if self.auto_prompt.is_some() {
+                if let Some(auto) = &self.auto_prompt {
                     // tools/profile.py waits for this line.
                     eprintln!("blongo: replay done");
+                    if let Some(view) = auto.view {
+                        self.open_profile_view(view, cx);
+                    }
                 }
                 let title = self.sidebar.read(cx).envs[env]
                     .thread(thread_id)
@@ -1406,7 +1412,11 @@ impl Shell {
                     .threads
                     .first()
                     .map(|t| (LOCAL, t.id)));
-                if let Some((env, thread_id)) = target {
+                if auto.prompt.is_empty() {
+                    if let Some(view) = auto.view {
+                        this.open_profile_view(view, cx);
+                    }
+                } else if let Some((env, thread_id)) = target {
                     this.dispatch(
                         env,
                         Command::MessageDispatch {
@@ -1429,6 +1439,36 @@ impl Shell {
             }
         })
         .detach();
+    }
+
+    /// Profiling: open a view and give it work (tools/profile.py waits for
+    /// "view opened" / "search done").
+    fn open_profile_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.set_view(view, cx);
+        eprintln!("blongo: view opened");
+        if view == View::Files
+            && let Some((env, thread_id)) = self.selected(cx)
+        {
+            self.open_file = Some("README.md".into());
+            let backend = self.backend(env).clone();
+            let query = blongo_protocol::workspace::Query::SearchFiles {
+                thread_id,
+                pattern: "index".into(),
+                limit: 50,
+            };
+            crate::query::ask(
+                &backend,
+                query,
+                cx.weak_entity(),
+                cx,
+                |_, result, _| match result {
+                    Ok(blongo_protocol::workspace::QueryReply::Files(f)) => {
+                        eprintln!("blongo: search done ({} matches)", f.len())
+                    }
+                    other => eprintln!("blongo: search done ({other:?})"),
+                },
+            );
+        }
     }
 
     // ------------------------------------------------------ views, commands
