@@ -358,3 +358,12 @@ stream 中の CPU の約 6 割は、この環境のソフトウェアラスタ�
 
 `cargo test --workspace` は 154 件すべて通過。clippy と fmt も問題なし。GUI e2e は全15場面が通過した（ディスクの都合で debug ビルド）。
 
+### 5.6 3回目のレビューの対応
+
+- **ブロッキング**: worktree を消す前の確認は `git status --porcelain --ignored --untracked-files=all --ignore-submodules=none` にした。ユーザーの設定（`status.showUntrackedFiles=no`、`submodule.*.ignore`）で未追跡のファイルやサブモジュールの変更が隠れることはない。テストは `user_status_settings_cannot_hide_files_from_the_worktree_check` と `ignored_submodule_changes_keep_the_worktree`
+- 他の安全確認も見直した。チェックポイントの `add -A`、未追跡ファイルの上限（`ls-files --others --exclude-standard`）、復元の `clean -fd` は、どれも `status.*` の設定に左右されない
+- 入れ子のプロジェクトでは、worktree の最上位（`git rev-parse --show-toplevel`）を確かめてから消す。他のスレッドが使っているかの判定も最上位で行う
+- 確認と削除の間に、Blongo の外のプロセス（ユーザーのシェルやエディター）がフォルダに書いた分は失われうる。この点をドキュメントコメントに書いた
+
+`cargo test --workspace` は 156 件すべて通過。clippy と fmt も問題なし。
+
