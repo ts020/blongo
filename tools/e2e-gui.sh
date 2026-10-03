@@ -139,9 +139,17 @@ echo "9. checkpoint rollback"
 typ "write notes.txt hello"; xdotool key Return; sleep 2
 [ -f "$WORK/myproject/notes.txt" ] || fail "the turn did not write notes.txt"
 shot 18-before-rollback
-xdotool key alt+z; sleep 2                 # undo the last turn
+xdotool key alt+z; sleep 1                 # undo the last turn: asks first
+[ -f "$WORK/myproject/notes.txt" ] || fail "rollback ran before it was confirmed"
+shot 18b-rollback-confirm                  # names the 3 other threads in the folder
+click 1139 667; sleep 2                    # Undo
 [ ! -e "$WORK/myproject/notes.txt" ] || fail "rollback left notes.txt behind"
 echo "  notes.txt restored away by the rollback"
+PRE=$(git -C "$WORK/myproject" for-each-ref --format='%(refname)' refs/blongo/pre-rollback | head -1)
+[ -n "$PRE" ] || fail "no pre-rollback ref"
+git -C "$WORK/myproject" show "$PRE:notes.txt" | grep -q hello \
+  || fail "the pre-rollback ref does not have notes.txt"
+echo "  the replaced files are kept under $PRE"
 shot 19-rolled-back
 
 echo "10. fork the thread"
