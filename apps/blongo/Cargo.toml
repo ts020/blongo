@@ -33,3 +33,6 @@ tree-sitter-c.workspace = true
 portable-pty.workspace = true
 alacritty_terminal.workspace = true
 libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true

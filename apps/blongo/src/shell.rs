@@ -7,7 +7,7 @@
 //! pumped separately and tagged with its [`EnvId`]; past that point the
 //! shell treats them alike.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,49 +16,30 @@ use blongo_client::environments::{self, Environment, EnvironmentFile};
 use blongo_client::{Backend, Events};
 use blongo_core::{CoreEvent, InstallState, LoginState};
 use blongo_protocol::client::{ConnectionState, TerminalEvent};
+use blongo_protocol::workspace::DiffScope;
 use blongo_protocol::{
-    Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, ItemKind, ModelInfo,
-    ProjectId, ProviderKind, RunId, RunStatus, Thread, ThreadId, ThreadSnapshot, ThreadStatus,
+    ApprovalState, Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, ItemKind,
+    ModelInfo, ProjectId, ProviderKind, RunId, RunStatus, Schedule, ScheduleId, Thread, ThreadId,
+    ThreadSnapshot, ThreadStatus, Timestamp, Usage,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, FontWeight, SharedString, StyleRefinement,
-    Subscription, Window, actions, div, prelude::*, px,
+    Subscription, Window, div, prelude::*, px,
 };
 
+use crate::deeplink::Link;
+use crate::diff::{DiffEvent, DiffView};
+use crate::files::FilesView;
+use crate::inbox::InboxView;
 use crate::input::{InputEvent, TextInput};
+use crate::keymap::{Binding, Cmd};
+use crate::palette::{Palette, PaletteEvent};
+use crate::settings::{NotifyMode, Settings, ThemeMode};
+use crate::settings_view::{SettingsEvent, SettingsView, ShellInfo};
 use crate::sidebar::{EnvId, EnvView, LOCAL, Sidebar, SidebarEvent};
 use crate::terminal::{self, GridSize, TerminalView};
 use crate::theme;
 use crate::timeline::{Timeline, TimelineEvent, button};
-
-actions!(
-    shell,
-    [
-        NewThread,
-        ForkThread,
-        UndoLastTurn,
-        ToggleTerminal,
-        UseCodex,
-        UseClaudeCode,
-        UseAntigravity,
-        NextModel,
-    ]
-);
-
-pub fn bind_keys(cx: &mut App) {
-    use gpui::KeyBinding;
-    let c = Some("Shell");
-    cx.bind_keys([
-        KeyBinding::new("secondary-n", NewThread, c),
-        KeyBinding::new("alt-f", ForkThread, c),
-        KeyBinding::new("alt-z", UndoLastTurn, c),
-        KeyBinding::new("secondary-`", ToggleTerminal, c),
-        KeyBinding::new("alt-1", UseCodex, c),
-        KeyBinding::new("alt-2", UseClaudeCode, c),
-        KeyBinding::new("alt-3", UseAntigravity, c),
-        KeyBinding::new("alt-m", NextModel, c),
-    ]);
-}
 
 const SIDEBAR_WIDTH: f32 = 260.;
 const TERMINAL_HEIGHT: f32 = 240.;
@@ -72,6 +53,27 @@ pub struct AutoPrompt {
     pub project_dir: PathBuf,
     /// Also open the terminal panel (memory with a terminal open).
     pub terminal: bool,
+}
+
+/// What the main area shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Chat,
+    Diff,
+    Files,
+    Inbox,
+    Settings,
+}
+
+/// Fixed facts the shell shows (settings screen) or needs.
+pub struct ShellOptions {
+    pub data_dir: PathBuf,
+    pub mcp: bool,
+    pub bindings: Vec<Binding>,
+    pub keybinding_problems: Vec<String>,
+    /// `blongo://` links from later processes (and the one this process
+    /// was started with).
+    pub links: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,6 +129,32 @@ pub struct Shell {
     /// Focus to apply on the next render (set where no window is at hand).
     pending_focus: Option<FocusHandle>,
     focus_handle: FocusHandle,
+    view: View,
+    diff: Option<Entity<DiffView>>,
+    /// Thread and scope the diff view shows.
+    diff_for: Option<(EnvId, ThreadId, DiffScope)>,
+    diff_scope: DiffScope,
+    files: Option<Entity<FilesView>>,
+    files_for: Option<(EnvId, ThreadId)>,
+    /// A file to open once the files view exists.
+    open_file: Option<String>,
+    inbox: Option<Entity<InboxView>>,
+    settings_view: Option<Entity<SettingsView>>,
+    palette: Option<Entity<Palette>>,
+    bindings: Vec<Binding>,
+    keybinding_problems: Vec<String>,
+    /// Each environment's schedules.
+    schedules: Vec<Vec<Schedule>>,
+    pending_schedule: Option<(EnvId, CommandId)>,
+    /// Token use of the open thread's runs.
+    usage: Vec<(RunId, Usage)>,
+    /// Links waiting for the local core's first snapshot.
+    links: Vec<Link>,
+    window_active: bool,
+    data_dir: PathBuf,
+    mcp: bool,
+    /// Subscriptions of the views above (replaced with them).
+    view_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -137,6 +165,7 @@ impl Shell {
         local: Arc<dyn Backend>,
         events: Events,
         auto_prompt: Option<AutoPrompt>,
+        options: ShellOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -162,8 +191,22 @@ impl Shell {
                 },
             ),
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
+            cx.observe_window_activation(window, |this, window, _| {
+                this.window_active = window.is_window_active();
+            }),
         ];
         Self::pump(LOCAL, events, cx);
+        if let Some(mut links) = options.links {
+            cx.spawn(async move |this, cx| {
+                while let Some(url) = links.recv().await {
+                    if this.update(cx, |this, cx| this.on_link(&url, cx)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .detach();
+        }
+        let settings = cx.global::<Settings>().value.clone();
         let mut this = Self {
             envs: vec![Env {
                 backend: local,
@@ -180,7 +223,7 @@ impl Shell {
             pairing: None,
             queued: Vec::new(),
             runs: Vec::new(),
-            default_provider: ProviderKind::Codex,
+            default_provider: settings.default_provider,
             picker: None,
             confirm_rollback: None,
             notice: None,
@@ -191,8 +234,52 @@ impl Shell {
             auto_prompt,
             pending_focus: None,
             focus_handle: cx.focus_handle(),
+            view: View::Chat,
+            diff: None,
+            diff_for: None,
+            diff_scope: DiffScope::Thread,
+            files: None,
+            files_for: None,
+            open_file: None,
+            inbox: None,
+            settings_view: None,
+            palette: None,
+            bindings: options.bindings,
+            keybinding_problems: options.keybinding_problems,
+            schedules: vec![Vec::new()],
+            pending_schedule: None,
+            usage: Vec::new(),
+            links: Vec::new(),
+            window_active: true,
+            data_dir: options.data_dir,
+            mcp: options.mcp,
+            view_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
         };
+        if settings.check_updates
+            && let Some((url, key)) = blongo_client::update::configured()
+        {
+            let task = blongo_client::net::handle().spawn(async move {
+                blongo_client::update::check(&url, &key, env!("CARGO_PKG_VERSION")).await
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(blongo_client::update::Status::Available(m))) = task.await {
+                    this.update(cx, |this, cx| {
+                        this.notice = Some(
+                            format!("Blongo {} is available (Settings → Updates)", m.version)
+                                .into(),
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+        if !this.keybinding_problems.is_empty() {
+            this.notice =
+                Some(format!("keybindings.json: {}", this.keybinding_problems.join("; ")).into());
+        }
         // Saved remote environments. Without any, no network thread is
         // ever started.
         match EnvironmentFile::load(&environments::default_path()) {
@@ -221,6 +308,7 @@ impl Shell {
             models: HashMap::new(),
             loaded: false,
         });
+        self.schedules.push(Vec::new());
         self.sidebar.update(cx, |s, cx| {
             s.envs.push(EnvView::new(name, true));
             cx.notify();
@@ -315,6 +403,8 @@ impl Shell {
             SidebarEvent::Dismissed => {
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
+            SidebarEvent::OpenInbox => self.set_view(View::Inbox, cx),
+            SidebarEvent::OpenSettings => self.set_view(View::Settings, cx),
             SidebarEvent::ImportT3 => {
                 let source = std::env::var_os("BLONGO_T3_DB")
                     .map(PathBuf::from)
@@ -411,8 +501,10 @@ impl Shell {
 
     fn on_core_event(&mut self, env: EnvId, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
-            CoreEvent::Reply { .. } => {}
+            CoreEvent::Reply { id, result } => crate::query::deliver(id, result, cx),
             CoreEvent::Shell(shell) => {
+                self.schedules[env] = shell.schedules.clone();
+                self.refresh_settings_info(cx);
                 let first = !self.envs[env].loaded;
                 self.envs[env].loaded = true;
                 let no_projects = shell.projects.is_empty();
@@ -449,6 +541,9 @@ impl Shell {
                             Some(self.sidebar.read(cx).project_input.focus_handle(cx));
                     }
                     self.start_auto_prompt(cx);
+                    for link in std::mem::take(&mut self.links) {
+                        self.open_link(link, cx);
+                    }
                 }
                 cx.notify();
             }
@@ -482,6 +577,13 @@ impl Shell {
                 if self.pending_project == Some((env, command_id)) {
                     self.pending_project = None;
                     self.form_notice(&reason, cx);
+                }
+                if self.pending_schedule == Some((env, command_id)) {
+                    self.pending_schedule = None;
+                    if let Some(view) = &self.settings_view {
+                        let reason = reason.clone();
+                        view.update(cx, |v, cx| v.set_message(false, reason, cx));
+                    }
                 }
                 if let Some((_, _, text)) = self
                     .pending_message
@@ -543,10 +645,27 @@ impl Shell {
                 }
                 cx.notify();
             }
-            CoreEvent::RunFinished { .. } => {
+            CoreEvent::RunFinished { thread_id, status } => {
                 if self.auto_prompt.is_some() {
                     // tools/profile.py waits for this line.
                     eprintln!("blongo: replay done");
+                }
+                let title = self.sidebar.read(cx).envs[env]
+                    .thread(thread_id)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default();
+                self.notify(
+                    &format!("{} — {}", status_word(status), title),
+                    "Blongo: a run finished",
+                    cx,
+                );
+                if self.is_selected(env, thread_id, cx) {
+                    if let Some(diff) = &self.diff {
+                        diff.update(cx, |d, cx| d.reload(cx));
+                    }
+                    if let Some(files) = &self.files {
+                        files.update(cx, |f, cx| f.refresh_git(cx));
+                    }
                 }
             }
             CoreEvent::Models { provider, models } => {
@@ -618,8 +737,17 @@ impl Shell {
             |this, _, event: &TimelineEvent, cx| match event {
                 TimelineEvent::Fork(run_id) => this.fork(Some(*run_id), cx),
                 TimelineEvent::Rollback(run_id) => this.rollback(*run_id, cx),
+                TimelineEvent::Diff(run_id) => {
+                    this.diff_scope = DiffScope::Turn { run_id: *run_id };
+                    this.set_view(View::Diff, cx);
+                }
             },
         );
+        self.usage = snapshot
+            .runs
+            .iter()
+            .filter_map(|r| Some((r.id, r.usage?)))
+            .collect();
         self.timeline_events = Some(sub);
         self.timeline = Some(timeline);
         self.confirm_rollback = None;
@@ -656,10 +784,41 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match kind {
-            EventKind::RunUsage { .. }
-            | EventKind::ScheduleCreated { .. }
-            | EventKind::ScheduleUpdated { .. }
-            | EventKind::ScheduleDeleted { .. } => {}
+            EventKind::RunUsage {
+                thread_id,
+                run_id,
+                usage,
+            } => {
+                if self.is_selected(env, *thread_id, cx) {
+                    match self.usage.iter_mut().find(|(id, _)| id == run_id) {
+                        Some(u) => u.1 = *usage,
+                        None => self.usage.push((*run_id, *usage)),
+                    }
+                    cx.notify();
+                }
+            }
+            EventKind::ScheduleCreated { schedule } => {
+                self.schedules[env].push(schedule.clone());
+                if command_id.is_some()
+                    && self.pending_schedule.map(|(e, id)| (e, Some(id))) == Some((env, command_id))
+                {
+                    self.pending_schedule = None;
+                    if let Some(view) = &self.settings_view {
+                        view.update(cx, |v, cx| v.schedule_created(cx));
+                    }
+                }
+                self.refresh_settings_info(cx);
+            }
+            EventKind::ScheduleUpdated { schedule } => {
+                if let Some(s) = self.schedules[env].iter_mut().find(|s| s.id == schedule.id) {
+                    *s = schedule.clone();
+                }
+                self.refresh_settings_info(cx);
+            }
+            EventKind::ScheduleDeleted { schedule_id } => {
+                self.schedules[env].retain(|s| s.id != *schedule_id);
+                self.refresh_settings_info(cx);
+            }
             EventKind::ProjectCreated { project } => {
                 let ours = command_id.is_some()
                     && self.pending_project.map(|(e, id)| (e, Some(id))) == Some((env, command_id));
@@ -793,6 +952,21 @@ impl Shell {
                 }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
+                if let (
+                    EventKind::ItemAdded { .. },
+                    ItemKind::ApprovalRequest {
+                        state: ApprovalState::Pending,
+                        title,
+                        ..
+                    },
+                ) = (kind, &item.kind)
+                {
+                    let thread = self.sidebar.read(cx).envs[env]
+                        .thread(item.thread_id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_default();
+                    self.notify(&format!("{thread}: {title}"), "Blongo: approval needed", cx);
+                }
                 if self.is_selected(env, item.thread_id, cx)
                     && let (ItemKind::UserMessage, Some(run_id)) = (&item.kind, item.run_id)
                     && let Some(q) = self.queued.iter_mut().find(|(id, _)| *id == run_id)
@@ -866,6 +1040,11 @@ impl Shell {
         self.picker = None;
         // The terminal belongs to the thread's workspace.
         self.terminal = None;
+        self.usage.clear();
+        self.diff_scope = DiffScope::Thread;
+        if matches!(self.view, View::Inbox | View::Settings) {
+            self.view = View::Chat;
+        }
         self.backend(env).open_thread(thread_id);
         cx.notify();
     }
@@ -1252,6 +1431,626 @@ impl Shell {
         .detach();
     }
 
+    // ------------------------------------------------------ views, commands
+
+    pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if matches!(view, View::Chat | View::Diff | View::Files) && self.selected(cx).is_none() {
+            return;
+        }
+        if view == View::Diff && self.view == View::Diff {
+            // Same tab again: show the latest state.
+            if let Some(diff) = &self.diff {
+                diff.update(cx, |d, cx| d.reload(cx));
+            }
+        }
+        self.view = view;
+        self.palette = None;
+        if view == View::Chat {
+            self.pending_focus = Some(self.composer.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    fn ensure_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<DiffView> {
+        let (env, thread_id) = self.selected(cx).expect("diff view without a thread");
+        let key = (env, thread_id, self.diff_scope);
+        if let (Some(diff), true) = (&self.diff, self.diff_for == Some(key)) {
+            return diff.clone();
+        }
+        let title = match self.diff_scope {
+            DiffScope::Thread => "All changes in this thread".to_owned(),
+            DiffScope::Turn { run_id } => format!("Changes of turn {}", self.turn_number(run_id)),
+        };
+        let backend = self.backend(env).clone();
+        let scope = self.diff_scope;
+        let diff = cx.new(|cx| {
+            DiffView::new(
+                crate::diff::Source::Thread {
+                    backend,
+                    thread_id,
+                    scope,
+                },
+                title,
+                "Send to agent",
+                window,
+                cx,
+            )
+        });
+        self.view_subscriptions.push(cx.subscribe_in(
+            &diff,
+            window,
+            |this, diff, event: &DiffEvent, window, cx| {
+                let DiffEvent::Send(comments) = event;
+                if comments.is_empty() {
+                    return;
+                }
+                let Some((env, thread_id)) = this.selected(cx) else {
+                    return;
+                };
+                this.dispatch(
+                    env,
+                    Command::MessageDispatch {
+                        thread_id,
+                        message_id: ItemId::new(),
+                        run_id: RunId::new(),
+                        text: crate::diff::comments_message(comments),
+                        delivery: Delivery::Queue,
+                    },
+                );
+                diff.update(cx, |d, cx| d.clear_comments(cx));
+                this.set_view(View::Chat, cx);
+                window.focus(&this.composer.focus_handle(cx), cx);
+            },
+        ));
+        self.diff = Some(diff.clone());
+        self.diff_for = Some(key);
+        diff
+    }
+
+    fn ensure_files(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<FilesView> {
+        let (env, thread_id) = self.selected(cx).expect("files view without a thread");
+        let files = match (&self.files, self.files_for == Some((env, thread_id))) {
+            (Some(files), true) => files.clone(),
+            _ => {
+                let backend = self.backend(env).clone();
+                let files = cx.new(|cx| FilesView::new(backend, thread_id, window, cx));
+                self.files = Some(files.clone());
+                self.files_for = Some((env, thread_id));
+                files
+            }
+        };
+        if let Some(path) = self.open_file.take() {
+            files.update(cx, |f, cx| f.open_file(path, cx));
+        }
+        files
+    }
+
+    fn ensure_inbox(&mut self, cx: &mut Context<Self>) -> Entity<InboxView> {
+        if let Some(inbox) = &self.inbox {
+            return inbox.clone();
+        }
+        let inbox = cx.new(InboxView::new);
+        self.inbox = Some(inbox.clone());
+        inbox
+    }
+
+    fn settings_info(&self, cx: &App) -> ShellInfo {
+        let env = self.selected_env(cx);
+        let sidebar = self.sidebar.read(cx);
+        let schedule_target = self.selected_thread(cx).and_then(|t| {
+            let project = sidebar.envs[env].project(t.project_id)?;
+            Some(SharedString::from(format!(
+                "{} ({})",
+                project.name, t.title
+            )))
+        });
+        let environments = EnvironmentFile::load(&environments::default_path())
+            .map(|f| {
+                f.environments
+                    .into_iter()
+                    .map(|e| (e.name, e.target))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ShellInfo {
+            schedules: self.schedules.get(env).cloned().unwrap_or_default(),
+            environments,
+            schedule_target,
+            keybinding_problems: self.keybinding_problems.clone(),
+            data_dir: self.data_dir.clone(),
+            mcp: self.mcp,
+        }
+    }
+
+    fn refresh_settings_info(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.settings_view.clone() {
+            let info = self.settings_info(cx);
+            view.update(cx, |v, cx| {
+                v.info = info;
+                cx.notify();
+            });
+        }
+    }
+
+    fn ensure_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<SettingsView> {
+        if let Some(view) = &self.settings_view {
+            return view.clone();
+        }
+        let info = self.settings_info(cx);
+        let view = cx.new(|cx| SettingsView::new(info, window, cx));
+        self.view_subscriptions
+            .push(cx.subscribe_in(&view, window, Self::on_settings_event));
+        self.settings_view = Some(view.clone());
+        view
+    }
+
+    fn on_settings_event(
+        &mut self,
+        view: &Entity<SettingsView>,
+        event: &SettingsEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SettingsEvent::Changed => self.apply_settings(cx),
+            SettingsEvent::CreateSchedule {
+                cron,
+                prompt,
+                in_open_thread,
+            } => {
+                let Some(thread) = self.selected_thread(cx) else {
+                    return;
+                };
+                let env = self.selected_env(cx);
+                let envelope = CommandEnvelope::new(Command::ScheduleCreate {
+                    schedule_id: ScheduleId::new(),
+                    project_id: thread.project_id,
+                    thread_id: in_open_thread.then_some(thread.id),
+                    cron: cron.clone(),
+                    prompt: prompt.clone(),
+                    provider: thread.provider,
+                });
+                self.pending_schedule = Some((env, envelope.command_id));
+                self.backend(env).dispatch(envelope);
+            }
+            SettingsEvent::ToggleSchedule(id, enabled) => self.dispatch_selected(
+                Command::ScheduleUpdate {
+                    schedule_id: *id,
+                    enabled: Some(*enabled),
+                    cron: None,
+                    prompt: None,
+                },
+                cx,
+            ),
+            SettingsEvent::RunSchedule(id) => {
+                self.dispatch_selected(Command::ScheduleRunNow { schedule_id: *id }, cx)
+            }
+            SettingsEvent::DeleteSchedule(id) => {
+                self.dispatch_selected(Command::ScheduleDelete { schedule_id: *id }, cx)
+            }
+            SettingsEvent::RemoveEnvironment(name) => {
+                let result =
+                    EnvironmentFile::update(&environments::default_path(), |f| f.remove(name));
+                let (ok, text) = match result {
+                    Ok(_) => (
+                        true,
+                        format!(
+                            "Removed {name}: it disconnects at the next start; its credential \
+                             works on the server until `blongo-serve revoke` there"
+                        ),
+                    ),
+                    Err(err) => (false, err),
+                };
+                view.update(cx, |v, cx| v.set_message(ok, text, cx));
+                self.refresh_settings_info(cx);
+            }
+            SettingsEvent::ReloadKeybindings => {
+                self.reload_keybindings(cx);
+                let text = if self.keybinding_problems.is_empty() {
+                    "Keybindings reloaded".to_owned()
+                } else {
+                    format!(
+                        "Reloaded with problems: {}",
+                        self.keybinding_problems.join("; ")
+                    )
+                };
+                let ok = self.keybinding_problems.is_empty();
+                view.update(cx, |v, cx| v.set_message(ok, text, cx));
+                self.refresh_settings_info(cx);
+            }
+            SettingsEvent::TestNotification => {
+                crate::notify::send("Blongo", "Notifications work.");
+            }
+        }
+    }
+
+    pub fn reload_keybindings(&mut self, cx: &mut Context<Self>) {
+        let (bindings, problems) = crate::bind_all(cx);
+        self.bindings = bindings;
+        self.keybinding_problems = problems;
+    }
+
+    /// The settings changed: theme, the local core's policy, defaults.
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        let settings = cx.global::<Settings>().value.clone();
+        self.default_provider = settings.default_provider;
+        self.backend(LOCAL).configure(settings.core());
+        let light = settings.theme == ThemeMode::Light;
+        if light != theme::is_light() {
+            theme::set_light(light);
+            // Cached elements keep their colors: rebuild them.
+            self.sidebar.update(cx, |_, cx| cx.notify());
+            if let Some((env, id)) = self.selected(cx) {
+                self.backend(env).open_thread(id);
+            }
+            cx.refresh_windows();
+        }
+        cx.notify();
+    }
+
+    fn update_settings(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut crate::settings::AppSettings),
+    ) {
+        let settings = cx.global_mut::<Settings>();
+        f(&mut settings.value);
+        if let Err(err) = settings.save() {
+            self.notice = Some(err.into());
+        }
+        self.apply_settings(cx);
+        if let Some(view) = &self.settings_view {
+            view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn context_names(&self, cx: &App) -> HashSet<&'static str> {
+        let mut names = HashSet::new();
+        if let Some(thread) = self.selected_thread(cx) {
+            names.insert("threadOpen");
+            if matches!(thread.status, ThreadStatus::Running | ThreadStatus::Waiting) {
+                names.insert("busy");
+            }
+        }
+        if self.selected_env(cx) != LOCAL {
+            names.insert("remote");
+        }
+        if self.terminal.is_some() {
+            names.insert("terminalOpen");
+        }
+        if self.palette.is_some() {
+            names.insert("paletteOpen");
+        }
+        names.insert(match self.view {
+            View::Chat => "view.chat",
+            View::Diff => "view.diff",
+            View::Files => "view.files",
+            View::Inbox => "view.inbox",
+            View::Settings => "view.settings",
+        });
+        names
+    }
+
+    fn on_cmd(&mut self, cmd: &Cmd, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(when) = &cmd.when
+            && !when.eval(&self.context_names(cx))
+        {
+            cx.propagate();
+            return;
+        }
+        self.run_command(&cmd.id, window, cx);
+    }
+
+    pub fn run_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if std::env::var_os("BLONGO_TRACE_COMMANDS").is_some() {
+            // tools/e2e-gui-phase4.sh checks which command a key ran.
+            eprintln!("blongo: command {id}");
+        }
+        match id {
+            "palette.commands" => self.open_palette(false, window, cx),
+            "palette.files" => self.open_palette(true, window, cx),
+            "thread.new" => {
+                let env = self.selected_env(cx);
+                let project = self.selected_thread(cx).map(|t| t.project_id).or(self
+                    .sidebar
+                    .read(cx)
+                    .envs[env]
+                    .projects
+                    .first()
+                    .map(|p| p.id));
+                if let Some(project_id) = project {
+                    self.new_thread(env, project_id, false, cx);
+                }
+            }
+            "thread.fork" => self.fork(None, cx),
+            "thread.undo" => self.undo_last(cx),
+            "thread.stop" => self.stop(cx),
+            "terminal.toggle" => self.toggle_terminal(window, cx),
+            "view.chat" => self.set_view(View::Chat, cx),
+            "view.diff" => self.set_view(View::Diff, cx),
+            "view.files" => self.set_view(View::Files, cx),
+            "view.inbox" => self.set_view(View::Inbox, cx),
+            "view.settings" => self.set_view(View::Settings, cx),
+            "model.next" => self.next_model(cx),
+            "theme.toggle" => self.update_settings(cx, |s| {
+                s.theme = match s.theme {
+                    ThemeMode::Dark => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                }
+            }),
+            "approval.toggle" => self.update_settings(cx, |s| {
+                s.approval = match s.approval {
+                    blongo_protocol::client::ApprovalPolicy::Ask => {
+                        blongo_protocol::client::ApprovalPolicy::AutoApprove
+                    }
+                    blongo_protocol::client::ApprovalPolicy::AutoApprove => {
+                        blongo_protocol::client::ApprovalPolicy::Ask
+                    }
+                }
+            }),
+            "git.refresh" => {
+                if let Some(files) = &self.files {
+                    files.update(cx, |f, cx| f.reload(cx));
+                }
+            }
+            "keybindings.open" => {
+                self.notice = Some(
+                    format!(
+                        "Keybindings file: {}",
+                        crate::settings::keybindings_path().display()
+                    )
+                    .into(),
+                );
+                cx.notify();
+            }
+            other => {
+                if let Some(provider) = other
+                    .strip_prefix("provider.")
+                    .and_then(ProviderKind::parse)
+                {
+                    self.set_provider(provider, None, cx);
+                }
+            }
+        }
+    }
+
+    fn open_palette(&mut self, files: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            window.focus(&self.composer.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
+        let mode = if files {
+            let Some((env, thread_id)) = self.selected(cx) else {
+                return;
+            };
+            crate::palette::Mode::Files {
+                backend: self.backend(env).clone(),
+                thread_id,
+            }
+        } else {
+            crate::palette::commands(&self.bindings)
+        };
+        let palette = cx.new(|cx| Palette::new(mode, window, cx));
+        self.view_subscriptions.push(cx.subscribe_in(
+            &palette,
+            window,
+            |this, _, event: &PaletteEvent, window, cx| {
+                this.palette = None;
+                match event {
+                    PaletteEvent::Run(id) => {
+                        window.focus(&this.composer.focus_handle(cx), cx);
+                        this.run_command(id, window, cx);
+                    }
+                    PaletteEvent::OpenFile(path) => {
+                        this.open_file = Some(path.clone());
+                        this.set_view(View::Files, cx);
+                    }
+                    PaletteEvent::Dismiss => {
+                        window.focus(&this.composer.focus_handle(cx), cx);
+                    }
+                }
+                cx.notify();
+            },
+        ));
+        self.palette = Some(palette);
+        cx.notify();
+    }
+
+    /// A desktop notification, as the settings allow.
+    fn notify(&self, body: &str, title: &str, cx: &App) {
+        let show = match cx.global::<Settings>().value.notifications {
+            NotifyMode::Off => false,
+            NotifyMode::Unfocused => !self.window_active,
+            NotifyMode::Always => true,
+        };
+        if show && self.auto_prompt.is_none() {
+            crate::notify::send(title, body);
+        }
+    }
+
+    fn on_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        match crate::deeplink::parse(url) {
+            Ok(link) if self.envs[LOCAL].loaded => self.open_link(link, cx),
+            Ok(link) => self.links.push(link),
+            Err(err) => {
+                self.notice = Some(err.into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_link(&mut self, link: Link, cx: &mut Context<Self>) {
+        match link {
+            Link::Thread(id) => {
+                if self.sidebar.read(cx).envs[LOCAL].thread(id).is_some() {
+                    self.select(LOCAL, id, cx);
+                    self.view = View::Chat;
+                } else {
+                    self.notice = Some(format!("No thread {id} here").into());
+                }
+            }
+            Link::Project(path) => {
+                let wanted = canonical(&path);
+                let existing = self.sidebar.read(cx).envs[LOCAL]
+                    .projects
+                    .iter()
+                    .find(|p| canonical(&p.path) == wanted)
+                    .map(|p| p.id);
+                match existing {
+                    Some(project_id) => self.new_thread(LOCAL, project_id, false, cx),
+                    None => {
+                        let envelope = CommandEnvelope::new(Command::ProjectCreate {
+                            project_id: ProjectId::new(),
+                            name: String::new(),
+                            path,
+                        });
+                        self.pending_project = Some((LOCAL, envelope.command_id));
+                        self.backend(LOCAL).dispatch(envelope);
+                    }
+                }
+                self.view = View::Chat;
+            }
+            Link::Settings => self.view = View::Settings,
+            Link::Inbox => self.view = View::Inbox,
+        }
+        cx.notify();
+    }
+
+    fn turn_number(&self, run_id: RunId) -> usize {
+        self.runs
+            .iter()
+            .filter(|(_, s)| {
+                !matches!(
+                    s,
+                    RunStatus::Queued | RunStatus::Cancelled | RunStatus::RolledBack
+                )
+            })
+            .position(|(id, _)| *id == run_id)
+            .map_or(0, |i| i + 1)
+    }
+
+    fn usage_label(&self) -> Option<SharedString> {
+        if self.usage.is_empty() {
+            return None;
+        }
+        let mut total = Usage::default();
+        for (_, u) in &self.usage {
+            total.add(u);
+        }
+        let mut text = format!("{} tokens", compact(total.total_tokens()));
+        if let Some(micros) = total.cost_micros {
+            text.push_str(&format!(" · ${:.2}", micros as f64 / 1_000_000.));
+        }
+        Some(text.into())
+    }
+
+    fn render_scope_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let turns: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|(_, s)| {
+                !matches!(
+                    s,
+                    RunStatus::Queued | RunStatus::Cancelled | RunStatus::RolledBack
+                )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let first = turns.len().saturating_sub(8);
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme::border())
+            .text_xs()
+            .child(
+                header_action("scope-thread", "All changes")
+                    .when(self.diff_scope == DiffScope::Thread, |d| {
+                        d.bg(theme::surface_hover()).text_color(theme::text())
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.diff_scope = DiffScope::Thread;
+                        cx.notify();
+                    })),
+            )
+            .children(
+                turns
+                    .into_iter()
+                    .enumerate()
+                    .skip(first)
+                    .map(|(ix, run_id)| {
+                        let active = self.diff_scope == DiffScope::Turn { run_id };
+                        div()
+                            .id(SharedString::from(format!("scope-turn-{}", ix + 1)))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .text_color(theme::text_muted())
+                            .when(active, |d| {
+                                d.bg(theme::surface_hover()).text_color(theme::text())
+                            })
+                            .hover(|d| d.bg(theme::surface_hover()))
+                            .cursor_pointer()
+                            .child(format!("Turn {}", ix + 1))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.diff_scope = DiffScope::Turn { run_id };
+                                cx.notify();
+                            }))
+                    }),
+            )
+    }
+
+    /// Settings and the inbox: a full-width page with a way back.
+    fn render_page(
+        &self,
+        title: &'static str,
+        body: gpui::AnyElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(header_action("page-back", "← Back").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.view = View::Chat;
+                            this.pending_focus = Some(this.composer.focus_handle(cx));
+                            cx.notify();
+                        },
+                    )))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .when_some(self.notice.clone(), |d, n| {
+                        d.child(div().text_xs().text_color(theme::danger()).child(n))
+                    }),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
     // ------------------------------------------------------------- rendering
 
     fn render_picker(&self, thread: &Thread, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -1386,6 +2185,17 @@ impl Shell {
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.view {
+            View::Settings => {
+                let body = self.ensure_settings(window, cx).into_any_element();
+                return self.render_page("Settings", body, cx);
+            }
+            View::Inbox => {
+                let body = self.ensure_inbox(cx).into_any_element();
+                return self.render_page("Review inbox", body, cx);
+            }
+            _ => {}
+        }
         if let Some(fatal) = self.fatal.clone() {
             return div()
                 .flex_1()
@@ -1445,6 +2255,14 @@ impl Shell {
             None => "Default model".into(),
         };
 
+        let usage = self.usage_label();
+        let tab = |id: &'static str, label: &'static str, view: View, current: View| {
+            header_action(id, label)
+                .when(view == current, |d| {
+                    d.bg(theme::surface_hover()).text_color(theme::text())
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+        };
         let header = div()
             .flex()
             .items_center()
@@ -1457,7 +2275,16 @@ impl Shell {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .whitespace_nowrap()
                     .child(SharedString::from(thread.title.clone())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(tab("tab-chat", "Chat", View::Chat, self.view))
+                    .child(tab("tab-diff", "Changes", View::Diff, self.view))
+                    .child(tab("tab-files", "Files", View::Files, self.view)),
             )
             .child(
                 div()
@@ -1468,6 +2295,16 @@ impl Shell {
                     .text_color(theme::text_faint())
                     .child(SharedString::from(location)),
             )
+            .when_some(usage, |d, usage| {
+                d.child(
+                    div()
+                        .id("usage")
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(usage),
+                )
+            })
             .child(
                 header_action("fork-thread", "Fork")
                     .on_click(cx.listener(|this, _, _, cx| this.fork(None, cx))),
@@ -1484,9 +2321,25 @@ impl Shell {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
             );
 
-        let timeline = match &self.timeline {
-            Some(t) => div().flex_1().min_h_0().child(t.clone()),
-            None => div().flex_1(),
+        let timeline = match self.view {
+            View::Diff => {
+                let diff = self.ensure_diff(window, cx);
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_scope_bar(cx))
+                    .child(div().flex_1().min_h_0().child(diff))
+            }
+            View::Files => {
+                let files = self.ensure_files(window, cx);
+                div().flex_1().min_h_0().child(files)
+            }
+            _ => match &self.timeline {
+                Some(t) => div().flex_1().min_h_0().child(t.clone()),
+                None => div().flex_1(),
+            },
         };
 
         let has_text = !self.composer.read(cx).text().trim().is_empty();
@@ -1530,7 +2383,7 @@ impl Shell {
         let status_text: SharedString = match thread.status {
             ThreadStatus::Running => format!("{provider} is working…").into(),
             ThreadStatus::Waiting => format!("{provider} is waiting for your approval").into(),
-            _ => "on-request approvals".into(),
+            _ => cx.global::<Settings>().value.approval.label().into(),
         };
 
         let queued = (!self.queued.is_empty()).then(|| {
@@ -1759,37 +2612,9 @@ impl Render for Shell {
         sidebar_style.size.height = Some(gpui::relative(1.).into());
         sidebar_style.flex_shrink = Some(0.);
         div()
-            .key_context("Shell")
-            .on_action(cx.listener(|this, _: &NewThread, _, cx| {
-                let env = this.selected_env(cx);
-                let project = this.selected_thread(cx).map(|t| t.project_id).or(this
-                    .sidebar
-                    .read(cx)
-                    .envs[env]
-                    .projects
-                    .first()
-                    .map(|p| p.id));
-                if let Some(project_id) = project {
-                    this.new_thread(env, project_id, false, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ForkThread, _, cx| this.fork(None, cx)))
-            .on_action(cx.listener(|this, _: &UndoLastTurn, _, cx| this.undo_last(cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleTerminal, window, cx| {
-                    this.toggle_terminal(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &UseCodex, _, cx| {
-                this.set_provider(ProviderKind::Codex, None, cx)
-            }))
-            .on_action(cx.listener(|this, _: &UseClaudeCode, _, cx| {
-                this.set_provider(ProviderKind::ClaudeCode, None, cx)
-            }))
-            .on_action(cx.listener(|this, _: &UseAntigravity, _, cx| {
-                this.set_provider(ProviderKind::Antigravity, None, cx)
-            }))
-            .on_action(cx.listener(|this, _: &NextModel, _, cx| this.next_model(cx)))
+            .key_context(crate::keymap::CONTEXT)
+            .on_action(cx.listener(Self::on_cmd))
+            .relative()
             .flex()
             .size_full()
             .bg(theme::bg())
@@ -1797,6 +2622,18 @@ impl Render for Shell {
             // Cached: re-rendered only when the sidebar itself is notified.
             .child(self.sidebar.clone().cached(sidebar_style))
             .child(self.render_main(window, cx))
+            .when_some(self.palette.clone(), |d, palette| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(60.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(palette),
+                )
+            })
     }
 }
 
@@ -1808,6 +2645,30 @@ struct RollbackConfirm {
     turns: usize,
     /// Titles of the other threads working in the same folder.
     sharers: Vec<(ThreadId, String)>,
+}
+
+/// "Completed", "Failed", … for notifications.
+fn status_word(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Completed => "Completed",
+        RunStatus::Failed => "Failed",
+        RunStatus::Interrupted => "Stopped",
+        _ => "Finished",
+    }
+}
+
+/// 1234 → "1.2k", 3_400_000 → "3.4M".
+fn compact(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.),
+    }
+}
+
+/// A timestamp as local "YYYY-MM-DD HH:MM".
+pub fn local_time(t: Timestamp) -> String {
+    blongo_core::cron::format_local(t.0)
 }
 
 fn canonical(path: &str) -> PathBuf {

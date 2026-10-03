@@ -25,14 +25,32 @@
 //!   credential (0600) in `$BLONGO_CONFIG_DIR` (default: the platform
 //!   config dir); `blongo env list`, `blongo env remove NAME`.
 //!
+//! Phase 4:
+//! - `blongo mcp-bridge SOCKET TOKEN_FILE`: started by agents to reach
+//!   Blongo's MCP server (docs/phase4/mcp.md).
+//! - `blongo blongo://…` opens a link (handing it to a running instance);
+//!   `blongo register-url-handler` registers the scheme (Linux).
+//! - Settings: `settings.json`, `keybindings.json`, `forge.json` in
+//!   `$BLONGO_CONFIG_DIR`. `BLONGO_NOTIFY_CMD` replaces the notifier.
+//!
 //! - Profiling (tools/profile.py): `BLONGO_PROFILE_PROMPT` is sent in a
 //!   project for `BLONGO_PROFILE_PROJECT` (default: cwd) after
 //!   `BLONGO_PROFILE_START_MS`; "blongo: replay done" is printed when the
 //!   run ends.
 
+mod deeplink;
+mod diff;
+mod files;
 mod highlight;
+mod inbox;
 mod input;
+mod keymap;
 mod markdown;
+mod notify;
+mod palette;
+mod query;
+mod settings;
+mod settings_view;
 mod shell;
 mod sidebar;
 mod terminal;
@@ -57,14 +75,87 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 actions!(blongo, [Quit]);
 
+/// Every key binding: the text input's, quit, then the shell's commands
+/// (defaults overlaid with the user's keybindings.json). Returns the
+/// shell's bindings and the problems found in the user's file.
+pub fn bind_all(cx: &mut App) -> (Vec<keymap::Binding>, Vec<String>) {
+    cx.clear_key_bindings();
+    input::bind_keys(cx);
+    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+    keymap::install(&settings::keybindings_path(), cx)
+}
+
 fn main() {
-    let config = CoreConfig::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The agents' MCP bridge: a byte pump, no core, no window.
+    if args.first().map(String::as_str) == Some("mcp-bridge") {
+        let (Some(socket), Some(token)) = (args.get(1), args.get(2)) else {
+            eprintln!("usage: blongo mcp-bridge SOCKET TOKEN_FILE");
+            std::process::exit(2);
+        };
+        std::process::exit(blongo_core::mcp::run_bridge(
+            socket.as_ref(),
+            token.as_ref(),
+        ));
+    }
+    let mut config = CoreConfig::from_env();
     match args.first().map(String::as_str) {
         Some("import-t3") => std::process::exit(import_t3(config, args.get(1).map(Into::into))),
         Some("serve") => std::process::exit(serve(&args[1..])),
         Some("env") => std::process::exit(env_command(&args[1..])),
+        Some("register-url-handler") => match deeplink::register() {
+            Ok(text) => {
+                println!("{text}");
+                std::process::exit(0)
+            }
+            Err(err) => {
+                eprintln!("blongo: {err}");
+                std::process::exit(1)
+            }
+        },
         _ => {}
+    }
+    // `blongo blongo://…`: hand the link to a running instance if there is
+    // one; otherwise start and open it.
+    let start_link = args.iter().find(|a| a.starts_with("blongo://")).cloned();
+    if let Some(url) = &start_link {
+        match deeplink::forward(&config.data_dir, url) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => {}
+            Err(err) => eprintln!("blongo: cannot reach the running instance: {err}"),
+        }
+    }
+    // Leftovers of SSH tunnels from crashed runs.
+    std::thread::spawn(|| {
+        let n = blongo_client::target::clean_stale_tunnel_dirs();
+        if n > 0 {
+            eprintln!("blongo: removed {n} stale tunnel folders");
+        }
+    });
+    let app_settings = settings::Settings::load();
+    if let Some(err) = &app_settings.load_error {
+        eprintln!("blongo: {err}; using defaults");
+    }
+    theme::set_light(app_settings.value.theme == settings::ThemeMode::Light);
+    config.settings = app_settings.value.core();
+    // The ACP agent from the settings, unless the environment names one.
+    if config.acp_executable.is_none() && !app_settings.value.acp.executable.is_empty() {
+        config.acp_executable = Some(app_settings.value.acp.executable.clone().into());
+        config.acp_args = app_settings.value.acp.args.clone();
+    }
+    let data_dir = config.data_dir.clone();
+    let mcp = config.mcp;
+    let (link_tx, link_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    if let Some(url) = start_link {
+        let _ = link_tx.send(url);
+    }
+    {
+        let tx = link_tx.clone();
+        if let Err(err) = deeplink::listen(&data_dir, move |url| {
+            let _ = tx.send(url);
+        }) {
+            eprintln!("blongo: cannot listen for blongo:// links: {err}");
+        }
     }
     let (core, events) = match blongo_core::spawn(config.clone()) {
         Ok(core) => core,
@@ -95,20 +186,38 @@ fn main() {
     // Owned by the app; taken and shut down cleanly when the window closes.
     let core = Rc::new(RefCell::new(Some(core)));
     let events = RefCell::new(Some(events));
+    let app_settings = RefCell::new(Some(app_settings));
+    let link_rx = RefCell::new(Some(link_rx));
+    let exit_dir = data_dir.clone();
 
-    application().run(move |cx: &mut App| {
-        input::bind_keys(cx);
-        shell::bind_keys(cx);
-        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+    let app = application();
+    // macOS delivers links to the running app this way.
+    app.on_open_urls(move |urls| {
+        for url in urls {
+            let _ = link_tx.send(url);
+        }
+    });
+    app.run(move |cx: &mut App| {
+        cx.set_global(app_settings.borrow_mut().take().expect("run once"));
+        let (bindings, keybinding_problems) = bind_all(cx);
         let quit_core = core.clone();
+        let quit_dir = exit_dir.clone();
         cx.on_action(move |_: &Quit, cx| {
             if let Some(core) = quit_core.borrow_mut().take() {
                 core.shutdown();
             }
+            deeplink::unlisten(&quit_dir);
             cx.quit();
         });
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let events = events.borrow_mut().take().expect("run once");
+        let options = shell::ShellOptions {
+            data_dir: data_dir.clone(),
+            mcp,
+            bindings,
+            keybinding_problems,
+            links: link_rx.borrow_mut().take(),
+        };
         cx.open_window(
             WindowOptions {
                 focus: true,
@@ -121,16 +230,25 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    shell::Shell::new(client.clone(), events, auto_prompt.clone(), window, cx)
+                    shell::Shell::new(
+                        client.clone(),
+                        events,
+                        auto_prompt.clone(),
+                        options,
+                        window,
+                        cx,
+                    )
                 })
             },
         )
         .expect("open window");
         let close_core = core.clone();
+        let closed_dir = exit_dir.clone();
         cx.on_window_closed(move |cx, _| {
             if let Some(core) = close_core.borrow_mut().take() {
                 core.shutdown();
             }
+            deeplink::unlisten(&closed_dir);
             cx.quit();
         })
         .detach();

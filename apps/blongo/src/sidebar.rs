@@ -38,6 +38,8 @@ pub enum SidebarEvent {
     /// A form was dismissed.
     Dismissed,
     ImportT3,
+    OpenInbox,
+    OpenSettings,
 }
 
 pub struct EnvView {
@@ -255,17 +257,32 @@ impl Render for Sidebar {
             )
             .child(
                 div()
-                    .id("add-project")
-                    .px_2()
-                    .rounded_md()
-                    .text_color(theme::text_muted())
-                    .hover(|d| d.bg(theme::surface_hover()))
-                    .cursor_pointer()
-                    .child("+ Project")
-                    .text_xs()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_form(Form::Project(LOCAL), window, cx)
-                    })),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        small_action("open-inbox".into(), "Inbox")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenInbox))),
+                    )
+                    .child(
+                        small_action("open-settings".into(), "Settings").on_click(
+                            cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenSettings)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("add-project")
+                            .px_2()
+                            .rounded_md()
+                            .text_color(theme::text_muted())
+                            .hover(|d| d.bg(theme::surface_hover()))
+                            .cursor_pointer()
+                            .child("+ Project")
+                            .text_xs()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_form(Form::Project(LOCAL), window, cx)
+                            })),
+                    ),
             );
 
         let form = self.form.map(|form| {

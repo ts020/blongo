@@ -32,6 +32,8 @@ pub enum TimelineEvent {
     Fork(RunId),
     /// Undo this run and every later one.
     Rollback(RunId),
+    /// Show the files this run changed.
+    Diff(RunId),
 }
 
 /// Coalesce streamed deltas into at most one re-layout per frame.
@@ -443,6 +445,9 @@ impl Timeline {
                         .group_hover("user-msg", |d| d.visible())
                         .flex()
                         .gap_1()
+                        .child(turn_action(format!("diff-{id}"), "Changes").on_click(
+                            cx.listener(move |_, _, _, cx| cx.emit(TimelineEvent::Diff(run_id))),
+                        ))
                         .child(
                             turn_action(format!("fork-{id}"), "Fork from here").on_click(
                                 cx.listener(move |_, _, _, cx| {

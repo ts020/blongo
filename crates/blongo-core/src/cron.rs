@@ -162,6 +162,16 @@ struct Local {
     weekday: u32,
 }
 
+/// `YYYY-MM-DD HH:MM` in the machine's local time (UTC where local time
+/// is not available), for showing schedule times.
+pub fn format_local(ms: i64) -> String {
+    let t = local(ms.div_euclid(1000));
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        t.year, t.month, t.day, t.hour, t.minute
+    )
+}
+
 #[cfg(unix)]
 fn local(secs: i64) -> Local {
     // SAFETY: localtime_r only writes the `tm` we pass.
