@@ -3,15 +3,21 @@
 //! used.
 //!
 //! A reader thread feeds PTY output into the emulator; the UI is told at
-//! most once per frame that the screen changed. Scrollback is bounded by
+//! most once per frame that the screen changed. Everything written to the
+//! PTY (keys, the emulator's replies) goes through a channel to a writer
+//! thread, so neither the UI thread nor the emulator lock ever waits on a
+//! full PTY buffer. The reader polls with a timeout and stops when the
+//! panel closes, even if a background job still holds the PTY open. Scrollback is bounded by
 //! [`SCROLLBACK`] lines. Closing the panel (or dropping it) hangs up the
 //! shell this panel started — and only that process — and reaps it off the
 //! UI thread.
 
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
@@ -35,6 +41,8 @@ pub const SCROLLBACK: usize = 1_000;
 pub const FONT_SIZE: f32 = 12.;
 pub const LINE_HEIGHT: f32 = 16.;
 const FRAME: Duration = Duration::from_millis(16);
+/// How often the reader checks whether its panel closed.
+const READ_POLL_MS: i32 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridSize {
@@ -56,28 +64,29 @@ impl Dimensions for GridSize {
 
 /// Answers the emulator's requests that need the PTY (device status
 /// reports and the like).
+/// Called with the emulator locked: only queues the bytes.
 #[derive(Clone)]
 struct Listener {
-    writer: Arc<FairMutex<Box<dyn Write + Send>>>,
+    writer: mpsc::Sender<Vec<u8>>,
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
         if let TermEvent::PtyWrite(text) = event {
-            let mut w = self.writer.lock();
-            let _ = w.write_all(text.as_bytes());
-            let _ = w.flush();
+            let _ = self.writer.send(text.into_bytes());
         }
     }
 }
 
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
-    writer: Arc<FairMutex<Box<dyn Write + Send>>>,
+    writer: mpsc::Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
     size: GridSize,
     exited: Arc<AtomicBool>,
+    /// Tells the reader thread to stop (set when the panel goes away).
+    closed: Arc<AtomicBool>,
     pub title: SharedString,
     focus_handle: FocusHandle,
 }
@@ -105,9 +114,18 @@ impl TerminalView {
         let child = pty.slave.spawn_command(cmd)?;
         // The child holds its own copy of the slave side.
         drop(pty.slave);
-        let reader = pty.master.try_clone_reader()?;
-        let writer: Arc<FairMutex<Box<dyn Write + Send>>> =
-            Arc::new(FairMutex::new(pty.master.take_writer()?));
+        // Our own duplicate of the master for reading, so the reader can
+        // poll it with a timeout.
+        let fd = pty
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow::anyhow!("the PTY has no file descriptor"))?;
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let reader = unsafe { OwnedFd::from_raw_fd(dup) };
+        let writer = Self::spawn_writer(pty.master.take_writer()?)?;
         let config = Config {
             scrolling_history: SCROLLBACK,
             ..Config::default()
@@ -120,9 +138,10 @@ impl TerminalView {
             },
         )));
         let exited = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let master = pty.master;
         Ok(cx.new(|cx| {
-            Self::pump(reader, term.clone(), exited.clone(), cx);
+            Self::pump(reader, term.clone(), exited.clone(), closed.clone(), cx);
             Self {
                 term,
                 writer,
@@ -130,17 +149,35 @@ impl TerminalView {
                 child: Some(child),
                 size,
                 exited,
+                closed,
                 title: SharedString::from(shell),
                 focus_handle: cx.focus_handle(),
             }
         }))
     }
 
+    /// The thread that owns the PTY writer; it ends when every sender
+    /// (the view and the emulator's listener) is gone.
+    fn spawn_writer(mut pty: Box<dyn Write + Send>) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("blongo-pty-writer".into())
+            .spawn(move || {
+                while let Ok(bytes) = rx.recv() {
+                    if pty.write_all(&bytes).and_then(|_| pty.flush()).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        Ok(tx)
+    }
+
     /// Reader thread → emulator; wake the view at most once per frame.
     fn pump(
-        mut reader: Box<dyn Read + Send>,
+        reader: OwnedFd,
         term: Arc<FairMutex<Term<Listener>>>,
         exited: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) {
         let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -149,7 +186,14 @@ impl TerminalView {
             .spawn(move || {
                 let mut processor: Processor = Processor::new();
                 let mut buf = vec![0u8; 64 * 1024];
+                let mut reader = std::fs::File::from(reader);
                 loop {
+                    if closed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !readable(&reader) {
+                        continue;
+                    }
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
@@ -180,10 +224,9 @@ impl TerminalView {
         self.exited.load(Ordering::Relaxed)
     }
 
+    /// Queue bytes for the shell (never blocks the caller).
     pub fn write(&self, bytes: &[u8]) {
-        let mut w = self.writer.lock();
-        let _ = w.write_all(bytes);
-        let _ = w.flush();
+        let _ = self.writer.send(bytes.to_vec());
     }
 
     /// Fit the grid to the panel.
@@ -220,8 +263,22 @@ impl TerminalView {
     }
 }
 
+/// Wait up to [`READ_POLL_MS`] for the PTY to have output (or hang up).
+fn readable(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut fds, 1, READ_POLL_MS) };
+    n > 0
+}
+
 impl Drop for TerminalView {
     fn drop(&mut self) {
+        // The reader stops even if a background job keeps the PTY open.
+        self.closed.store(true, Ordering::Relaxed);
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -549,7 +606,7 @@ mod tests {
 
     #[test]
     fn emulator_scrollback_is_bounded() {
-        let sink: Box<dyn Write + Send> = Box::new(std::io::sink());
+        let (tx, replies) = mpsc::channel();
         let size = GridSize {
             columns: 20,
             lines: 5,
@@ -560,9 +617,7 @@ mod tests {
                 ..Config::default()
             },
             &size,
-            Listener {
-                writer: Arc::new(FairMutex::new(sink)),
-            },
+            Listener { writer: tx },
         );
         let mut processor: Processor = Processor::new();
         for i in 0..(SCROLLBACK * 3) {
@@ -576,5 +631,10 @@ mod tests {
         // "red" carries a color run, and the cursor cell is styled.
         assert!(last.runs[0].0 == (0..3) && last.runs[0].1.color.is_some());
         assert!(last.runs.len() >= 2);
+        // A cursor position request is answered through the writer channel
+        // (queued under the emulator lock, never written there).
+        processor.advance(&mut term, b"\x1b[6n");
+        let reply = replies.try_recv().expect("a queued reply");
+        assert!(reply.starts_with(b"\x1b[") && reply.ends_with(b"R"));
     }
 }
