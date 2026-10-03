@@ -534,7 +534,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -661,11 +661,21 @@ name = "blongo-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blongo-git",
  "blongo-harness",
  "blongo-protocol",
  "blongo-store",
  "dirs",
+ "rusqlite",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "blongo-git"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
  "tokio",
 ]
 
@@ -678,7 +688,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "zip",
 ]
 
 [[package]]
@@ -2812,9 +2824,9 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
@@ -5729,6 +5741,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7229,6 +7247,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "zip"
+version = "7.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]
