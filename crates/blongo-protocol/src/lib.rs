@@ -21,15 +21,43 @@ pub enum AgentKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The provider assigned (or resumed) its own session/thread id.
-    SessionStarted { provider_session_id: String },
-    TextDelta { text: String },
-    ReasoningDelta { text: String },
-    ToolCall { call_id: String, name: String, input: serde_json::Value },
-    ToolResult { call_id: String, is_error: bool, output: String },
+    SessionStarted {
+        provider_session_id: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        call_id: String,
+        is_error: bool,
+        output: String,
+    },
     /// The agent is blocked until the user answers.
-    ApprovalRequest { request_id: String, title: String, detail: String },
-    TurnCompleted { status: TurnStatus },
-    Error { message: String },
+    ApprovalRequest {
+        request_id: String,
+        title: String,
+        detail: String,
+    },
+    /// The agent CLI is not signed in. `url` is a browser sign-in link when
+    /// the agent offered one (Antigravity prints an OAuth URL on stdout).
+    AuthRequired {
+        message: String,
+        url: Option<String>,
+    },
+    TurnCompleted {
+        status: TurnStatus,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
