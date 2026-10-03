@@ -95,6 +95,8 @@ pub struct Shell {
     /// Provider for new threads: the last one picked.
     default_provider: ProviderKind,
     picker: Option<Picker>,
+    /// A rollback waiting for the user's confirmation.
+    confirm_rollback: Option<RollbackConfirm>,
     /// Last rejected command's reason.
     notice: Option<SharedString>,
     /// Sign-in / install progress.
@@ -155,6 +157,7 @@ impl Shell {
             models: HashMap::new(),
             default_provider: ProviderKind::Codex,
             picker: None,
+            confirm_rollback: None,
             notice: None,
             provider_notice: None,
             fatal: None,
@@ -358,11 +361,19 @@ impl Shell {
             }
             CoreEvent::Imported(result) => {
                 let message: SharedString = match result {
-                    Ok(r) => format!(
-                        "Imported {} projects, {} threads ({} already there)",
-                        r.projects, r.threads, r.skipped_threads
-                    )
-                    .into(),
+                    Ok(r) => {
+                        let mut text = format!(
+                            "Imported {} projects, {} threads ({} updated, {} already there)",
+                            r.projects,
+                            r.threads,
+                            r.updated_threads.len(),
+                            r.skipped_threads
+                        );
+                        if r.bad_rows > 0 {
+                            text.push_str(&format!("; skipped {} unreadable rows", r.bad_rows));
+                        }
+                        text.into()
+                    }
                     Err(err) => format!("Import failed: {err}").into(),
                 };
                 self.sidebar.update(cx, |s, cx| {
@@ -386,6 +397,7 @@ impl Shell {
         );
         self.timeline_events = Some(sub);
         self.timeline = Some(timeline);
+        self.confirm_rollback = None;
         self.runs = snapshot.runs.iter().map(|r| (r.id, r.status)).collect();
         self.queued = snapshot
             .runs
@@ -472,6 +484,7 @@ impl Shell {
                 });
                 if selected {
                     self.timeline = None;
+                    self.confirm_rollback = None;
                     self.terminal = None;
                 }
                 cx.notify();
@@ -673,11 +686,116 @@ impl Shell {
         });
     }
 
+    /// Ask before rolling back: it rewrites files (of every thread in the
+    /// same folder) and cannot be undone from here.
     fn rollback(&mut self, run_id: RunId, cx: &mut Context<Self>) {
-        if let Some(thread_id) = self.selected(cx) {
-            self.notice = None;
-            self.dispatch(Command::ThreadRollback { thread_id, run_id });
+        let Some(thread) = self.selected_thread(cx) else {
+            return;
+        };
+        let Some(pos) = self.runs.iter().position(|(id, _)| *id == run_id) else {
+            return;
+        };
+        let turns = self.runs[pos..]
+            .iter()
+            .filter(|(_, s)| {
+                !matches!(
+                    s,
+                    RunStatus::Queued | RunStatus::Cancelled | RunStatus::RolledBack
+                )
+            })
+            .count();
+        let sidebar = self.sidebar.read(cx);
+        let sharers = sidebar
+            .project(thread.project_id)
+            .map(|project| {
+                let mine = canonical(thread.cwd(project));
+                sidebar
+                    .threads
+                    .iter()
+                    .filter(|t| t.id != thread.id && !t.archived)
+                    .filter(|t| {
+                        sidebar.project(t.project_id).is_some_and(|p| {
+                            let theirs = canonical(t.cwd(p));
+                            theirs.starts_with(&mine) || mine.starts_with(&theirs)
+                        })
+                    })
+                    .map(|t| t.title.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.notice = None;
+        self.confirm_rollback = Some(RollbackConfirm {
+            thread_id: thread.id,
+            run_id,
+            turns,
+            sharers,
+        });
+        cx.notify();
+    }
+
+    fn confirm_rollback(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm_rollback.take() else {
+            return;
+        };
+        self.dispatch(Command::ThreadRollback {
+            thread_id: confirm.thread_id,
+            run_id: confirm.run_id,
+            acknowledged_sharers: confirm.sharers.len() as u32,
+        });
+        cx.notify();
+    }
+
+    fn render_rollback_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let confirm = self.confirm_rollback.as_ref()?;
+        let turns = match confirm.turns {
+            1 => "the last turn".to_owned(),
+            n => format!("the last {n} turns"),
+        };
+        let mut text = format!(
+            "Undo {turns}? Files in this folder go back to how they were before it; \
+             the current files are kept in a hidden git ref."
+        );
+        match confirm.sharers.len() {
+            0 => {}
+            1 => text.push_str(&format!(
+                " 1 other thread works in this folder and will see its files change: {}.",
+                confirm.sharers[0]
+            )),
+            n => text.push_str(&format!(
+                " {n} other threads work in this folder and will see their files change: {}.",
+                confirm.sharers.join(", ")
+            )),
         }
+        Some(
+            div()
+                .id("rollback-confirm")
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(theme::warning_bg())
+                .text_xs()
+                .child(div().flex_1().text_color(theme::text()).child(text))
+                .child(button(
+                    "rollback-cancel".into(),
+                    "Cancel",
+                    theme::surface_hover(),
+                    theme::text(),
+                    cx.listener(|this, _, _, cx| {
+                        this.confirm_rollback = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(button(
+                    "rollback-confirm-button".into(),
+                    "Undo",
+                    theme::danger_bg(),
+                    theme::danger(),
+                    cx.listener(|this, _, _, cx| this.confirm_rollback(cx)),
+                )),
+        )
     }
 
     /// Undo the latest turn that is still part of the conversation.
@@ -1147,6 +1265,7 @@ impl Shell {
         });
 
         let picker = self.render_picker(&thread, cx);
+        let rollback_confirm = self.render_rollback_confirm(cx);
         let composer = div().flex().justify_center().px_6().pb_4().child(
             div()
                 .w_full()
@@ -1155,6 +1274,7 @@ impl Shell {
                 .flex_col()
                 .gap_2()
                 .children(queued)
+                .children(rollback_confirm)
                 .when_some(self.notice.clone(), |d, notice| {
                     d.child(div().text_xs().text_color(theme::danger()).child(notice))
                 })
@@ -1361,4 +1481,19 @@ impl Render for Shell {
             .child(self.sidebar.clone().cached(sidebar_style))
             .child(self.render_main(window, cx))
     }
+}
+
+struct RollbackConfirm {
+    thread_id: ThreadId,
+    run_id: RunId,
+    /// Turns the rollback drops.
+    turns: usize,
+    /// Titles of the other threads working in the same folder.
+    sharers: Vec<String>,
+}
+
+fn canonical(path: &str) -> PathBuf {
+    std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path))
 }
