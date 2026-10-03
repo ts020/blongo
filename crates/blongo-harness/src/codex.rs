@@ -42,6 +42,10 @@ pub struct CodexOptions {
     /// Launch the vendored native binary instead of the npm Node shim.
     pub prefer_native: bool,
     pub kill_grace: Duration,
+    /// Continue this Codex thread (`thread/resume`) instead of starting a
+    /// new one. Falls back to `thread/start` when Codex cannot resume it;
+    /// `SessionStarted` then carries a different id.
+    pub resume_thread_id: Option<String>,
 }
 
 impl Default for CodexOptions {
@@ -51,6 +55,7 @@ impl Default for CodexOptions {
             sandbox: "workspace-write".into(),
             prefer_native: true,
             kill_grace: Duration::from_secs(3),
+            resume_thread_id: None,
         }
     }
 }
@@ -533,6 +538,19 @@ async fn setup(
     });
     if let Some(model) = &config.model {
         params["model"] = json!(model);
+    }
+    if let Some(resume) = &options.resume_thread_id {
+        let mut resume_params = params.clone();
+        resume_params["threadId"] = json!(resume);
+        // A thread Codex no longer has (or an older CLI) is not fatal: the
+        // conversation continues in a fresh Codex thread.
+        if let Ok(thread) = peer
+            .call("thread/resume", resume_params, SETUP_TIMEOUT)
+            .await
+            && let Some(id) = thread.pointer("/thread/id").and_then(Value::as_str)
+        {
+            return Ok(id.to_owned());
+        }
     }
     let thread = peer
         .call("thread/start", params, SETUP_TIMEOUT)

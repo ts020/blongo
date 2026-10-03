@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/blongo-protocol", "crates/blongo-harness", "apps/blongo"]
+members = [
+    "crates/blongo-protocol",
+    "crates/blongo-harness",
+    "crates/blongo-store",
+    "crates/blongo-core",
+    "apps/blongo",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -11,6 +17,8 @@ publish = false
 [workspace.dependencies]
 blongo-protocol = { path = "crates/blongo-protocol" }
 blongo-harness = { path = "crates/blongo-harness" }
+blongo-store = { path = "crates/blongo-store" }
+blongo-core = { path = "crates/blongo-core" }
 
 # GPUI: Zed's Apache-2.0 UI crates only, pinned to one rev.
 # Never depend on Zed's GPL-3.0 crates (editor, terminal, markdown, ui, ...).
@@ -23,6 +31,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "sync", "time"] }
 mimalloc = { version = "0.1", default-features = false }
+uuid = { version = "1", features = ["v7", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "6"
+unicode-segmentation = "1"
 
 [profile.release]
 lto = "thin"

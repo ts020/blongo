@@ -1,9 +1,13 @@
 //! Domain types shared by the core, the harnesses and the UI.
 //!
-//! Phase 0 only carries what the harness spikes emit. The full command/event
-//! model (Project → Thread → Run → TurnItem) lands in Phase 1.
+//! - [`domain`]: the orchestration model (Project → Thread → Run → TurnItem),
+//!   commands and sequenced domain events.
+//! - [`AgentEvent`]: what a harness emits, normalized at the provider edge.
 
 use serde::{Deserialize, Serialize};
+
+pub mod domain;
+pub use domain::*;
 
 /// Which agent CLI a harness drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

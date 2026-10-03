@@ -5,7 +5,10 @@ Message names and shapes follow `codex app-server generate-json-schema`
 from codex-cli 0.160.0 and its real responses (notifications carry no
 "jsonrpc" field and an "emittedAtMs", like the real server).
 
-Prompt "loop" streams deltas until `turn/interrupt`; any other prompt runs a
+Prompt "loop" streams deltas until `turn/interrupt`; a prompt starting with
+"markdown" streams a Markdown reply with a file change; "replay" streams the
+zeron-format journal named by FAKE_CODEX_REPLAY (reasoningDelta / textDelta
+lines) every FAKE_CODEX_DELAY_MS (default 40); any other prompt runs a
 command-execution approval round trip. FAKE_CODEX_SIGNED_OUT=1 makes
 `account/read` report no account.
 """
@@ -63,6 +66,12 @@ def handle_setup(msg):
         respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
                       "model": "fake-model", "approvalPolicy": msg["params"].get("approvalPolicy")})
         notify("thread/started", {"thread": {"id": THREAD}})
+    elif method == "thread/resume":
+        if msg["params"].get("threadId") == THREAD:
+            respond(msg, {"thread": {"id": THREAD, "status": {"type": "idle"}, "turns": []},
+                          "model": "fake-model"})
+        else:
+            send({"id": msg["id"], "error": {"code": -32600, "message": "no rollout found"}})
     elif method == "turn/interrupt":
         send({"id": msg["id"], "error": {"code": -32600, "message": "no active turn"}})
     elif "id" in msg and "method" in msg:
@@ -138,6 +147,86 @@ def loop_turn(turn_id):
                {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": f"tick {n} "})
 
 
+MARKDOWN = """## Plan
+
+I looked at the project layout first. The change is small:
+
+1. Add a `greet` function.
+2. Call it from `main`.
+
+```rust
+fn greet(name: &str) -> String {
+    format!("Hello, {name}!")
+}
+```
+
+Done. The file `src/main.rs` was updated and the build is green.
+"""
+
+
+def interruptible_sleep(seconds):
+    """Sleep, but return True if a turn/interrupt arrived meanwhile."""
+    try:
+        msg = inbox.get(timeout=seconds)
+    except queue.Empty:
+        return False, None
+    if msg is None:
+        sys.exit(0)
+    if msg.get("method") == "turn/interrupt":
+        respond(msg, {})
+        return True, msg
+    return False, msg
+
+
+def stream(turn_id, deltas, delay):
+    """Stream (kind, text) deltas; True if interrupted."""
+    for kind, text in deltas:
+        if kind == "reasoning":
+            notify("item/reasoning/summaryTextDelta", {"threadId": THREAD, "turnId": turn_id,
+                                                       "itemId": "r1", "delta": text, "summaryIndex": 0})
+        else:
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": text})
+        interrupted, _ = interruptible_sleep(delay)
+        if interrupted:
+            complete(turn_id, "interrupted")
+            return True
+    return False
+
+
+def markdown_turn(turn_id):
+    delay = int(os.environ.get("FAKE_CODEX_DELAY_MS", "30")) / 1000
+    words = MARKDOWN.split(" ")
+    deltas = [("reasoning", "Reading the project layout, "), ("reasoning", "then editing main.rs.")]
+    deltas += [("text", w + " ") for w in words[:-1]] + [("text", words[-1])]
+    half = len(deltas) // 2
+    if stream(turn_id, deltas[:half], delay):
+        return
+    item = {"type": "fileChange", "id": "f1", "status": "inProgress",
+            "changes": [{"path": "src/main.rs", "kind": {"type": "update"}, "diff": "+fn greet"}]}
+    notify("item/started", {"threadId": THREAD, "turnId": turn_id, "item": item})
+    notify("item/completed", {"threadId": THREAD, "turnId": turn_id, "item": dict(item, status="completed")})
+    if stream(turn_id, deltas[half:], delay):
+        return
+    complete(turn_id, "completed")
+
+
+def replay_turn(turn_id):
+    delay = int(os.environ.get("FAKE_CODEX_DELAY_MS", "40")) / 1000
+    deltas = []
+    with open(os.environ["FAKE_CODEX_REPLAY"]) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            event = json.loads(line)["event"]
+            if event["type"] == "reasoningDelta":
+                deltas.append(("reasoning", event["text"]))
+            elif event["type"] == "textDelta":
+                deltas.append(("text", event["text"]))
+    if not stream(turn_id, deltas, delay):
+        complete(turn_id, "completed")
+
+
 def main():
     global turn_seq
     threading.Thread(target=reader, daemon=True).start()
@@ -155,6 +244,10 @@ def main():
         text = msg["params"]["input"][0]["text"]
         if text == "loop":
             loop_turn(turn_id)
+        elif text.startswith("markdown"):
+            markdown_turn(turn_id)
+        elif text.startswith("replay"):
+            replay_turn(turn_id)
         else:
             tool_turn(turn_id)
 

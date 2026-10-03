@@ -1,0 +1,774 @@
+//! SQLite event store (rusqlite, WAL).
+//!
+//! One [`Store::commit`] writes, in a single transaction (t3code's
+//! `EventSink.commitCommand` pattern):
+//!
+//! 1. the domain events, appended to `events` with the next global sequence,
+//! 2. the projection rows they imply (`projects`, `threads`, `runs`,
+//!    `turn_items`),
+//! 3. the command receipt (when the batch answers a client command), and
+//! 4. effect outbox rows for the core's effect worker.
+//!
+//! Replaying a command id that already has a receipt changes nothing and
+//! returns [`CommitOutcome::Duplicate`].
+//!
+//! Message bodies are stored once, in `turn_items.body`. Event payloads
+//! carry no bodies (`ItemTextAppended` logs only the resulting length), so
+//! the log stays small and streaming never writes a row per token: the core
+//! coalesces deltas and commits them every few hundred milliseconds.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context as _, bail};
+use blongo_protocol::{
+    CommandId, DomainEvent, EventKind, ItemId, ItemKind, Project, ProjectId, Run, RunId, RunStatus,
+    Thread, ThreadId, ThreadStatus, Timestamp, TurnItem,
+};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use serde::{Deserialize, Serialize};
+
+mod migrations;
+
+pub use migrations::LATEST_VERSION;
+
+/// A side effect the core must perform after a commit. Stored in the outbox
+/// in the same transaction as the events that caused it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Effect {
+    /// Start a provider turn for `run_id` with the body of `message_id`.
+    ProviderTurnStart {
+        thread_id: ThreadId,
+        run_id: RunId,
+        message_id: ItemId,
+    },
+    ProviderInterrupt {
+        thread_id: ThreadId,
+        run_id: RunId,
+    },
+    RuntimeRequestRespond {
+        thread_id: ThreadId,
+        run_id: RunId,
+        provider_request_id: String,
+        approve: bool,
+    },
+}
+
+impl Effect {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::ProviderTurnStart { .. } => "provider_turn_start",
+            Self::ProviderInterrupt { .. } => "provider_interrupt",
+            Self::RuntimeRequestRespond { .. } => "runtime_request_respond",
+        }
+    }
+
+    pub fn thread_id(&self) -> ThreadId {
+        match self {
+            Self::ProviderTurnStart { thread_id, .. }
+            | Self::ProviderInterrupt { thread_id, .. }
+            | Self::RuntimeRequestRespond { thread_id, .. } => *thread_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectStatus {
+    Pending,
+    Done,
+    /// Process-bound effect left over from a previous process; not retried.
+    Dropped,
+}
+
+impl EffectStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Done => "done",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub effect: Effect,
+}
+
+/// What one commit writes.
+#[derive(Debug, Default)]
+pub struct Batch {
+    /// The client command this batch answers (gets a receipt).
+    pub command_id: Option<CommandId>,
+    pub events: Vec<EventKind>,
+    pub effects: Vec<Effect>,
+}
+
+impl Batch {
+    pub fn for_command(command_id: CommandId) -> Self {
+        Self {
+            command_id: Some(command_id),
+            ..Self::default()
+        }
+    }
+
+    pub fn event(mut self, event: EventKind) -> Self {
+        self.events.push(event);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.effects.is_empty() && self.command_id.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub command_id: CommandId,
+    /// Sequence range of the events the command produced (`None` if none).
+    pub sequences: Option<(u64, u64)>,
+    pub at: Timestamp,
+}
+
+#[derive(Debug)]
+pub enum CommitOutcome {
+    Committed {
+        events: Vec<DomainEvent>,
+        outbox: Vec<OutboxRow>,
+    },
+    /// The command id already had a receipt; nothing was written.
+    Duplicate(Receipt),
+}
+
+pub struct Store {
+    conn: Connection,
+    last_sequence: u64,
+}
+
+impl Store {
+    /// Open (creating if needed) and migrate the database at `path`.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create data dir {}", dir.display()))?;
+        }
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> anyhow::Result<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Small page cache: the working set is a few open threads.
+        conn.pragma_update(None, "cache_size", -1024)?;
+        conn.set_prepared_statement_cache_capacity(32);
+        migrations::migrate(&conn)?;
+        let last_sequence: i64 =
+            conn.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |r| {
+                r.get(0)
+            })?;
+        Ok(Self {
+            conn,
+            last_sequence: last_sequence as u64,
+        })
+    }
+
+    pub fn schema_version(&self) -> anyhow::Result<u32> {
+        migrations::current_version(&self.conn)
+    }
+
+    pub fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
+    /// Commit a batch atomically. On any error nothing is written.
+    pub fn commit(&mut self, batch: Batch) -> anyhow::Result<CommitOutcome> {
+        if let Some(command_id) = batch.command_id
+            && let Some(receipt) = self.receipt(command_id)?
+        {
+            return Ok(CommitOutcome::Duplicate(receipt));
+        }
+        let at = Timestamp::now();
+        let tx = self.conn.transaction()?;
+        let mut sequence = self.last_sequence;
+        let mut events = Vec::with_capacity(batch.events.len());
+        for kind in batch.events {
+            sequence += 1;
+            let event = DomainEvent {
+                sequence,
+                at,
+                command_id: batch.command_id,
+                kind,
+            };
+            append_event(&tx, &event)?;
+            apply(&tx, &event)?;
+            events.push(event);
+        }
+        if let Some(command_id) = batch.command_id {
+            let range = events
+                .first()
+                .zip(events.last())
+                .map(|(a, b)| (a.sequence as i64, b.sequence as i64));
+            tx.prepare_cached(
+                "INSERT INTO command_receipts (command_id, first_sequence, last_sequence, at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                command_id.to_string(),
+                range.map(|r| r.0),
+                range.map(|r| r.1),
+                at.0
+            ])?;
+        }
+        let mut outbox = Vec::with_capacity(batch.effects.len());
+        for effect in batch.effects {
+            tx.prepare_cached(
+                "INSERT INTO effect_outbox (thread_id, kind, payload, status, created_at)
+                 VALUES (?1, ?2, ?3, 'pending', ?4)",
+            )?
+            .execute(params![
+                effect.thread_id().to_string(),
+                effect.tag(),
+                serde_json::to_string(&effect)?,
+                at.0
+            ])?;
+            outbox.push(OutboxRow {
+                id: tx.last_insert_rowid(),
+                effect,
+            });
+        }
+        tx.commit()?;
+        self.last_sequence = sequence;
+        Ok(CommitOutcome::Committed { events, outbox })
+    }
+
+    pub fn receipt(&self, command_id: CommandId) -> anyhow::Result<Option<Receipt>> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT first_sequence, last_sequence, at FROM command_receipts
+                 WHERE command_id = ?1",
+            )?
+            .query_row([command_id.to_string()], |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?;
+        Ok(row.map(|(first, last, at)| Receipt {
+            command_id,
+            sequences: first.zip(last).map(|(a, b)| (a as u64, b as u64)),
+            at: Timestamp(at),
+        }))
+    }
+
+    /// Committed events after `sequence`, oldest first (bodies excluded).
+    pub fn events_after(&self, sequence: u64, limit: usize) -> anyhow::Result<Vec<DomainEvent>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT sequence, at, command_id, payload FROM events
+             WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![sequence as i64, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (sequence, at, command_id, payload) = row?;
+            out.push(DomainEvent {
+                sequence: sequence as u64,
+                at: Timestamp(at),
+                command_id: command_id.as_deref().and_then(CommandId::parse),
+                kind: serde_json::from_str(&payload)
+                    .with_context(|| format!("event {sequence} payload"))?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn projects(&self) -> anyhow::Result<Vec<Project>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, name, path, created_at FROM projects ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Project {
+                id: ProjectId(uuid_col(r, 0)?),
+                name: r.get(1)?,
+                path: r.get(2)?,
+                created_at: Timestamp(r.get(3)?),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn project(&self, id: ProjectId) -> anyhow::Result<Option<Project>> {
+        Ok(self.projects()?.into_iter().find(|p| p.id == id))
+    }
+
+    /// Threads, most recently updated first.
+    pub fn threads(&self, include_archived: bool) -> anyhow::Result<Vec<Thread>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, project_id, title, status, archived, created_at, updated_at,
+                    provider_thread_id
+             FROM threads WHERE archived = 0 OR ?1
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([include_archived], thread_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn thread(&self, id: ThreadId) -> anyhow::Result<Option<Thread>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT id, project_id, title, status, archived, created_at, updated_at,
+                        provider_thread_id
+                 FROM threads WHERE id = ?1",
+            )?
+            .query_row([id.to_string()], thread_row)
+            .optional()?)
+    }
+
+    pub fn runs(&self, thread_id: ThreadId) -> anyhow::Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error
+             FROM runs WHERE thread_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([thread_id.to_string()], run_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Runs not in a terminal state (across all threads).
+    pub fn unfinished_runs(&self) -> anyhow::Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, thread_id, parent_run_id, status, created_at, ended_at, error
+             FROM runs WHERE status IN ('starting', 'running', 'waiting')
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], run_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn items(&self, thread_id: ThreadId) -> anyhow::Result<Vec<Arc<TurnItem>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, thread_id, run_id, ordinal, created_at, data, body
+             FROM turn_items WHERE thread_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([thread_id.to_string()], item_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(Arc::new(row??));
+        }
+        Ok(out)
+    }
+
+    pub fn item(&self, id: ItemId) -> anyhow::Result<Option<TurnItem>> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT id, thread_id, run_id, ordinal, created_at, data, body
+                 FROM turn_items WHERE id = ?1",
+            )?
+            .query_row([id.to_string()], item_row)
+            .optional()?;
+        row.transpose()
+    }
+
+    /// Items of a run that are still streaming or awaiting an answer.
+    pub fn open_items(&self, run_id: RunId) -> anyhow::Result<Vec<TurnItem>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, thread_id, run_id, ordinal, created_at, data, body
+             FROM turn_items WHERE run_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([run_id.to_string()], item_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let item = row??;
+            let open = match &item.kind {
+                ItemKind::AssistantMessage { streaming } | ItemKind::Reasoning { streaming } => {
+                    *streaming
+                }
+                ItemKind::ApprovalRequest { state, .. } => {
+                    *state == blongo_protocol::ApprovalState::Pending
+                }
+                ItemKind::CommandExecution { status, .. }
+                | ItemKind::FileChange { status, .. }
+                | ItemKind::ToolCall { status, .. } => {
+                    *status == blongo_protocol::ToolStatus::Running
+                }
+                _ => false,
+            };
+            if open {
+                out.push(item);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Next free ordinal in a thread's timeline.
+    pub fn next_ordinal(&self, thread_id: ThreadId) -> anyhow::Result<u32> {
+        let max: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT MAX(ordinal) FROM turn_items WHERE thread_id = ?1")?
+            .query_row([thread_id.to_string()], |r| r.get(0))?;
+        Ok(max.map_or(0, |m| m as u32 + 1))
+    }
+
+    pub fn pending_effects(&self) -> anyhow::Result<Vec<OutboxRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, payload FROM effect_outbox WHERE status = 'pending' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            out.push(OutboxRow {
+                id,
+                effect: serde_json::from_str(&payload)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn set_effect_status(&self, id: i64, status: EffectStatus) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE effect_outbox SET status = ?2, attempts = attempts + 1 WHERE id = ?1",
+            )?
+            .execute(params![id, status.as_str()])?;
+        Ok(())
+    }
+
+    /// Delete finished outbox rows (they have no further use).
+    pub fn prune_effects(&self) -> anyhow::Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM effect_outbox WHERE status != 'pending'", [])?)
+    }
+}
+
+fn append_event(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO events (sequence, at, thread_id, command_id, kind, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?
+    .execute(params![
+        event.sequence as i64,
+        event.at.0,
+        event.kind.thread_id().map(|t| t.to_string()),
+        event.command_id.map(|c| c.to_string()),
+        event.kind.tag(),
+        serde_json::to_string(&event.kind)?,
+    ])?;
+    Ok(())
+}
+
+/// Update the projection tables for one event (inside the commit's
+/// transaction).
+fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
+    let at = event.at.0;
+    match &event.kind {
+        EventKind::ProjectCreated { project } => {
+            tx.prepare_cached(
+                "INSERT INTO projects (id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                project.id.to_string(),
+                project.name,
+                project.path,
+                project.created_at.0
+            ])?;
+        }
+        EventKind::ThreadCreated { thread } => {
+            tx.prepare_cached(
+                "INSERT INTO threads (id, project_id, title, status, archived, created_at,
+                                      updated_at, provider_thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(params![
+                thread.id.to_string(),
+                thread.project_id.to_string(),
+                thread.title,
+                thread_status_str(thread.status),
+                thread.archived,
+                thread.created_at.0,
+                thread.updated_at.0,
+                thread.provider_thread_id,
+            ])?;
+        }
+        EventKind::ThreadRenamed { thread_id, title } => {
+            expect_one(
+                tx.prepare_cached("UPDATE threads SET title = ?2, updated_at = ?3 WHERE id = ?1")?
+                    .execute(params![thread_id.to_string(), title, at])?,
+                "thread",
+            )?;
+        }
+        EventKind::ThreadArchived { thread_id } => {
+            expect_one(
+                tx.prepare_cached("UPDATE threads SET archived = 1 WHERE id = ?1")?
+                    .execute([thread_id.to_string()])?,
+                "thread",
+            )?;
+        }
+        EventKind::ThreadProviderBound {
+            thread_id,
+            provider_thread_id,
+        } => {
+            expect_one(
+                tx.prepare_cached("UPDATE threads SET provider_thread_id = ?2 WHERE id = ?1")?
+                    .execute(params![thread_id.to_string(), provider_thread_id])?,
+                "thread",
+            )?;
+        }
+        EventKind::RunCreated { run } => {
+            tx.prepare_cached(
+                "INSERT INTO runs (id, thread_id, parent_run_id, status, created_at, ended_at,
+                                   error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(params![
+                run.id.to_string(),
+                run.thread_id.to_string(),
+                run.parent_run_id.map(|r| r.to_string()),
+                run_status_str(run.status),
+                run.created_at.0,
+                run.ended_at.map(|t| t.0),
+                run.error,
+            ])?;
+            if run.parent_run_id.is_none() {
+                set_thread_status(tx, run.thread_id, run.status.thread_status(), at)?;
+            }
+        }
+        EventKind::RunStatusChanged {
+            thread_id,
+            run_id,
+            status,
+            error,
+        } => {
+            let ended = status.is_terminal().then_some(at);
+            expect_one(
+                tx.prepare_cached(
+                    "UPDATE runs SET status = ?2, error = COALESCE(?3, error),
+                                     ended_at = COALESCE(?4, ended_at)
+                     WHERE id = ?1",
+                )?
+                .execute(params![
+                    run_id.to_string(),
+                    run_status_str(*status),
+                    error,
+                    ended
+                ])?,
+                "run",
+            )?;
+            let parent: Option<String> = tx
+                .prepare_cached("SELECT parent_run_id FROM runs WHERE id = ?1")?
+                .query_row([run_id.to_string()], |r| r.get(0))?;
+            // Invariant: only a root run moves the thread (and ends a turn).
+            if parent.is_none() {
+                set_thread_status(tx, *thread_id, status.thread_status(), at)?;
+            }
+        }
+        EventKind::ItemAdded { item } => {
+            tx.prepare_cached(
+                "INSERT INTO turn_items (id, thread_id, run_id, ordinal, kind, created_at,
+                                         updated_at, data, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+            )?
+            .execute(params![
+                item.id.to_string(),
+                item.thread_id.to_string(),
+                item.run_id.map(|r| r.to_string()),
+                item.ordinal,
+                item.kind.tag(),
+                item.created_at.0,
+                serde_json::to_string(&item.kind)?,
+                &*item.text,
+            ])?;
+        }
+        EventKind::ItemUpdated { item } => {
+            expect_one(
+                tx.prepare_cached(
+                    "UPDATE turn_items SET kind = ?2, data = ?3, updated_at = ?4 WHERE id = ?1",
+                )?
+                .execute(params![
+                    item.id.to_string(),
+                    item.kind.tag(),
+                    serde_json::to_string(&item.kind)?,
+                    at
+                ])?,
+                "item",
+            )?;
+        }
+        EventKind::ItemTextAppended { item_id, chunk, .. } => {
+            expect_one(
+                tx.prepare_cached(
+                    "UPDATE turn_items SET body = body || ?2, updated_at = ?3 WHERE id = ?1",
+                )?
+                .execute(params![item_id.to_string(), &**chunk, at])?,
+                "item",
+            )?;
+        }
+        EventKind::ItemFinished { item_id, .. } => {
+            let data: String = tx
+                .prepare_cached("SELECT data FROM turn_items WHERE id = ?1")?
+                .query_row([item_id.to_string()], |r| r.get(0))
+                .optional()?
+                .with_context(|| format!("unknown item {item_id}"))?;
+            let mut kind: ItemKind = serde_json::from_str(&data)?;
+            match &mut kind {
+                ItemKind::AssistantMessage { streaming } | ItemKind::Reasoning { streaming } => {
+                    *streaming = false
+                }
+                _ => {}
+            }
+            tx.prepare_cached("UPDATE turn_items SET data = ?2, updated_at = ?3 WHERE id = ?1")?
+                .execute(params![
+                    item_id.to_string(),
+                    serde_json::to_string(&kind)?,
+                    at
+                ])?;
+        }
+    }
+    Ok(())
+}
+
+fn expect_one(changed: usize, what: &str) -> anyhow::Result<()> {
+    if changed != 1 {
+        bail!("{what} not found");
+    }
+    Ok(())
+}
+
+fn set_thread_status(
+    tx: &Transaction<'_>,
+    thread_id: ThreadId,
+    status: ThreadStatus,
+    at: i64,
+) -> anyhow::Result<()> {
+    expect_one(
+        tx.prepare_cached("UPDATE threads SET status = ?2, updated_at = ?3 WHERE id = ?1")?
+            .execute(params![
+                thread_id.to_string(),
+                thread_status_str(status),
+                at
+            ])?,
+        "thread",
+    )
+}
+
+fn thread_status_str(status: ThreadStatus) -> &'static str {
+    match status {
+        ThreadStatus::Idle => "idle",
+        ThreadStatus::Running => "running",
+        ThreadStatus::Waiting => "waiting",
+        ThreadStatus::Failed => "failed",
+    }
+}
+
+fn parse_thread_status(s: &str) -> ThreadStatus {
+    match s {
+        "running" => ThreadStatus::Running,
+        "waiting" => ThreadStatus::Waiting,
+        "failed" => ThreadStatus::Failed,
+        _ => ThreadStatus::Idle,
+    }
+}
+
+fn run_status_str(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Starting => "starting",
+        RunStatus::Running => "running",
+        RunStatus::Waiting => "waiting",
+        RunStatus::Completed => "completed",
+        RunStatus::Interrupted => "interrupted",
+        RunStatus::Failed => "failed",
+    }
+}
+
+fn parse_run_status(s: &str) -> RunStatus {
+    match s {
+        "starting" => RunStatus::Starting,
+        "running" => RunStatus::Running,
+        "waiting" => RunStatus::Waiting,
+        "completed" => RunStatus::Completed,
+        "interrupted" => RunStatus::Interrupted,
+        _ => RunStatus::Failed,
+    }
+}
+
+fn uuid_col(r: &Row<'_>, ix: usize) -> rusqlite::Result<blongo_protocol::Uuid> {
+    let s: String = r.get(ix)?;
+    s.parse().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(ix, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn opt_uuid_col(r: &Row<'_>, ix: usize) -> rusqlite::Result<Option<blongo_protocol::Uuid>> {
+    match r.get::<_, Option<String>>(ix)? {
+        None => Ok(None),
+        Some(_) => uuid_col(r, ix).map(Some),
+    }
+}
+
+fn thread_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
+    Ok(Thread {
+        id: ThreadId(uuid_col(r, 0)?),
+        project_id: ProjectId(uuid_col(r, 1)?),
+        title: r.get(2)?,
+        status: parse_thread_status(&r.get::<_, String>(3)?),
+        archived: r.get(4)?,
+        created_at: Timestamp(r.get(5)?),
+        updated_at: Timestamp(r.get(6)?),
+        provider_thread_id: r.get(7)?,
+    })
+}
+
+fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: RunId(uuid_col(r, 0)?),
+        thread_id: ThreadId(uuid_col(r, 1)?),
+        parent_run_id: opt_uuid_col(r, 2)?.map(RunId),
+        status: parse_run_status(&r.get::<_, String>(3)?),
+        created_at: Timestamp(r.get(4)?),
+        ended_at: r.get::<_, Option<i64>>(5)?.map(Timestamp),
+        error: r.get(6)?,
+    })
+}
+
+/// Outer error: SQL; inner: JSON in `data`.
+fn item_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<TurnItem>> {
+    let data: String = r.get(5)?;
+    let body: String = r.get(6)?;
+    let id = ItemId(uuid_col(r, 0)?);
+    let thread_id = ThreadId(uuid_col(r, 1)?);
+    let run_id = opt_uuid_col(r, 2)?.map(RunId);
+    let ordinal: u32 = r.get(3)?;
+    let created_at = Timestamp(r.get(4)?);
+    Ok(serde_json::from_str::<ItemKind>(&data)
+        .with_context(|| format!("item {id} data"))
+        .map(|kind| TurnItem {
+            id,
+            thread_id,
+            run_id,
+            ordinal,
+            created_at,
+            kind,
+            text: body.into(),
+        }))
+}
+
+#[cfg(test)]
+mod tests;
