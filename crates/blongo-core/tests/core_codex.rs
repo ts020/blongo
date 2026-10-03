@@ -3,200 +3,9 @@
 //! approval, deny, interrupt, idempotency, restart restore and crash
 //! recovery.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+mod common;
 
-use blongo_core::{CoreConfig, CoreEvent, CoreHandle};
-use blongo_protocol::{
-    ApprovalDecision, ApprovalState, Command, CommandEnvelope, EventKind, ItemId, ItemKind,
-    ProjectId, RunId, RunStatus, ShellSnapshot, ThreadId, ThreadSnapshot, ThreadStatus, ToolStatus,
-    TurnItem,
-};
-use tokio::sync::mpsc::UnboundedReceiver;
-
-fn fake_codex() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../blongo-harness/tests/fixtures/fake_codex.py")
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blongo-core-{name}-{}", ThreadId::new()));
-    std::fs::create_dir_all(dir.join("project")).unwrap();
-    dir
-}
-
-struct TestCore {
-    handle: Option<CoreHandle>,
-    rx: UnboundedReceiver<CoreEvent>,
-    last_sequence: u64,
-}
-
-impl TestCore {
-    fn start(dir: &Path) -> (Self, Arc<ShellSnapshot>) {
-        Self::start_with(dir, |_| {})
-    }
-
-    fn start_with(dir: &Path, tweak: impl FnOnce(&mut CoreConfig)) -> (Self, Arc<ShellSnapshot>) {
-        let mut config = CoreConfig::new(dir.join("data/blongo.sqlite"));
-        config.codex_executable = Some(fake_codex());
-        config.text_flush_interval = Duration::from_millis(30);
-        tweak(&mut config);
-        let (handle, mut rx) = blongo_core::spawn(config).unwrap();
-        let shell = match rx.blocking_recv_timeout() {
-            CoreEvent::Shell(shell) => shell,
-            other => panic!("expected shell snapshot, got {other:?}"),
-        };
-        let core = Self {
-            handle: Some(handle),
-            rx,
-            last_sequence: shell.sequence,
-        };
-        (core, shell)
-    }
-
-    fn handle(&self) -> &CoreHandle {
-        self.handle.as_ref().unwrap()
-    }
-
-    fn dispatch(&self, command: Command) -> CommandEnvelope {
-        let envelope = CommandEnvelope::new(command);
-        self.handle().dispatch(envelope.clone());
-        envelope
-    }
-
-    async fn next(&mut self) -> CoreEvent {
-        let event = tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
-            .await
-            .expect("timed out waiting for a core event")
-            .expect("core channel closed");
-        if let CoreEvent::Event(e) = &event {
-            assert!(
-                e.sequence > self.last_sequence,
-                "sequence must increase: {} after {}",
-                e.sequence,
-                self.last_sequence
-            );
-            self.last_sequence = e.sequence;
-        }
-        event
-    }
-
-    /// Skip events until `f` returns `Some`.
-    async fn until<T>(&mut self, mut f: impl FnMut(&CoreEvent) -> Option<T>) -> T {
-        loop {
-            let event = self.next().await;
-            if let CoreEvent::CommandRejected { reason, .. } = &event {
-                eprintln!("(rejected: {reason})");
-            }
-            if let Some(out) = f(&event) {
-                return out;
-            }
-        }
-    }
-
-    async fn run_finished(&mut self) -> RunStatus {
-        self.until(|e| match e {
-            CoreEvent::RunFinished { status, .. } => Some(*status),
-            _ => None,
-        })
-        .await
-    }
-
-    async fn added_item(&mut self, pred: impl Fn(&TurnItem) -> bool) -> Arc<TurnItem> {
-        self.until(|e| match e {
-            CoreEvent::Event(ev) => match &ev.kind {
-                EventKind::ItemAdded { item } if pred(item) => Some(item.clone()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .await
-    }
-
-    async fn snapshot(&mut self, thread_id: ThreadId) -> Arc<ThreadSnapshot> {
-        self.handle().open_thread(thread_id);
-        self.until(|e| match e {
-            CoreEvent::Thread(s) if s.thread_id == thread_id => Some(s.clone()),
-            _ => None,
-        })
-        .await
-    }
-
-    async fn rejected(&mut self, envelope: &CommandEnvelope) -> String {
-        let id = envelope.command_id;
-        self.until(|e| match e {
-            CoreEvent::CommandRejected { command_id, reason } if *command_id == id => {
-                Some(reason.clone())
-            }
-            CoreEvent::Event(ev) if ev.command_id == Some(id) => {
-                panic!("command was accepted: {ev:?}")
-            }
-            _ => None,
-        })
-        .await
-    }
-
-    /// Create a project + thread; returns the thread id.
-    async fn project_and_thread(&mut self, dir: &Path) -> (ProjectId, ThreadId) {
-        let project_id = ProjectId::new();
-        let thread_id = ThreadId::new();
-        self.dispatch(Command::ProjectCreate {
-            project_id,
-            name: String::new(),
-            path: dir.join("project").to_string_lossy().into_owned(),
-        });
-        self.dispatch(Command::ThreadCreate {
-            thread_id,
-            project_id,
-            title: String::new(),
-        });
-        self.until(|e| match e {
-            CoreEvent::Event(ev) => match &ev.kind {
-                EventKind::ThreadCreated { thread } if thread.id == thread_id => Some(()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .await;
-        (project_id, thread_id)
-    }
-
-    fn send(&self, thread_id: ThreadId, text: &str) -> CommandEnvelope {
-        self.dispatch(Command::MessageDispatch {
-            thread_id,
-            message_id: ItemId::new(),
-            run_id: RunId::new(),
-            text: text.into(),
-        })
-    }
-
-    fn shutdown(mut self) {
-        self.handle.take().unwrap().shutdown();
-    }
-
-    fn abort(mut self) {
-        self.handle.take().unwrap().abort();
-    }
-}
-
-trait RecvTimeout {
-    fn blocking_recv_timeout(&mut self) -> CoreEvent;
-}
-
-impl RecvTimeout for UnboundedReceiver<CoreEvent> {
-    fn blocking_recv_timeout(&mut self) -> CoreEvent {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match self.try_recv() {
-                Ok(event) => return event,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(e) => panic!("no shell snapshot: {e:?}"),
-            }
-        }
-    }
-}
+use common::*;
 
 fn kinds(snapshot: &ThreadSnapshot) -> Vec<&'static str> {
     snapshot.items.iter().map(|i| i.kind.tag()).collect()
@@ -331,15 +140,48 @@ async fn full_turns_approval_deny_interrupt_and_restore() {
         .count();
     assert_eq!(denied, 1);
 
-    // Turn 3: busy rejection, then interrupt a streaming turn.
+    // Turn 3: a message sent meanwhile queues (and is cancelled again),
+    // then interrupt a streaming turn.
     core.send(thread_id, "loop");
     core.until(|e| match e {
         CoreEvent::TextDelta { chunk, .. } if chunk.starts_with("tick 3") => Some(()),
         _ => None,
     })
     .await;
-    let busy = core.send(thread_id, "too soon");
-    assert!(core.rejected(&busy).await.contains("already running"));
+    let queued_run = RunId::new();
+    core.dispatch(Command::MessageDispatch {
+        thread_id,
+        message_id: ItemId::new(),
+        run_id: queued_run,
+        text: "too soon".into(),
+        delivery: Delivery::Queue,
+    });
+    core.until(|e| match e {
+        CoreEvent::Event(ev) => match &ev.kind {
+            EventKind::RunCreated { run } if run.id == queued_run => {
+                assert_eq!(run.status, RunStatus::Queued);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    core.dispatch(Command::RunCancel {
+        thread_id,
+        run_id: queued_run,
+    });
+    core.until(|e| match e {
+        CoreEvent::Event(ev) => match &ev.kind {
+            EventKind::RunStatusChanged { run_id, status, .. } if *run_id == queued_run => {
+                assert_eq!(*status, RunStatus::Cancelled);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
     core.dispatch(Command::RunInterrupt { thread_id });
     assert_eq!(core.run_finished().await, RunStatus::Interrupted);
     let snap = core.snapshot(thread_id).await;
@@ -349,7 +191,13 @@ async fn full_turns_approval_deny_interrupt_and_restore() {
     );
     let ticks = texts(&snap, "assistant_message").last().unwrap().clone();
     assert!(ticks.starts_with("tick 1 tick 2 tick 3"), "{ticks}");
-    assert_eq!(snap.runs.last().unwrap().status, RunStatus::Interrupted);
+    // The cancelled queued run is listed but its message is hidden.
+    assert_eq!(snap.runs.last().unwrap().status, RunStatus::Cancelled);
+    assert_eq!(
+        snap.runs[snap.runs.len() - 2].status,
+        RunStatus::Interrupted
+    );
+    assert!(!texts(&snap, "user_message").contains(&"too soon".to_owned()));
 
     // Restart: everything comes back from SQLite.
     let before = snap;
@@ -488,6 +336,9 @@ async fn invalid_commands_are_rejected() {
     });
     core.rejected(&c).await;
     let c = core.dispatch(Command::ThreadCreate {
+        provider: ProviderKind::Codex,
+        model: None,
+        worktree: false,
         thread_id: ThreadId::new(),
         project_id: ProjectId::new(),
         title: String::new(),

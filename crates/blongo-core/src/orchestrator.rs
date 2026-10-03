@@ -1,29 +1,36 @@
 //! The core task: command handling, provider event translation, coalesced
 //! text persistence, effects, recovery and session lifecycle.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use blongo_harness::{ApprovalDecision as HarnessDecision, Session, SessionConfig, codex};
+use blongo_harness::{
+    ApprovalDecision as HarnessDecision, Session, SessionConfig, StartOptions, acp,
+    antigravity_install,
+};
 use blongo_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalState, Command, CommandEnvelope, EventKind, ItemId,
-    ItemKind, Project, ProjectId, Run, RunId, RunStatus, ShellSnapshot, Thread, ThreadId,
-    ThreadSnapshot, ThreadStatus, Timestamp, ToolStatus, TurnItem, TurnStatus,
+    AgentEvent, ApprovalDecision, ApprovalState, Command, CommandEnvelope, Delivery, EventKind,
+    ItemId, ItemKind, PendingContext, PlanStep, Project, ProjectId, ProviderKind, Run, RunId,
+    RunStatus, ShellSnapshot, Thread, ThreadId, ThreadSnapshot, Timestamp, ToolStatus, TurnItem,
+    TurnStatus, Worktree,
 };
 use blongo_store::{Batch, CommitOutcome, Effect, EffectStatus, OutboxRow, Store};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::{CoreConfig, CoreEvent, Request};
+use crate::{CoreConfig, CoreEvent, InstallState, LoginState, Request};
 
 /// Default title of a new thread; replaced by the first message.
 pub const DEFAULT_TITLE: &str = "New thread";
 const MAX_OUTPUT_PREVIEW: usize = 4 * 1024;
 const MAX_TITLE: usize = 48;
+/// Upper bound of the transcript a context handoff puts in front of the
+/// next prompt.
+const MAX_HANDOFF_CHARS: usize = 24_000;
 
 /// One message from a session's forwarding task. `event == None`: the agent
 /// session ended.
@@ -36,6 +43,7 @@ struct SessionMsg {
 struct LiveSession {
     session: Session,
     generation: u64,
+    provider: ProviderKind,
     /// Task copying the session's events into the core loop. Aborted
     /// before the session is shut down: a forwarder blocked on a full core
     /// channel would otherwise keep the driver blocked on its own send, and
@@ -77,6 +85,31 @@ struct ActiveRun {
     /// Pending approval items.
     approvals: HashMap<ItemId, Arc<TurnItem>>,
     interrupt_deadline: Option<Instant>,
+    /// The run's plan item (updated in place).
+    plan: Option<Arc<TurnItem>>,
+    provider_turn_id: Option<String>,
+}
+
+/// A message waiting behind the active run.
+#[derive(Clone, Copy)]
+struct Queued {
+    run_id: RunId,
+    message_id: ItemId,
+}
+
+/// Runtime changes that only apply once their command's batch committed.
+enum Post {
+    Release(ThreadId),
+    Enqueue(ThreadId, Queued),
+    Dequeue(ThreadId, RunId),
+}
+
+/// Work a command needs done (with I/O) before it can be decided.
+#[derive(Default)]
+struct Prepared {
+    worktree: Option<Worktree>,
+    /// Rollback restored the workspace from this checkpoint.
+    restored: Option<String>,
 }
 
 /// Runtime state for a thread that has (or had) an agent session or run.
@@ -85,6 +118,7 @@ struct ThreadRt {
     session: Option<LiveSession>,
     run: Option<ActiveRun>,
     idle_since: Option<Instant>,
+    queue: VecDeque<Queued>,
 }
 
 pub(crate) struct Orchestrator {
@@ -97,6 +131,9 @@ pub(crate) struct Orchestrator {
     session_tx: mpsc::Sender<SessionMsg>,
     generation: u64,
     flush_deadline: Option<Instant>,
+    post: Vec<Post>,
+    /// Threads whose run just ended and whose queue may start.
+    ready: Vec<ThreadId>,
 }
 
 pub(crate) async fn run(
@@ -134,6 +171,8 @@ pub(crate) async fn run(
         session_tx,
         generation: 0,
         flush_deadline: None,
+        post: Vec::new(),
+        ready: Vec::new(),
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");
@@ -148,6 +187,9 @@ pub(crate) async fn run(
             request = requests.recv() => match request {
                 Some(Request::Dispatch(command)) => core.dispatch(command).await,
                 Some(Request::OpenThread(thread_id)) => core.open_thread(thread_id),
+                Some(Request::Login(provider)) => core.login(provider),
+                Some(Request::InstallAntigravity) => core.install_antigravity(),
+                Some(Request::ImportT3(source)) => core.import_t3(&source),
                 Some(Request::Abort) => {
                     // No forwarder may block on a full channel now.
                     session_rx.close();
@@ -163,6 +205,7 @@ pub(crate) async fn run(
             Some(msg) = session_rx.recv() => core.on_session_msg(msg).await,
             _ = sleep_until(timer), if timer.is_some() => core.on_timer().await,
         }
+        core.start_queued().await;
     }
 }
 
@@ -181,11 +224,7 @@ impl Orchestrator {
         for thread in self.store.threads(false)? {
             self.threads.insert(thread.id, thread);
         }
-        let snapshot = ShellSnapshot {
-            sequence: self.store.last_sequence(),
-            projects: self.store.projects()?,
-            threads: self.store.threads(false)?,
-        };
+        let snapshot = self.shell_snapshot()?;
         let _ = self.out.send(CoreEvent::Shell(Arc::new(snapshot)));
         Ok(())
     }
@@ -206,6 +245,11 @@ impl Orchestrator {
                 events.extend(close_item_event(&item));
             }
             let ordinal = self.store.next_ordinal(run.thread_id)?;
+            let message = if run.status == RunStatus::Queued {
+                "Not sent: Blongo exited before this queued message started."
+            } else {
+                "Interrupted: Blongo exited before this turn finished."
+            };
             events.push(EventKind::ItemAdded {
                 item: Arc::new(TurnItem {
                     id: ItemId::new(),
@@ -214,7 +258,7 @@ impl Orchestrator {
                     ordinal,
                     created_at: Timestamp::now(),
                     kind: ItemKind::SystemNotice {
-                        message: "Interrupted: Blongo exited before this turn finished.".into(),
+                        message: message.into(),
                     },
                     text: "".into(),
                 }),
@@ -302,18 +346,37 @@ impl Orchestrator {
             } => {
                 if let Some(t) = self.threads.get_mut(thread_id) {
                     t.provider_thread_id = Some(provider_thread_id.clone());
+                    t.pending_context = None;
+                }
+            }
+            EventKind::ThreadProviderChanged {
+                thread_id,
+                provider,
+                model,
+                provider_thread_id,
+                pending_context,
+            } => {
+                if let Some(t) = self.threads.get_mut(thread_id) {
+                    t.provider = *provider;
+                    t.model = model.clone();
+                    t.provider_thread_id = provider_thread_id.clone();
+                    t.pending_context = pending_context.clone();
                 }
             }
             EventKind::RunStatusChanged {
                 thread_id, status, ..
             } => {
-                if let Some(t) = self.threads.get_mut(thread_id) {
-                    t.status = status.thread_status();
+                if let Some(t) = self.threads.get_mut(thread_id)
+                    && let Some(status) = status.thread_status()
+                {
+                    t.status = status;
                 }
             }
             EventKind::RunCreated { run } => {
-                if let Some(t) = self.threads.get_mut(&run.thread_id) {
-                    t.status = run.status.thread_status();
+                if let Some(t) = self.threads.get_mut(&run.thread_id)
+                    && let Some(status) = run.status.thread_status()
+                {
+                    t.status = status;
                 }
             }
             _ => {}
@@ -337,6 +400,7 @@ impl Orchestrator {
                     session: None,
                     run: None,
                     idle_since: None,
+                    queue: VecDeque::new(),
                 },
             );
         }
@@ -381,17 +445,34 @@ impl Orchestrator {
             Ok(None) => {}
             Err(err) => return self.reject(&command, format!("{err:#}")),
         }
-        let batch = match self.decide(&command) {
-            Ok(batch) => batch,
+        let prepared = match self.prepare(&command.command).await {
+            Ok(prepared) => prepared,
             Err(reason) => return self.reject(&command, reason),
+        };
+        self.post.clear();
+        let worktree = prepared.worktree.clone();
+        let batch = match self.decide(&command, prepared) {
+            Ok(batch) => batch,
+            Err(reason) => {
+                self.post.clear();
+                self.discard_worktree(&command.command, worktree.clone())
+                    .await;
+                return self.reject(&command, reason);
+            }
         };
         match self.commit(batch) {
             Ok(outbox) => {
+                for post in std::mem::take(&mut self.post) {
+                    self.apply_post(post);
+                }
                 for row in outbox {
                     self.run_effect(row).await;
                 }
             }
             Err(err) => {
+                self.post.clear();
+                self.discard_worktree(&command.command, worktree.clone())
+                    .await;
                 // Ordinals handed out for the failed batch are not reused,
                 // which is harmless (ordinals only need to be increasing).
                 self.reject(&command, format!("{err:#}"));
@@ -399,9 +480,154 @@ impl Orchestrator {
         }
     }
 
+    fn apply_post(&mut self, post: Post) {
+        match post {
+            Post::Release(thread_id) => {
+                self.release_session(thread_id);
+                if let Some(rt) = self.rt.get(&thread_id)
+                    && rt.run.is_none()
+                    && rt.queue.is_empty()
+                {
+                    self.rt.remove(&thread_id);
+                }
+            }
+            Post::Enqueue(thread_id, queued) => {
+                if let Ok(rt) = self.rt(thread_id) {
+                    rt.queue.push_back(queued);
+                }
+            }
+            Post::Dequeue(thread_id, run_id) => {
+                if let Some(rt) = self.rt.get_mut(&thread_id) {
+                    rt.queue.retain(|q| q.run_id != run_id);
+                }
+            }
+        }
+    }
+
+    /// The I/O a command needs before it can be decided: create a worktree,
+    /// restore a checkpoint. Validates just enough to not do that work for
+    /// a command that is going to be refused anyway.
+    async fn prepare(&mut self, command: &Command) -> Result<Prepared, String> {
+        let mut prepared = Prepared::default();
+        match command {
+            Command::ThreadCreate {
+                thread_id,
+                project_id,
+                worktree: true,
+                ..
+            } => {
+                let project = self.projects.get(project_id).ok_or("unknown project")?;
+                if self.threads.contains_key(thread_id) {
+                    return Err("thread already exists".into());
+                }
+                let project_path = PathBuf::from(&project.path);
+                let root = blongo_git::work_tree_root(&project_path)
+                    .await
+                    .ok_or_else(|| format!("{} is not in a git repository", project.path))?;
+                let id = thread_id.0.simple().to_string();
+                let branch = format!("blongo/{}", &id[id.len() - 12..]);
+                let path = self
+                    .config
+                    .data_dir
+                    .join("worktrees")
+                    .join(thread_id.to_string());
+                blongo_git::add_worktree(&root, &path, &branch)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                // A project inside a larger repository keeps its relative
+                // place in the worktree.
+                let rel = project_path
+                    .canonicalize()
+                    .ok()
+                    .zip(root.canonicalize().ok())
+                    .and_then(|(p, r)| p.strip_prefix(r).ok().map(Path::to_path_buf))
+                    .unwrap_or_default();
+                prepared.worktree = Some(Worktree {
+                    path: path.join(rel).to_string_lossy().into_owned(),
+                    branch,
+                });
+            }
+            Command::ThreadRollback { thread_id, run_id } => {
+                let (thread, cwd) = self.thread_cwd(*thread_id)?;
+                self.ensure_idle(&thread)?;
+                let run = self
+                    .store
+                    .run(*run_id)
+                    .map_err(|e| format!("{e:#}"))?
+                    .filter(|r| r.thread_id == *thread_id)
+                    .ok_or("unknown turn")?;
+                if !matches!(
+                    run.status,
+                    RunStatus::Completed | RunStatus::Interrupted | RunStatus::Failed
+                ) {
+                    return Err("this turn cannot be rolled back".into());
+                }
+                if let Some(commit) = &run.checkpoint {
+                    blongo_git::restore_checkpoint(Path::new(&cwd), commit)
+                        .await
+                        .map_err(|e| format!("could not restore the files: {e:#}"))?;
+                    prepared.restored = Some(commit.clone());
+                }
+            }
+            _ => {}
+        }
+        Ok(prepared)
+    }
+
+    /// Remove a worktree prepared for a command that was then refused.
+    async fn discard_worktree(&self, command: &Command, worktree: Option<Worktree>) {
+        let (Some(worktree), Command::ThreadCreate { project_id, .. }) = (worktree, command) else {
+            return;
+        };
+        let Some(project) = self.projects.get(project_id) else {
+            return;
+        };
+        if let Some(top) = blongo_git::work_tree_root(Path::new(&worktree.path)).await {
+            let _ = blongo_git::remove_worktree(Path::new(&project.path), &top).await;
+        }
+    }
+
+    fn thread_cwd(&self, thread_id: ThreadId) -> Result<(Thread, String), String> {
+        let thread = self.live_thread(thread_id)?.clone();
+        let project = self
+            .projects
+            .get(&thread.project_id)
+            .ok_or("unknown project")?;
+        let cwd = thread.cwd(project).to_owned();
+        Ok((thread, cwd))
+    }
+
+    fn ensure_idle(&self, thread: &Thread) -> Result<(), String> {
+        let busy = self
+            .rt
+            .get(&thread.id)
+            .is_some_and(|rt| rt.run.is_some() || !rt.queue.is_empty());
+        if busy {
+            Err("wait for the running turn (and queued messages) to finish".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Runs that are part of the conversation (root, not rolled back or
+    /// cancelled), oldest first.
+    fn visible_runs(&self, thread_id: ThreadId) -> Result<Vec<Run>, String> {
+        Ok(self
+            .store
+            .runs(thread_id)
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .filter(|r| {
+                r.parent_run_id.is_none()
+                    && !matches!(r.status, RunStatus::RolledBack | RunStatus::Cancelled)
+            })
+            .collect())
+    }
+
     /// Validate a command and decide its events and effects (no side
-    /// effects besides reading state).
-    fn decide(&mut self, envelope: &CommandEnvelope) -> Result<Batch, String> {
+    /// effects besides reading state and handing out ordinals; runtime
+    /// changes wait in `self.post` for the commit).
+    fn decide(&mut self, envelope: &CommandEnvelope, prepared: Prepared) -> Result<Batch, String> {
         let mut batch = Batch::for_command(envelope.command_id);
         let now = Timestamp::now();
         match &envelope.command {
@@ -448,6 +674,9 @@ impl Orchestrator {
                 thread_id,
                 project_id,
                 title,
+                provider,
+                model,
+                worktree: _,
             } => {
                 if !self.projects.contains_key(project_id) {
                     return Err("unknown project".into());
@@ -456,22 +685,85 @@ impl Orchestrator {
                     return Err("thread already exists".into());
                 }
                 let title = title.trim();
-                batch.events.push(EventKind::ThreadCreated {
-                    thread: Thread {
-                        id: *thread_id,
-                        project_id: *project_id,
-                        title: if title.is_empty() {
-                            DEFAULT_TITLE.into()
-                        } else {
-                            title.into()
-                        },
-                        status: ThreadStatus::Idle,
-                        archived: false,
-                        created_at: now,
-                        updated_at: now,
-                        provider_thread_id: None,
+                let mut thread = Thread::new(
+                    *thread_id,
+                    *project_id,
+                    if title.is_empty() {
+                        DEFAULT_TITLE
+                    } else {
+                        title
                     },
+                    now,
+                );
+                thread.provider = *provider;
+                thread.model = model.clone().filter(|m| !m.trim().is_empty());
+                thread.worktree = prepared.worktree;
+                batch.events.push(EventKind::ThreadCreated { thread });
+            }
+            Command::ThreadFork {
+                source_thread_id,
+                thread_id,
+                up_to_run_id,
+            } => self.decide_fork(
+                &mut batch,
+                *source_thread_id,
+                *thread_id,
+                *up_to_run_id,
+                now,
+            )?,
+            Command::ThreadSetProvider {
+                thread_id,
+                provider,
+                model,
+            } => {
+                let thread = self.live_thread(*thread_id)?.clone();
+                self.ensure_idle(&thread)?;
+                let model = model.clone().filter(|m| !m.trim().is_empty());
+                if thread.provider == *provider && thread.model == model {
+                    return Ok(batch);
+                }
+                let switching = thread.provider != *provider;
+                let has_history = !self.visible_runs(*thread_id)?.is_empty();
+                let (provider_thread_id, pending_context) = if switching {
+                    (None, has_history.then_some(PendingContext::Handoff))
+                } else {
+                    (
+                        thread.provider_thread_id.clone(),
+                        thread.pending_context.clone(),
+                    )
+                };
+                batch.events.push(EventKind::ThreadProviderChanged {
+                    thread_id: *thread_id,
+                    provider: *provider,
+                    model,
+                    provider_thread_id,
+                    pending_context,
                 });
+                if switching && has_history {
+                    let item = self
+                        .new_item(
+                            *thread_id,
+                            None,
+                            ItemKind::SystemNotice {
+                                message: format!(
+                                    "Switched from {} to {}. The conversation so far is \
+                                     handed over with the next message.",
+                                    thread.provider.label(),
+                                    provider.label()
+                                ),
+                            },
+                            "",
+                        )
+                        .map_err(|e| format!("{e:#}"))?;
+                    batch.events.push(EventKind::ItemAdded {
+                        item: Arc::new(item),
+                    });
+                }
+                // The next turn starts a session with the new settings.
+                self.post.push(Post::Release(*thread_id));
+            }
+            Command::ThreadRollback { thread_id, run_id } => {
+                self.decide_rollback(&mut batch, *thread_id, *run_id, prepared.restored)?
             }
             Command::ThreadRename { thread_id, title } => {
                 self.live_thread(*thread_id)?;
@@ -485,63 +777,103 @@ impl Orchestrator {
                 });
             }
             Command::ThreadArchive { thread_id } => {
-                self.live_thread(*thread_id)?;
-                if self.active_run(*thread_id).is_some() {
-                    return Err("stop the running turn first".into());
-                }
+                let thread = self.live_thread(*thread_id)?.clone();
+                self.ensure_idle(&thread)?;
                 batch.events.push(EventKind::ThreadArchived {
                     thread_id: *thread_id,
                 });
+                self.post.push(Post::Release(*thread_id));
             }
             Command::MessageDispatch {
                 thread_id,
                 message_id,
                 run_id,
                 text,
+                delivery,
             } => {
                 let thread = self.live_thread(*thread_id)?.clone();
                 if text.trim().is_empty() {
                     return Err("message is empty".into());
                 }
-                if self.active_run(*thread_id).is_some() {
-                    return Err("a turn is already running in this thread".into());
+                let active = self.active_run(*thread_id).map(|r| r.run_id);
+                match (active, delivery) {
+                    (Some(active), Delivery::Steer) => {
+                        // Into the running turn: no new run.
+                        batch.events.extend(self.close_text(*thread_id));
+                        let item = self
+                            .new_item(*thread_id, Some(active), ItemKind::UserMessage, text)
+                            .map_err(|e| format!("{e:#}"))?;
+                        batch.events.push(EventKind::ItemAdded {
+                            item: Arc::new(TurnItem {
+                                id: *message_id,
+                                ..item
+                            }),
+                        });
+                        batch.effects.push(Effect::ProviderSteer {
+                            thread_id: *thread_id,
+                            run_id: active,
+                            message_id: *message_id,
+                        });
+                    }
+                    (Some(_), Delivery::Queue) => {
+                        batch.events.push(EventKind::RunCreated {
+                            run: Run::new(
+                                *run_id,
+                                *thread_id,
+                                RunStatus::Queued,
+                                thread.provider,
+                                now,
+                            ),
+                        });
+                        let item = self
+                            .new_item(*thread_id, Some(*run_id), ItemKind::UserMessage, text)
+                            .map_err(|e| format!("{e:#}"))?;
+                        batch.events.push(EventKind::ItemAdded {
+                            item: Arc::new(TurnItem {
+                                id: *message_id,
+                                ..item
+                            }),
+                        });
+                        self.post.push(Post::Enqueue(
+                            *thread_id,
+                            Queued {
+                                run_id: *run_id,
+                                message_id: *message_id,
+                            },
+                        ));
+                    }
+                    (None, _) => {
+                        batch.events.push(EventKind::RunCreated {
+                            run: Run::new(
+                                *run_id,
+                                *thread_id,
+                                RunStatus::Starting,
+                                thread.provider,
+                                now,
+                            ),
+                        });
+                        let item = self
+                            .new_item(*thread_id, Some(*run_id), ItemKind::UserMessage, text)
+                            .map_err(|e| format!("{e:#}"))?;
+                        batch.events.push(EventKind::ItemAdded {
+                            item: Arc::new(TurnItem {
+                                id: *message_id,
+                                ..item
+                            }),
+                        });
+                        batch.effects.push(Effect::ProviderTurnStart {
+                            thread_id: *thread_id,
+                            run_id: *run_id,
+                            message_id: *message_id,
+                        });
+                    }
                 }
-                let rt = self.rt(*thread_id).map_err(|e| format!("{e:#}"))?;
-                let ordinal = rt.next_ordinal;
-                rt.next_ordinal += 1;
-                batch.events.push(EventKind::RunCreated {
-                    run: Run {
-                        id: *run_id,
-                        thread_id: *thread_id,
-                        parent_run_id: None,
-                        status: RunStatus::Starting,
-                        created_at: now,
-                        ended_at: None,
-                        error: None,
-                    },
-                });
-                batch.events.push(EventKind::ItemAdded {
-                    item: Arc::new(TurnItem {
-                        id: *message_id,
-                        thread_id: *thread_id,
-                        run_id: Some(*run_id),
-                        ordinal,
-                        created_at: now,
-                        kind: ItemKind::UserMessage,
-                        text: text.as_str().into(),
-                    }),
-                });
                 if thread.title == DEFAULT_TITLE {
                     batch.events.push(EventKind::ThreadRenamed {
                         thread_id: *thread_id,
                         title: title_from(text),
                     });
                 }
-                batch.effects.push(Effect::ProviderTurnStart {
-                    thread_id: *thread_id,
-                    run_id: *run_id,
-                    message_id: *message_id,
-                });
             }
             Command::RunInterrupt { thread_id } => {
                 self.live_thread(*thread_id)?;
@@ -552,6 +884,23 @@ impl Orchestrator {
                     thread_id: *thread_id,
                     run_id: run.run_id,
                 });
+            }
+            Command::RunCancel { thread_id, run_id } => {
+                self.live_thread(*thread_id)?;
+                let queued = self
+                    .rt
+                    .get(thread_id)
+                    .is_some_and(|rt| rt.queue.iter().any(|q| q.run_id == *run_id));
+                if !queued {
+                    return Err("this message is not queued".into());
+                }
+                batch.events.push(EventKind::RunStatusChanged {
+                    thread_id: *thread_id,
+                    run_id: *run_id,
+                    status: RunStatus::Cancelled,
+                    error: None,
+                });
+                self.post.push(Post::Dequeue(*thread_id, *run_id));
             }
             Command::RuntimeRequestRespond {
                 thread_id,
@@ -600,6 +949,200 @@ impl Orchestrator {
         Ok(batch)
     }
 
+    /// A new thread holding a copy of the source's conversation (up to and
+    /// including `up_to`). The provider continues it natively when it can
+    /// branch its own conversation, otherwise by a context handoff.
+    fn decide_fork(
+        &mut self,
+        batch: &mut Batch,
+        source_id: ThreadId,
+        thread_id: ThreadId,
+        up_to: Option<RunId>,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let source = self.live_thread(source_id)?.clone();
+        if self.threads.contains_key(&thread_id) {
+            return Err("thread already exists".into());
+        }
+        let mut runs: Vec<Run> = self
+            .visible_runs(source_id)?
+            .into_iter()
+            .filter(|r| r.status.is_terminal())
+            .collect();
+        if let Some(up_to) = up_to {
+            let Some(pos) = runs.iter().position(|r| r.id == up_to) else {
+                return Err("that turn cannot be forked from".into());
+            };
+            runs.truncate(pos + 1);
+        }
+        let caps = source.provider.capabilities();
+        let pending_context = match runs.last() {
+            None => None,
+            Some(last) => match (&source.provider_thread_id, &source.pending_context) {
+                (Some(pid), None) if caps.native_fork && last.provider_turn_id.is_some() => {
+                    Some(PendingContext::Fork {
+                        provider_thread_id: pid.clone(),
+                        up_to_turn: last.provider_turn_id.clone(),
+                    })
+                }
+                _ => Some(PendingContext::Handoff),
+            },
+        };
+        let mut thread = Thread::new(thread_id, source.project_id, fork_title(&source.title), now);
+        thread.provider = source.provider;
+        thread.model = source.model.clone();
+        thread.worktree = source.worktree.clone();
+        thread.forked_from = Some(source_id);
+        thread.pending_context = pending_context;
+        batch.events.push(EventKind::ThreadCreated { thread });
+
+        let mut run_map = HashMap::new();
+        for run in &runs {
+            let id = RunId::new();
+            run_map.insert(run.id, id);
+            batch.events.push(EventKind::RunCreated {
+                run: Run {
+                    id,
+                    thread_id,
+                    ..run.clone()
+                },
+            });
+        }
+        let items = self.store.items(source_id).map_err(|e| format!("{e:#}"))?;
+        let last_ordinal = items
+            .iter()
+            .filter(|i| i.run_id.is_some_and(|r| run_map.contains_key(&r)))
+            .map(|i| i.ordinal)
+            .max();
+        for item in items {
+            let run_id = match item.run_id {
+                Some(r) => match run_map.get(&r) {
+                    Some(new) => Some(*new),
+                    None => continue,
+                },
+                // Thread-level notices before the cut.
+                None if last_ordinal.is_some_and(|last| item.ordinal < last) => None,
+                None => continue,
+            };
+            batch.events.push(EventKind::ItemAdded {
+                item: Arc::new(TurnItem {
+                    id: ItemId::new(),
+                    thread_id,
+                    run_id,
+                    ..(*item).clone()
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    /// Undo `run_id` and every later run.
+    fn decide_rollback(
+        &mut self,
+        batch: &mut Batch,
+        thread_id: ThreadId,
+        run_id: RunId,
+        restored: Option<String>,
+    ) -> Result<(), String> {
+        let thread = self.live_thread(thread_id)?.clone();
+        self.ensure_idle(&thread)?;
+        let runs = self.visible_runs(thread_id)?;
+        let Some(pos) = runs.iter().position(|r| r.id == run_id) else {
+            return Err("unknown turn".into());
+        };
+        let (kept, dropped) = runs.split_at(pos);
+        let target = &dropped[0];
+        for run in dropped {
+            batch.events.push(EventKind::RunStatusChanged {
+                thread_id,
+                run_id: run.id,
+                status: RunStatus::RolledBack,
+                error: None,
+            });
+        }
+        let keep_through = kept.last().and_then(|r| r.provider_turn_id.clone());
+        let caps = thread.provider.capabilities();
+        let live = self
+            .rt
+            .get(&thread_id)
+            .is_some_and(|rt| rt.session.is_some());
+        let mut live_rewind = None;
+        let (provider_thread_id, pending_context) = match &thread.pending_context {
+            // The provider never saw this thread's turns natively yet: the
+            // fork point moves back with the rollback.
+            Some(PendingContext::Fork {
+                provider_thread_id, ..
+            }) => match (&keep_through, kept.is_empty()) {
+                (_, true) => (None, None),
+                (Some(turn), false) => (
+                    None,
+                    Some(PendingContext::Fork {
+                        provider_thread_id: provider_thread_id.clone(),
+                        up_to_turn: Some(turn.clone()),
+                    }),
+                ),
+                (None, false) => (None, Some(PendingContext::Handoff)),
+            },
+            Some(PendingContext::Handoff) => (None, Some(PendingContext::Handoff)),
+            _ => match (&thread.provider_thread_id, &target.provider_turn_id) {
+                (Some(pid), Some(drop_from)) if caps.native_rollback => {
+                    if caps.live_rollback && live {
+                        live_rewind = Some(drop_from.clone());
+                        (Some(pid.clone()), None)
+                    } else {
+                        (
+                            Some(pid.clone()),
+                            Some(PendingContext::Rewind {
+                                keep_through_turn: keep_through.clone(),
+                                drop_from_turn: Some(drop_from.clone()),
+                            }),
+                        )
+                    }
+                }
+                // No native rollback: a fresh provider conversation that
+                // gets what is left as a handoff.
+                _ => (None, (!kept.is_empty()).then_some(PendingContext::Handoff)),
+            },
+        };
+        batch.events.push(EventKind::ThreadProviderChanged {
+            thread_id,
+            provider: thread.provider,
+            model: thread.model.clone(),
+            provider_thread_id,
+            pending_context,
+        });
+        let turns = dropped.len();
+        let files = if restored.is_some() {
+            "Files were restored to how they were before it."
+        } else {
+            "No checkpoint was taken for it, so files were left as they are."
+        };
+        let item = self
+            .new_item(
+                thread_id,
+                None,
+                ItemKind::SystemNotice {
+                    message: format!(
+                        "Rolled back {turns} turn{}. {files}",
+                        if turns == 1 { "" } else { "s" }
+                    ),
+                },
+                "",
+            )
+            .map_err(|e| format!("{e:#}"))?;
+        batch.events.push(EventKind::ItemAdded {
+            item: Arc::new(item),
+        });
+        match live_rewind {
+            Some(before_turn) => batch.effects.push(Effect::ProviderRewind {
+                thread_id,
+                before_turn,
+            }),
+            None => self.post.push(Post::Release(thread_id)),
+        }
+        Ok(())
+    }
+
     fn live_thread(&self, thread_id: ThreadId) -> Result<&Thread, String> {
         match self.threads.get(&thread_id) {
             Some(t) if !t.archived => Ok(t),
@@ -639,6 +1182,20 @@ impl Orchestrator {
             } => self.start_turn(thread_id, run_id, message_id).await,
             Effect::ProviderInterrupt { thread_id, run_id } => {
                 self.interrupt(thread_id, run_id).await;
+                Ok(())
+            }
+            Effect::ProviderSteer {
+                thread_id,
+                run_id,
+                message_id,
+            } => self.steer(thread_id, run_id, message_id).await,
+            Effect::ProviderRewind {
+                thread_id,
+                before_turn,
+            } => {
+                if let Some(live) = self.rt.get(&thread_id).and_then(|rt| rt.session.as_ref()) {
+                    let _ = live.session.rewind(before_turn);
+                }
                 Ok(())
             }
             Effect::RuntimeRequestRespond {
@@ -683,32 +1240,224 @@ impl Orchestrator {
             tools: HashMap::new(),
             approvals: HashMap::new(),
             interrupt_deadline: None,
+            plan: None,
+            provider_turn_id: None,
         });
         let text = self
             .store
             .item(message_id)?
             .context("message not found")?
             .text;
+        let thread = self
+            .threads
+            .get(&thread_id)
+            .context("unknown thread")?
+            .clone();
+        let label = thread.provider.label();
+        if self.config.checkpoints {
+            self.checkpoint(&thread, run_id).await;
+        }
+        let fresh = !self
+            .rt
+            .get(&thread_id)
+            .is_some_and(|rt| rt.session.is_some());
         if let Err(err) = self.ensure_session(thread_id).await {
-            let message = format!("Could not start Codex: {err:#}");
+            let message = format!("Could not start {label}: {err:#}");
             self.finish_run(thread_id, RunStatus::Failed, Some(message));
             return Ok(());
         }
+        // A new provider conversation that must first learn this one.
+        let text = if fresh && thread.pending_context == Some(PendingContext::Handoff) {
+            self.handoff_prompt(thread_id, run_id, &text)?
+        } else {
+            text.to_string()
+        };
         let sent = self
             .rt
             .get(&thread_id)
             .and_then(|rt| rt.session.as_ref())
-            .map(|live| live.session.prompt(text.to_string()));
+            .map(|live| live.session.prompt(text));
         if !matches!(sent, Some(Ok(()))) {
             self.finish_run(
                 thread_id,
                 RunStatus::Failed,
-                Some("The Codex session ended unexpectedly.".into()),
+                Some(format!("The {label} session ended unexpectedly.")),
             );
             return Ok(());
         }
         self.set_run_status(thread_id, RunStatus::Running);
         Ok(())
+    }
+
+    /// Capture the thread's workspace before `run_id` changes it. Not being
+    /// in a git repository is normal (no checkpoint); a failure is logged.
+    async fn checkpoint(&mut self, thread: &Thread, run_id: RunId) {
+        let Some(project) = self.projects.get(&thread.project_id) else {
+            return;
+        };
+        let cwd = PathBuf::from(thread.cwd(project));
+        if blongo_git::work_tree_root(&cwd).await.is_none() {
+            return;
+        }
+        let name = blongo_git::checkpoint_ref(&thread.id.to_string(), &run_id.to_string());
+        match blongo_git::capture_checkpoint(&cwd, &name).await {
+            Ok(commit) => self.commit_events(vec![EventKind::RunCheckpointed {
+                thread_id: thread.id,
+                run_id,
+                commit,
+            }]),
+            Err(err) => eprintln!("blongo-core: checkpoint failed: {err:#}"),
+        }
+    }
+
+    /// The prompt for the first turn of a provider conversation that takes
+    /// over this thread: its visible messages so far (bounded, newest kept),
+    /// then the new message.
+    fn handoff_prompt(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        let items = self.store.items(thread_id)?;
+        let mut entries: Vec<String> = items
+            .iter()
+            .filter(|i| i.run_id != Some(run_id))
+            .filter_map(|i| match i.kind {
+                ItemKind::UserMessage => Some(format!("User: {}", i.text)),
+                ItemKind::AssistantMessage { .. } if !i.text.is_empty() => {
+                    Some(format!("Assistant: {}", i.text))
+                }
+                _ => None,
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok(text.to_owned());
+        }
+        let mut total: usize = entries.iter().map(|e| e.len() + 2).sum();
+        let mut omitted = 0;
+        while total > MAX_HANDOFF_CHARS && entries.len() > 1 {
+            total -= entries.remove(0).len() + 2;
+            omitted += 1;
+        }
+        if total > MAX_HANDOFF_CHARS {
+            let last = entries.last_mut().expect("one entry");
+            let keep = last.len() - (total - MAX_HANDOFF_CHARS).min(last.len());
+            let mut cut = last.len() - keep;
+            while !last.is_char_boundary(cut) {
+                cut += 1;
+            }
+            *last = format!("…{}", &last[cut..]);
+        }
+        let note = if omitted > 0 {
+            format!("({omitted} earlier messages omitted)\n\n")
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "<previous_conversation>\nThis conversation was started elsewhere (another \
+             agent or session). The messages so far:\n\n{note}{}\n</previous_conversation>\n\n{text}",
+            entries.join("\n\n")
+        ))
+    }
+
+    async fn steer(
+        &mut self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        message_id: ItemId,
+    ) -> anyhow::Result<()> {
+        let text = self
+            .store
+            .item(message_id)?
+            .context("message not found")?
+            .text;
+        let still_running = self
+            .active_run(thread_id)
+            .is_some_and(|r| r.run_id == run_id);
+        let live = self.rt.get(&thread_id).and_then(|rt| rt.session.as_ref());
+        match live {
+            Some(live) if still_running => {
+                let _ = live.session.steer(text.to_string());
+            }
+            _ => {
+                // The turn ended before the steer got there.
+                if let Some(rt) = self.rt.get_mut(&thread_id)
+                    && rt.run.is_none()
+                {
+                    let item = self.new_item(
+                        thread_id,
+                        Some(run_id),
+                        ItemKind::SystemNotice {
+                            message: "The turn ended before this message reached the agent.".into(),
+                        },
+                        "",
+                    )?;
+                    self.commit_events(vec![EventKind::ItemAdded {
+                        item: Arc::new(item),
+                    }]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the next queued message of every thread whose run just ended.
+    async fn start_queued(&mut self) {
+        while let Some(thread_id) = self.ready.pop() {
+            let next = match self.rt.get_mut(&thread_id) {
+                Some(rt) if rt.run.is_none() => rt.queue.pop_front(),
+                _ => None,
+            };
+            let Some(queued) = next else {
+                continue;
+            };
+            if self.live_thread(thread_id).is_err() {
+                continue;
+            }
+            // The message moves to the end of the timeline, where its turn
+            // now starts.
+            let mut events = Vec::new();
+            if let Ok(Some(item)) = self.store.item(queued.message_id)
+                && let Ok(rt) = self.rt(thread_id)
+            {
+                let ordinal = rt.next_ordinal;
+                rt.next_ordinal += 1;
+                events.push(EventKind::ItemUpdated {
+                    item: Arc::new(TurnItem { ordinal, ..item }),
+                });
+            }
+            events.push(EventKind::RunStatusChanged {
+                thread_id,
+                run_id: queued.run_id,
+                status: RunStatus::Starting,
+                error: None,
+            });
+            self.commit_events(events);
+            if let Err(err) = self
+                .start_turn(thread_id, queued.run_id, queued.message_id)
+                .await
+            {
+                eprintln!("blongo-core: queued turn failed to start: {err:#}");
+            }
+        }
+    }
+
+    fn session_config(
+        &self,
+        provider: ProviderKind,
+        cwd: &str,
+        model: Option<String>,
+    ) -> SessionConfig {
+        let mut config = SessionConfig::new(cwd);
+        if let Some(exe) = self.config.executable(provider) {
+            config = config.executable(exe);
+        }
+        for (k, v) in &self.config.agent_env {
+            config = config.env(k, v);
+        }
+        config.model = model;
+        config
     }
 
     async fn ensure_session(&mut self, thread_id: ThreadId) -> anyhow::Result<()> {
@@ -724,18 +1473,13 @@ impl Orchestrator {
             .projects
             .get(&thread.project_id)
             .context("unknown project")?;
-        let mut config = SessionConfig::new(&project.path);
-        if let Some(exe) = &self.config.codex_executable {
-            config = config.executable(exe);
-        }
-        for (k, v) in &self.config.agent_env {
-            config = config.env(k, v);
-        }
-        let options = codex::CodexOptions {
-            resume_thread_id: thread.provider_thread_id.clone(),
-            ..codex::CodexOptions::default()
+        let provider = thread.provider;
+        let config = self.session_config(provider, thread.cwd(project), thread.model.clone());
+        let options = StartOptions {
+            resume: thread.provider_thread_id.clone(),
+            context: thread.pending_context.clone(),
         };
-        let mut session = codex::start_with(config, options).await?;
+        let mut session = blongo_harness::start(provider, config, options).await?;
         self.generation += 1;
         let generation = self.generation;
         // Forward this session's events into the core loop, tagged so a
@@ -764,9 +1508,119 @@ impl Orchestrator {
         self.rt(thread_id)?.session = Some(LiveSession {
             session,
             generation,
+            provider,
             forwarder,
         });
         Ok(())
+    }
+
+    // ------------------------------------------------------- sign-in, install
+
+    fn login(&mut self, provider: ProviderKind) {
+        let out = self.out.clone();
+        if !provider.capabilities().interactive_login {
+            let how = match provider {
+                ProviderKind::Codex => "run `codex login` in a terminal",
+                ProviderKind::ClaudeCode => "run `claude` in a terminal and use /login",
+                ProviderKind::Antigravity => "sign in from Blongo",
+            };
+            let _ = out.send(CoreEvent::Login {
+                provider,
+                state: LoginState::Failed(format!("To sign in to {}, {how}.", provider.label())),
+            });
+            return;
+        }
+        let cwd = dirs::home_dir().unwrap_or_else(|| self.config.data_dir.clone());
+        let config = self.session_config(provider, &cwd.to_string_lossy(), None);
+        let wait = self.config.login_timeout;
+        tokio::spawn(async move {
+            let (url_tx, mut url_rx) = mpsc::channel(4);
+            let urls = {
+                let out = out.clone();
+                tokio::spawn(async move {
+                    while let Some(url) = url_rx.recv().await {
+                        let _ = out.send(CoreEvent::Login {
+                            provider,
+                            state: LoginState::Url(url),
+                        });
+                    }
+                })
+            };
+            let result = acp::login(config, acp::antigravity(), url_tx, wait).await;
+            let _ = urls.await;
+            let state = match result {
+                Ok(()) => LoginState::Succeeded,
+                Err(err) => LoginState::Failed(format!("{err:#}")),
+            };
+            let _ = out.send(CoreEvent::Login { provider, state });
+        });
+    }
+
+    fn import_t3(&mut self, source: &Path) {
+        let result = crate::t3_import::import(&mut self.store, source);
+        let reload = (|| -> anyhow::Result<()> {
+            self.projects = self
+                .store
+                .projects()?
+                .into_iter()
+                .map(|p| (p.id, p))
+                .collect();
+            self.threads = self
+                .store
+                .threads(true)?
+                .into_iter()
+                .map(|t| (t.id, t))
+                .collect();
+            Ok(())
+        })();
+        let ok = result.is_ok();
+        self.emit(CoreEvent::Imported(
+            result
+                .and_then(|r| reload.map(|()| r))
+                .map_err(|e| format!("{e:#}")),
+        ));
+        if ok {
+            match self.shell_snapshot() {
+                Ok(shell) => self.emit(CoreEvent::Shell(Arc::new(shell))),
+                Err(err) => eprintln!("blongo-core: shell snapshot failed: {err:#}"),
+            }
+        }
+    }
+
+    fn shell_snapshot(&self) -> anyhow::Result<ShellSnapshot> {
+        Ok(ShellSnapshot {
+            sequence: self.store.last_sequence(),
+            projects: self.store.projects()?,
+            threads: self.store.threads(false)?,
+        })
+    }
+
+    fn install_antigravity(&mut self) {
+        let out = self.out.clone();
+        let target = self.config.antigravity_install.clone();
+        tokio::spawn(async move {
+            let fail = |message: String| {
+                let _ = out.send(CoreEvent::Install(InstallState::Failed(message)));
+            };
+            let Some(pin) = target.pin.or_else(antigravity_install::antigravity_pin) else {
+                return fail("Antigravity has no build for this platform.".into());
+            };
+            let Some(root) = target.root.or_else(antigravity_install::default_root) else {
+                return fail("No data directory to install into (HOME is unset).".into());
+            };
+            let progress = {
+                let out = out.clone();
+                move |message: String| {
+                    let _ = out.send(CoreEvent::Install(InstallState::Progress(message)));
+                }
+            };
+            match antigravity_install::install(&root, &pin, &target.origin, progress).await {
+                Ok(entry) => {
+                    let _ = out.send(CoreEvent::Install(InstallState::Done(entry)));
+                }
+                Err(err) => fail(format!("{err:#}")),
+            }
+        });
     }
 
     async fn interrupt(&mut self, thread_id: ThreadId, run_id: RunId) {
@@ -802,17 +1656,21 @@ impl Orchestrator {
             None => {
                 let rt = self.rt.get_mut(&msg.thread_id).expect("checked");
                 let session = rt.session.take();
+                let label = session
+                    .as_ref()
+                    .map_or("agent", |live| live.provider.label());
                 match rt.run.as_ref().map(|r| r.interrupt_deadline.is_some()) {
                     // Exiting is one way to honour an interrupt.
                     Some(true) => self.finish_run(msg.thread_id, RunStatus::Interrupted, None),
                     Some(false) => self.finish_run(
                         msg.thread_id,
                         RunStatus::Failed,
-                        Some("The Codex process exited.".into()),
+                        Some(format!("The {label} process exited.")),
                     ),
-                    None => {
+                    None if rt.queue.is_empty() => {
                         self.rt.remove(&msg.thread_id);
                     }
+                    None => {}
                 }
                 if let Some(live) = session {
                     live.release();
@@ -822,20 +1680,33 @@ impl Orchestrator {
     }
 
     fn on_agent_event(&mut self, thread_id: ThreadId, event: AgentEvent) {
+        if let AgentEvent::Models { models } = event {
+            if let Some(thread) = self.threads.get(&thread_id) {
+                self.emit(CoreEvent::Models {
+                    provider: thread.provider,
+                    models: models.into(),
+                });
+            }
+            return;
+        }
         if let AgentEvent::SessionStarted {
             provider_session_id,
         } = event
         {
-            let previous = self
-                .threads
-                .get(&thread_id)
-                .and_then(|t| t.provider_thread_id.clone());
-            if previous.as_deref() != Some(provider_session_id.as_str()) {
+            let Some(thread) = self.threads.get(&thread_id) else {
+                return;
+            };
+            let previous = thread.provider_thread_id.clone();
+            let expected_new = thread.pending_context.is_some();
+            let label = thread.provider.label();
+            if previous.as_deref() != Some(provider_session_id.as_str()) || expected_new {
                 let mut events = vec![EventKind::ThreadProviderBound {
                     thread_id,
-                    provider_thread_id: provider_session_id,
+                    provider_thread_id: provider_session_id.clone(),
                 }];
                 if previous.is_some()
+                    && !expected_new
+                    && previous.as_deref() != Some(provider_session_id.as_str())
                     && let Ok(item) = self.new_item(
                         thread_id,
                         self.rt
@@ -843,9 +1714,10 @@ impl Orchestrator {
                             .and_then(|rt| rt.run.as_ref())
                             .map(|r| r.run_id),
                         ItemKind::SystemNotice {
-                            message: "Codex could not resume the previous conversation; \
-                                      this turn starts without its context."
-                                .into(),
+                            message: format!(
+                                "{label} could not resume the previous conversation; \
+                                 this turn starts without its context."
+                            ),
                         },
                         "",
                     )
@@ -866,7 +1738,21 @@ impl Orchestrator {
             return;
         };
         match event {
-            AgentEvent::SessionStarted { .. } => unreachable!(),
+            AgentEvent::SessionStarted { .. } | AgentEvent::Models { .. } => unreachable!(),
+            AgentEvent::ProviderTurnId { id } => {
+                let Some(run) = self.active_run(thread_id) else {
+                    return;
+                };
+                if run.provider_turn_id.as_deref() != Some(id.as_str()) {
+                    run.provider_turn_id = Some(id.clone());
+                    self.commit_events(vec![EventKind::RunProviderTurn {
+                        thread_id,
+                        run_id,
+                        provider_turn_id: id,
+                    }]);
+                }
+            }
+            AgentEvent::Plan { steps } => self.on_plan(thread_id, run_id, steps),
             AgentEvent::TextDelta { text } => self.on_text(thread_id, TextKind::Assistant, text),
             AgentEvent::ReasoningDelta { text } => {
                 self.on_text(thread_id, TextKind::Reasoning, text)
@@ -953,6 +1839,42 @@ impl Orchestrator {
                 self.finish_run(thread_id, status, None);
             }
         }
+    }
+
+    /// The run's plan: one item, replaced in place on every update.
+    fn on_plan(&mut self, thread_id: ThreadId, run_id: RunId, steps: Vec<PlanStep>) {
+        let existing = self.active_run(thread_id).and_then(|r| r.plan.clone());
+        let (event, item) = match existing {
+            Some(item) => {
+                let mut updated = (*item).clone();
+                updated.kind = ItemKind::Plan { steps };
+                let updated = Arc::new(updated);
+                (
+                    EventKind::ItemUpdated {
+                        item: updated.clone(),
+                    },
+                    updated,
+                )
+            }
+            None => {
+                let mut events = self.close_text(thread_id);
+                let Ok(item) = self.new_item(thread_id, Some(run_id), ItemKind::Plan { steps }, "")
+                else {
+                    return;
+                };
+                let item = Arc::new(item);
+                events.push(EventKind::ItemAdded { item: item.clone() });
+                self.commit_events(events);
+                if let Some(run) = self.active_run(thread_id) {
+                    run.plan = Some(item);
+                }
+                return;
+            }
+        };
+        if let Some(run) = self.active_run(thread_id) {
+            run.plan = Some(item);
+        }
+        self.commit_events(vec![event]);
     }
 
     fn add_item(&mut self, thread_id: ThreadId, run_id: RunId, kind: ItemKind) {
@@ -1139,6 +2061,10 @@ impl Orchestrator {
         });
         self.commit_events(events);
         match self.rt.get_mut(&thread_id) {
+            Some(rt) if !rt.queue.is_empty() => {
+                rt.idle_since = Some(Instant::now());
+                self.ready.push(thread_id);
+            }
             Some(rt) if rt.session.is_some() => rt.idle_since = Some(Instant::now()),
             // No process to keep warm: drop the runtime state entirely.
             Some(_) => {
@@ -1189,11 +2115,17 @@ impl Orchestrator {
             .collect();
         for thread_id in overdue {
             // The agent ignored the interrupt: stop it.
+            let label = self
+                .threads
+                .get(&thread_id)
+                .map_or("The agent", |t| t.provider.label());
             self.release_session(thread_id);
             self.finish_run(
                 thread_id,
                 RunStatus::Interrupted,
-                Some("Codex did not stop in time; its process was terminated.".into()),
+                Some(format!(
+                    "{label} did not stop in time; its process was terminated."
+                )),
             );
         }
         let idle_timeout = self.config.session_idle_timeout;
@@ -1210,7 +2142,13 @@ impl Orchestrator {
         for thread_id in idle {
             self.release_session(thread_id);
             // Nothing left worth keeping in memory for this thread.
-            self.rt.remove(&thread_id);
+            if self
+                .rt
+                .get(&thread_id)
+                .is_some_and(|rt| rt.queue.is_empty())
+            {
+                self.rt.remove(&thread_id);
+            }
         }
     }
 
@@ -1280,7 +2218,10 @@ impl Orchestrator {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         for (_, handle) in &mut shutdowns {
-            if tokio::time::timeout_at(deadline, &mut *handle).await.is_err() {
+            if tokio::time::timeout_at(deadline, &mut *handle)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -1458,6 +2399,11 @@ fn close_item_event(item: &TurnItem) -> Option<EventKind> {
             item: Arc::new(item),
         }),
     }
+}
+
+fn fork_title(title: &str) -> String {
+    let base = title.strip_suffix(" (fork)").unwrap_or(title);
+    format!("{base} (fork)")
 }
 
 #[cfg(test)]

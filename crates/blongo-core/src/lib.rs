@@ -20,12 +20,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blongo_harness::antigravity_install::ArchivePin;
 use blongo_protocol::{
-    CommandEnvelope, CommandId, DomainEvent, ItemId, ShellSnapshot, ThreadId, ThreadSnapshot,
+    CommandEnvelope, CommandId, DomainEvent, ItemId, ModelInfo, ProviderKind, ShellSnapshot,
+    ThreadId, ThreadSnapshot,
 };
 use tokio::sync::mpsc;
 
 mod orchestrator;
+pub mod t3_import;
 
 pub use blongo_store::Store;
 
@@ -34,9 +37,23 @@ pub use blongo_store::Store;
 pub struct CoreConfig {
     /// SQLite database file.
     pub database: PathBuf,
+    /// Where worktrees live (`<data_dir>/worktrees/<thread>`).
+    pub data_dir: PathBuf,
     /// Codex executable; `None` uses the harness default (PATH, npm shim →
     /// native binary).
     pub codex_executable: Option<PathBuf>,
+    /// Claude Code executable; `None`: `BLONGO_CLAUDE_EXECUTABLE`, PATH.
+    pub claude_executable: Option<PathBuf>,
+    /// Antigravity ACP server; `None`: `BLONGO_ANTIGRAVITY_EXECUTABLE`, the
+    /// managed install, PATH.
+    pub antigravity_executable: Option<PathBuf>,
+    /// Capture a git checkpoint before every run (when the thread works in
+    /// a git repository).
+    pub checkpoints: bool,
+    /// Where and what the Antigravity installer downloads.
+    pub antigravity_install: AntigravityInstall,
+    /// How long an interactive sign-in may wait for the browser.
+    pub login_timeout: Duration,
     /// Extra environment for agent processes (tests, profiling).
     pub agent_env: Vec<(String, String)>,
     /// Release an idle thread's agent process after this long.
@@ -49,9 +66,20 @@ pub struct CoreConfig {
 
 impl CoreConfig {
     pub fn new(database: impl Into<PathBuf>) -> Self {
+        let database = database.into();
+        let data_dir = database
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         Self {
-            database: database.into(),
+            database,
+            data_dir,
             codex_executable: None,
+            claude_executable: None,
+            antigravity_executable: None,
+            checkpoints: true,
+            antigravity_install: AntigravityInstall::default(),
+            login_timeout: Duration::from_secs(10 * 60),
             agent_env: Vec::new(),
             session_idle_timeout: Duration::from_secs(10 * 60),
             text_flush_interval: Duration::from_millis(200),
@@ -60,7 +88,8 @@ impl CoreConfig {
     }
 
     /// `BLONGO_DATA_DIR` (default: the platform data dir + `blongo`),
-    /// `BLONGO_CODEX_EXE`, `BLONGO_SESSION_IDLE_SECS`.
+    /// `BLONGO_CODEX_EXE`, `BLONGO_CLAUDE_EXE`, `BLONGO_ANTIGRAVITY_EXE`,
+    /// `BLONGO_SESSION_IDLE_SECS`.
     pub fn from_env() -> Self {
         let dir = std::env::var_os("BLONGO_DATA_DIR")
             .filter(|d| !d.is_empty())
@@ -68,9 +97,14 @@ impl CoreConfig {
             .or_else(|| dirs::data_dir().map(|d| d.join("blongo")))
             .unwrap_or_else(|| PathBuf::from(".blongo"));
         let mut config = Self::new(dir.join("blongo.sqlite"));
-        config.codex_executable = std::env::var_os("BLONGO_CODEX_EXE")
-            .filter(|e| !e.is_empty())
-            .map(PathBuf::from);
+        let exe = |var: &str| {
+            std::env::var_os(var)
+                .filter(|e| !e.is_empty())
+                .map(PathBuf::from)
+        };
+        config.codex_executable = exe("BLONGO_CODEX_EXE");
+        config.claude_executable = exe("BLONGO_CLAUDE_EXE");
+        config.antigravity_executable = exe("BLONGO_ANTIGRAVITY_EXE");
         if let Some(secs) = std::env::var("BLONGO_SESSION_IDLE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -79,6 +113,50 @@ impl CoreConfig {
         }
         config
     }
+
+    pub fn executable(&self, provider: ProviderKind) -> Option<&PathBuf> {
+        match provider {
+            ProviderKind::Codex => self.codex_executable.as_ref(),
+            ProviderKind::ClaudeCode => self.claude_executable.as_ref(),
+            ProviderKind::Antigravity => self.antigravity_executable.as_ref(),
+        }
+    }
+}
+
+/// The Antigravity installer's target (defaults: the pinned archive for this
+/// platform, `$XDG_DATA_HOME/blongo/antigravity-acp`, dl.google.com).
+#[derive(Clone, Debug)]
+pub struct AntigravityInstall {
+    pub root: Option<PathBuf>,
+    pub pin: Option<ArchivePin>,
+    pub origin: String,
+}
+
+impl Default for AntigravityInstall {
+    fn default() -> Self {
+        Self {
+            root: None,
+            pin: None,
+            origin: blongo_harness::antigravity_install::ANTIGRAVITY_ORIGIN.into(),
+        }
+    }
+}
+
+/// Progress of an interactive provider sign-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginState {
+    /// Open this URL in a browser to continue.
+    Url(String),
+    Succeeded,
+    Failed(String),
+}
+
+/// Progress of the Antigravity install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallState {
+    Progress(String),
+    Done(PathBuf),
+    Failed(String),
 }
 
 /// What the core tells its client, in order.
@@ -104,19 +182,39 @@ pub enum CoreEvent {
         reason: String,
     },
     /// The command id was already processed; nothing was written again.
-    CommandDuplicate { command_id: CommandId },
+    CommandDuplicate {
+        command_id: CommandId,
+    },
     /// The core could not start (or stopped) and accepts no more commands.
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
     /// A root run ended (also visible as an event; convenient for tools).
     RunFinished {
         thread_id: ThreadId,
         status: blongo_protocol::RunStatus,
     },
+    /// Models a provider offered in its handshake (not persisted).
+    Models {
+        provider: ProviderKind,
+        models: Arc<[ModelInfo]>,
+    },
+    Login {
+        provider: ProviderKind,
+        state: LoginState,
+    },
+    Install(InstallState),
+    /// Answer to [`CoreClient::import_t3`]; a new [`CoreEvent::Shell`]
+    /// follows a successful import.
+    Imported(Result<t3_import::ImportReport, String>),
 }
 
 pub(crate) enum Request {
     Dispatch(CommandEnvelope),
     OpenThread(ThreadId),
+    Login(ProviderKind),
+    InstallAntigravity,
+    ImportT3(PathBuf),
     Shutdown,
     /// Stop without finishing runs or flushing, like a crash (tests).
     Abort,
@@ -151,6 +249,23 @@ impl CoreClient {
     /// Ask for a thread's snapshot ([`CoreEvent::Thread`]).
     pub fn open_thread(&self, thread_id: ThreadId) {
         let _ = self.requests.send(Request::OpenThread(thread_id));
+    }
+
+    /// Start an interactive sign-in ([`CoreEvent::Login`]).
+    pub fn login(&self, provider: ProviderKind) {
+        let _ = self.requests.send(Request::Login(provider));
+    }
+
+    /// Download and unpack the pinned Antigravity server
+    /// ([`CoreEvent::Install`]).
+    pub fn install_antigravity(&self) {
+        let _ = self.requests.send(Request::InstallAntigravity);
+    }
+
+    /// Import t3code's history from its `statev2.sqlite` (read-only;
+    /// [`CoreEvent::Imported`]).
+    pub fn import_t3(&self, source: PathBuf) {
+        let _ = self.requests.send(Request::ImportT3(source));
     }
 }
 

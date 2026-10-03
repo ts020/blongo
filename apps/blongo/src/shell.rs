@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use blongo_core::{CoreClient, CoreEvent};
 use blongo_protocol::{
-    Command, CommandEnvelope, CommandId, EventKind, ItemId, Project, ProjectId, RunId, Thread,
-    ThreadId, ThreadStatus,
+    Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, Project, ProjectId,
+    ProviderKind, RunId, Thread, ThreadId, ThreadStatus,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, FontWeight, SharedString, Subscription, Window,
@@ -206,7 +206,11 @@ impl Shell {
                 self.notice = Some(reason.into());
                 cx.notify();
             }
-            CoreEvent::CommandDuplicate { .. } => {}
+            CoreEvent::CommandDuplicate { .. }
+            | CoreEvent::Models { .. }
+            | CoreEvent::Login { .. }
+            | CoreEvent::Install(_)
+            | CoreEvent::Imported(_) => {}
             CoreEvent::Failed { message } => {
                 self.fatal = Some(message.into());
                 cx.notify();
@@ -269,12 +273,16 @@ impl Shell {
                 cx.notify();
             }
             EventKind::RunCreated { run } => {
-                self.set_thread_status(run.thread_id, run.status.thread_status(), cx);
+                if let Some(status) = run.status.thread_status() {
+                    self.set_thread_status(run.thread_id, status, cx);
+                }
             }
             EventKind::RunStatusChanged {
                 thread_id, status, ..
             } => {
-                self.set_thread_status(*thread_id, status.thread_status(), cx);
+                if let Some(status) = status.thread_status() {
+                    self.set_thread_status(*thread_id, status, cx);
+                }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
                 if let Some(timeline) = self.timeline_for(item.thread_id) {
@@ -286,7 +294,11 @@ impl Shell {
                     timeline.update(cx, |t, cx| t.apply(kind, cx));
                 }
             }
-            EventKind::ThreadProviderBound { .. } | EventKind::ItemTextAppended { .. } => {}
+            EventKind::ThreadProviderBound { .. }
+            | EventKind::ThreadProviderChanged { .. }
+            | EventKind::RunProviderTurn { .. }
+            | EventKind::RunCheckpointed { .. }
+            | EventKind::ItemTextAppended { .. } => {}
         }
     }
 
@@ -330,6 +342,9 @@ impl Shell {
                 thread_id,
                 project_id,
                 title: String::new(),
+                provider: ProviderKind::Codex,
+                model: None,
+                worktree: false,
             }));
         cx.notify();
     }
@@ -367,6 +382,7 @@ impl Shell {
             message_id: ItemId::new(),
             run_id: RunId::new(),
             text: text.clone(),
+            delivery: Delivery::Queue,
         });
         self.pending_message = Some((envelope.command_id, text));
         self.core.dispatch(envelope);
@@ -414,6 +430,7 @@ impl Shell {
                             message_id: ItemId::new(),
                             run_id: RunId::new(),
                             text: auto.prompt.clone(),
+                            delivery: Delivery::Queue,
                         }));
                 }
                 cx.notify();
