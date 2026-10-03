@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 blongo-protocol.workspace = true
 blongo-core.workspace = true
+blongo-client = { workspace = true, features = ["local"] }
 tokio.workspace = true
 anyhow.workspace = true
 unicode-segmentation.workspace = true

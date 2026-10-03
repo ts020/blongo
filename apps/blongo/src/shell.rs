@@ -1,13 +1,21 @@
-//! The window: sidebar (projects → threads), the open thread's timeline,
-//! the composer and the terminal panel. Fed by the core's event channel;
-//! sends commands back.
+//! The window: sidebar (environments → projects → threads), the open
+//! thread's timeline, the composer and the terminal panel.
+//!
+//! Every environment is a [`Backend`]: environment 0 is the in-process core
+//! (typed values over channels, nothing serialized); the others are
+//! `blongo serve` instances reached over the wire. Each one's events are
+//! pumped separately and tagged with its [`EnvId`]; past that point the
+//! shell treats them alike.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use blongo_core::{CoreClient, CoreEvent, InstallState, LoginState};
+use blongo_client::environments::{self, Environment, EnvironmentFile};
+use blongo_client::{Backend, Events};
+use blongo_core::{CoreEvent, InstallState, LoginState};
+use blongo_protocol::client::{ConnectionState, TerminalEvent};
 use blongo_protocol::{
     Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, ItemKind, ModelInfo,
     ProjectId, ProviderKind, RunId, RunStatus, Thread, ThreadId, ThreadSnapshot, ThreadStatus,
@@ -16,10 +24,9 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, FontWeight, SharedString, StyleRefinement,
     Subscription, Window, actions, div, prelude::*, px,
 };
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::input::{InputEvent, TextInput};
-use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::sidebar::{EnvId, EnvView, LOCAL, Sidebar, SidebarEvent};
 use crate::terminal::{self, GridSize, TerminalView};
 use crate::theme;
 use crate::timeline::{Timeline, TimelineEvent, button};
@@ -73,25 +80,35 @@ enum Picker {
     Model,
 }
 
+/// One environment's link and what it told us that the sidebar does not
+/// show.
+struct Env {
+    backend: Arc<dyn Backend>,
+    /// Models each provider offered in its last handshake.
+    models: HashMap<ProviderKind, Arc<[ModelInfo]>>,
+    /// The first shell snapshot arrived.
+    loaded: bool,
+}
+
 pub struct Shell {
-    core: CoreClient,
+    envs: Vec<Env>,
     sidebar: Entity<Sidebar>,
     timeline: Option<Entity<Timeline>>,
     /// Turn actions of the open timeline (replaced with it).
     timeline_events: Option<Subscription>,
     composer: Entity<TextInput>,
-    pending_project: Option<CommandId>,
-    /// A sent message the core has not accepted yet: its text comes back
-    /// into the composer if the command is rejected.
-    pending_message: Option<(CommandId, String)>,
+    pending_project: Option<(EnvId, CommandId)>,
+    /// A sent message the backend has not accepted yet: its text comes
+    /// back into the composer if the command is rejected.
+    pending_message: Option<(EnvId, CommandId, String)>,
     /// Select this thread when its creation event arrives.
-    pending_select: Option<ThreadId>,
+    pending_select: Option<(EnvId, ThreadId)>,
+    /// An environment being paired (its name).
+    pairing: Option<String>,
     /// Queued messages of the open thread, oldest first.
     queued: Vec<(RunId, SharedString)>,
     /// The open thread's run id → status (for the last-turn undo).
     runs: Vec<(RunId, RunStatus)>,
-    /// Models each provider offered in its last handshake.
-    models: HashMap<ProviderKind, Arc<[ModelInfo]>>,
     /// Provider for new threads: the last one picked.
     default_provider: ProviderKind,
     picker: Option<Picker>,
@@ -101,9 +118,11 @@ pub struct Shell {
     notice: Option<SharedString>,
     /// Sign-in / install progress.
     provider_notice: Option<SharedString>,
-    /// The core stopped; shown instead of the main area.
+    /// The local core stopped; shown instead of the main area.
     fatal: Option<SharedString>,
     terminal: Option<Entity<TerminalView>>,
+    /// Id of the next server-side terminal.
+    next_terminal: u32,
     auto_prompt: Option<AutoPrompt>,
     /// Focus to apply on the next render (set where no window is at hand).
     pending_focus: Option<FocusHandle>,
@@ -112,9 +131,11 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// `local`: the in-process core and its events. Remote environments
+    /// come from the saved environments file.
     pub fn new(
-        core: CoreClient,
-        events: UnboundedReceiver<CoreEvent>,
+        local: Arc<dyn Backend>,
+        events: Events,
         auto_prompt: Option<AutoPrompt>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -142,9 +163,13 @@ impl Shell {
             ),
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
         ];
-        Self::pump(events, cx);
-        Self {
-            core,
+        Self::pump(LOCAL, events, cx);
+        let mut this = Self {
+            envs: vec![Env {
+                backend: local,
+                models: HashMap::new(),
+                loaded: false,
+            }],
             sidebar,
             timeline: None,
             timeline_events: None,
@@ -152,9 +177,9 @@ impl Shell {
             pending_project: None,
             pending_message: None,
             pending_select: None,
+            pairing: None,
             queued: Vec::new(),
             runs: Vec::new(),
-            models: HashMap::new(),
             default_provider: ProviderKind::Codex,
             picker: None,
             confirm_rollback: None,
@@ -162,16 +187,51 @@ impl Shell {
             provider_notice: None,
             fatal: None,
             terminal: None,
+            next_terminal: 1,
             auto_prompt,
             pending_focus: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+        };
+        // Saved remote environments. Without any, no network thread is
+        // ever started.
+        match EnvironmentFile::load(&environments::default_path()) {
+            Ok(file) => {
+                for env in file.environments {
+                    this.add_remote(env, cx);
+                }
+            }
+            Err(err) => {
+                this.sidebar.update(cx, |s, _| {
+                    s.footer_notice = Some(format!("Environments: {err}").into());
+                });
+            }
         }
+        this
     }
 
-    /// Receive core events on the UI thread. Each wake drains everything
-    /// queued, so a burst of deltas costs one entity update.
-    fn pump(mut events: UnboundedReceiver<CoreEvent>, cx: &mut Context<Self>) {
+    /// Connect to a remote environment and show it in the sidebar.
+    fn add_remote(&mut self, env: Environment, cx: &mut Context<Self>) -> EnvId {
+        let name = env.name.clone();
+        let (backend, events) =
+            blongo_client::remote::connect(env, blongo_client::RemoteOptions::default());
+        let id = self.envs.len();
+        self.envs.push(Env {
+            backend: Arc::new(backend),
+            models: HashMap::new(),
+            loaded: false,
+        });
+        self.sidebar.update(cx, |s, cx| {
+            s.envs.push(EnvView::new(name, true));
+            cx.notify();
+        });
+        Self::pump(id, events, cx);
+        id
+    }
+
+    /// Receive one environment's events on the UI thread. Each wake drains
+    /// everything queued, so a burst of deltas costs one entity update.
+    fn pump(env: EnvId, mut events: Events, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut batch = Vec::new();
             while let Some(first) = events.recv().await {
@@ -181,7 +241,7 @@ impl Shell {
                 }
                 let alive = this.update(cx, |this, cx| {
                     for event in batch.drain(..) {
-                        this.on_core_event(event, cx);
+                        this.on_core_event(env, event, cx);
                     }
                 });
                 if alive.is_err() {
@@ -192,13 +252,29 @@ impl Shell {
         .detach();
     }
 
-    fn selected(&self, cx: &App) -> Option<ThreadId> {
+    fn backend(&self, env: EnvId) -> &Arc<dyn Backend> {
+        &self.envs[env].backend
+    }
+
+    fn selected(&self, cx: &App) -> Option<(EnvId, ThreadId)> {
         self.sidebar.read(cx).selected
+    }
+
+    fn is_selected(&self, env: EnvId, thread_id: ThreadId, cx: &App) -> bool {
+        self.selected(cx) == Some((env, thread_id))
+    }
+
+    /// The environment of the open thread (the local core when none).
+    fn selected_env(&self, cx: &App) -> EnvId {
+        self.selected(cx).map_or(LOCAL, |(env, _)| env)
     }
 
     fn selected_thread(&self, cx: &App) -> Option<Thread> {
         let sidebar = self.sidebar.read(cx);
-        sidebar.selected.and_then(|id| sidebar.thread(id)).cloned()
+        sidebar
+            .selected
+            .and_then(|(env, id)| sidebar.thread(env, id))
+            .cloned()
     }
 
     fn selected_status(&self, cx: &App) -> ThreadStatus {
@@ -214,24 +290,28 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SidebarEvent::Select(id) => {
-                self.select(*id, cx);
+            SidebarEvent::Select(env, id) => {
+                self.select(*env, *id, cx);
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
             SidebarEvent::NewThread {
+                env,
                 project_id,
                 worktree,
-            } => self.new_thread(*project_id, *worktree, cx),
-            SidebarEvent::Archive(id) => self.dispatch(Command::ThreadArchive { thread_id: *id }),
-            SidebarEvent::AddProject(path) => {
+            } => self.new_thread(*env, *project_id, *worktree, cx),
+            SidebarEvent::Archive(env, id) => {
+                self.dispatch(*env, Command::ThreadArchive { thread_id: *id })
+            }
+            SidebarEvent::AddProject(env, path) => {
                 let envelope = CommandEnvelope::new(Command::ProjectCreate {
                     project_id: ProjectId::new(),
                     name: String::new(),
                     path: path.clone(),
                 });
-                self.pending_project = Some(envelope.command_id);
-                self.core.dispatch(envelope);
+                self.pending_project = Some((*env, envelope.command_id));
+                self.backend(*env).dispatch(envelope);
             }
+            SidebarEvent::AddEnvironment(text) => self.add_environment(text, cx),
             SidebarEvent::Dismissed => {
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
@@ -242,7 +322,7 @@ impl Shell {
                 let message = match source {
                     Some(source) => {
                         let text = format!("Importing {}…", source.display());
-                        self.core.import_t3(source);
+                        self.backend(LOCAL).import_t3(Some(source));
                         text
                     }
                     None => "No home directory: cannot find t3code's database".into(),
@@ -255,26 +335,117 @@ impl Shell {
         }
     }
 
-    fn on_core_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
+    /// "NAME TARGET [CODE]": pair (on the network thread), save the
+    /// credential, connect.
+    fn add_environment(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mut words = text.split_whitespace();
+        let (Some(name), Some(target)) = (words.next(), words.next()) else {
+            self.form_notice(
+                "Type a name and a target, e.g. devbox ws://100.64.0.2:7878 CODE",
+                cx,
+            );
+            return;
+        };
+        let code = words.next().map(str::to_owned);
+        if let Err(err) = blongo_client::target::Target::parse(target) {
+            self.form_notice(&err, cx);
+            return;
+        }
+        let taken = self
+            .sidebar
+            .read(cx)
+            .envs
+            .iter()
+            .any(|e| e.name.as_ref() == name);
+        if taken || name == "Local" {
+            self.form_notice(&format!("An environment named {name} already exists"), cx);
+            return;
+        }
+        if self.pairing.is_some() {
+            return;
+        }
+        self.pairing = Some(name.to_owned());
+        self.form_notice_muted(&format!("Connecting to {target}…"), cx);
+        let (name, target) = (name.to_owned(), target.to_owned());
+        let task = blongo_client::net::handle().spawn(async move {
+            let device = blongo_client::pairing::device_name();
+            let env =
+                blongo_client::pairing::pair(&name, &target, code.as_deref(), &device).await?;
+            let path = environments::default_path();
+            let mut file = EnvironmentFile::load(&path)?;
+            file.upsert(env.clone());
+            file.save(&path)?;
+            Ok::<_, String>(env)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
+            this.update(cx, |this, cx| {
+                this.pairing = None;
+                match result {
+                    Ok(env) => {
+                        this.add_remote(env, cx);
+                        this.sidebar.update(cx, |s, cx| s.environment_added(cx));
+                        this.pending_focus = Some(this.composer.focus_handle(cx));
+                    }
+                    Err(err) => this.form_notice(&err, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn form_notice(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text: SharedString = text.to_owned().into();
+        self.sidebar.update(cx, |s, cx| {
+            s.form_notice = Some(text);
+            cx.notify();
+        });
+    }
+
+    fn form_notice_muted(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text: SharedString = text.to_owned().into();
+        self.sidebar.update(cx, |s, cx| {
+            s.footer_notice = Some(text);
+            cx.notify();
+        });
+    }
+
+    fn on_core_event(&mut self, env: EnvId, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
             CoreEvent::Shell(shell) => {
-                let first = self.sidebar.read(cx).projects.is_empty()
-                    && self.sidebar.read(cx).threads.is_empty();
+                let first = !self.envs[env].loaded;
+                self.envs[env].loaded = true;
                 let no_projects = shell.projects.is_empty();
+                let local_empty = env == LOCAL && no_projects && self.auto_prompt.is_none();
+                let selected = self.selected(cx);
+                let mut lost_selection = false;
                 self.sidebar.update(cx, |s, cx| {
-                    s.projects = shell.projects.clone();
-                    s.set_threads(shell.threads.clone());
-                    if no_projects && self.auto_prompt.is_none() {
-                        s.adding_project = true;
+                    s.envs[env].projects = shell.projects.clone();
+                    s.envs[env].set_threads(shell.threads.clone());
+                    if let Some((e, id)) = selected
+                        && e == env
+                        && s.envs[env].thread(id).is_none()
+                    {
+                        s.selected = None;
+                        lost_selection = true;
+                    }
+                    if first && local_empty && s.envs.len() == 1 {
+                        s.open_project_form(LOCAL);
                     }
                     cx.notify();
                 });
-                if first {
+                if lost_selection {
+                    self.timeline = None;
+                    self.terminal = None;
+                    self.confirm_rollback = None;
+                }
+                if first && env == LOCAL {
                     // Restore: reopen the most recently active thread.
                     if let Some(id) = shell.threads.first().map(|t| t.id) {
-                        self.select(id, cx);
+                        self.select(LOCAL, id, cx);
                     }
-                    if no_projects && self.auto_prompt.is_none() {
+                    if local_empty && self.sidebar.read(cx).adding_project() {
                         self.pending_focus =
                             Some(self.sidebar.read(cx).project_input.focus_handle(cx));
                     }
@@ -283,8 +454,8 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::Thread(snapshot) => {
-                if self.selected(cx) == Some(snapshot.thread_id) {
-                    self.load_thread(&snapshot, cx);
+                if self.is_selected(env, snapshot.thread_id, cx) {
+                    self.load_thread(env, &snapshot, cx);
                 }
             }
             CoreEvent::TextDelta {
@@ -292,28 +463,30 @@ impl Shell {
                 item_id,
                 chunk,
             } => {
-                if let Some(timeline) = self.timeline_for(thread_id, cx) {
+                if let Some(timeline) = self.timeline_for(env, thread_id, cx) {
                     timeline.update(cx, |t, cx| t.append(item_id, &chunk, cx));
                 }
             }
             CoreEvent::Event(event) => {
                 if event.command_id.is_some()
-                    && self.pending_message.as_ref().map(|(id, _)| *id) == event.command_id
+                    && self
+                        .pending_message
+                        .as_ref()
+                        .map(|(e, id, _)| (*e, Some(*id)))
+                        == Some((env, event.command_id))
                 {
                     self.pending_message = None;
                 }
-                self.on_domain_event(&event.kind, event.command_id, cx)
+                self.on_domain_event(env, &event.kind, event.command_id, cx)
             }
             CoreEvent::CommandRejected { command_id, reason } => {
-                if self.pending_project == Some(command_id) {
+                if self.pending_project == Some((env, command_id)) {
                     self.pending_project = None;
-                    let reason: SharedString = reason.clone().into();
-                    self.sidebar.update(cx, |s, cx| {
-                        s.form_notice = Some(reason);
-                        cx.notify();
-                    });
+                    self.form_notice(&reason, cx);
                 }
-                if let Some((_, text)) = self.pending_message.take_if(|(id, _)| *id == command_id)
+                if let Some((_, _, text)) = self
+                    .pending_message
+                    .take_if(|(e, id, _)| *e == env && *id == command_id)
                     && self.composer.read(cx).text().is_empty()
                 {
                     self.composer.update(cx, |c, cx| c.set_text(&text, cx));
@@ -322,9 +495,53 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::CommandDuplicate { .. } => {}
-            CoreEvent::Connection(_) | CoreEvent::Terminal(_) => {}
+            CoreEvent::Connection(state) => {
+                if !state.is_connected() {
+                    // Server-side terminals end with the connection.
+                    if self.selected_env(cx) == env
+                        && let Some(term) = &self.terminal
+                        && term.read(cx).remote_id().is_some()
+                    {
+                        term.update(cx, |t, cx| t.set_exited(None, cx));
+                    }
+                }
+                if let ConnectionState::Failed(reason) = &state {
+                    eprintln!("blongo: environment {env}: {reason}");
+                }
+                self.sidebar.update(cx, |s, cx| {
+                    if let Some(e) = s.envs.get_mut(env) {
+                        e.status = Some(state);
+                        cx.notify();
+                    }
+                });
+            }
+            CoreEvent::Terminal(event) => {
+                let Some(term) = self.terminal.clone() else {
+                    return;
+                };
+                if self.selected_env(cx) != env {
+                    return;
+                }
+                let id = term.read(cx).remote_id();
+                match event {
+                    TerminalEvent::Output { id: t, data } if Some(t) == id => {
+                        term.update(cx, |term, cx| term.feed(&data, cx));
+                    }
+                    TerminalEvent::Exited { id: t } if Some(t) == id => {
+                        term.update(cx, |term, cx| term.set_exited(None, cx));
+                    }
+                    TerminalEvent::Failed { id: t, message } if Some(t) == id => {
+                        term.update(cx, |term, cx| term.set_exited(Some(message), cx));
+                    }
+                    _ => {}
+                }
+            }
             CoreEvent::Failed { message } => {
-                self.fatal = Some(message.into());
+                if env == LOCAL {
+                    self.fatal = Some(message.into());
+                } else {
+                    self.notice = Some(message.into());
+                }
                 cx.notify();
             }
             CoreEvent::RunFinished { .. } => {
@@ -334,7 +551,7 @@ impl Shell {
                 }
             }
             CoreEvent::Models { provider, models } => {
-                self.models.insert(provider, models);
+                self.envs[env].models.insert(provider, models);
                 cx.notify();
             }
             CoreEvent::Login { provider, state } => {
@@ -389,10 +606,10 @@ impl Shell {
         }
     }
 
-    fn load_thread(&mut self, snapshot: &ThreadSnapshot, cx: &mut Context<Self>) {
+    fn load_thread(&mut self, env: EnvId, snapshot: &ThreadSnapshot, cx: &mut Context<Self>) {
         let status = self.selected_status(cx);
-        let core = self.core.clone();
-        let timeline = cx.new(|_| Timeline::new(snapshot, status, core));
+        let backend = self.backend(env).clone();
+        let timeline = cx.new(|_| Timeline::new(snapshot, status, backend));
         let sub = cx.subscribe(
             &timeline,
             |this, _, event: &TimelineEvent, cx| match event {
@@ -421,29 +638,30 @@ impl Shell {
         cx.notify();
     }
 
-    fn timeline_for(&self, thread_id: ThreadId, cx: &App) -> Option<Entity<Timeline>> {
+    fn timeline_for(&self, env: EnvId, thread_id: ThreadId, cx: &App) -> Option<Entity<Timeline>> {
         self.timeline
             .as_ref()
-            .filter(|_| self.selected(cx) == Some(thread_id))
+            .filter(|_| self.is_selected(env, thread_id, cx))
             .cloned()
     }
 
     fn on_domain_event(
         &mut self,
+        env: EnvId,
         kind: &EventKind,
         command_id: Option<CommandId>,
         cx: &mut Context<Self>,
     ) {
         match kind {
             EventKind::ProjectCreated { project } => {
-                let ours = command_id.is_some() && command_id == self.pending_project;
+                let ours = command_id.is_some()
+                    && self.pending_project.map(|(e, id)| (e, Some(id))) == Some((env, command_id));
                 let project = project.clone();
                 let project_id = project.id;
                 self.sidebar.update(cx, |s, cx| {
-                    s.projects.push(project);
+                    s.envs[env].projects.push(project);
                     if ours {
-                        s.adding_project = false;
-                        s.form_notice = None;
+                        s.close_form(cx);
                         s.project_input.update(cx, |i, cx| i.set_text("", cx));
                     }
                     cx.notify();
@@ -452,36 +670,39 @@ impl Shell {
                     self.pending_project = None;
                     self.notice = None;
                     // A new project starts with a thread, like t3code.
-                    self.new_thread(project_id, false, cx);
+                    self.new_thread(env, project_id, false, cx);
                 }
             }
             EventKind::ThreadCreated { thread } => {
                 let thread = thread.clone();
                 let id = thread.id;
                 self.sidebar.update(cx, |s, cx| {
-                    s.threads.insert(0, thread);
+                    let threads = &mut s.envs[env].threads;
+                    if !threads.iter().any(|t| t.id == id) {
+                        threads.insert(0, thread);
+                    }
                     cx.notify();
                 });
-                if self.pending_select == Some(id) {
+                if self.pending_select == Some((env, id)) {
                     self.pending_select = None;
-                    self.select(id, cx);
+                    self.select(env, id, cx);
                 }
             }
             EventKind::ThreadRenamed { thread_id, title } => {
                 let changed = self.sidebar.update(cx, |s, cx| {
-                    s.update_thread(*thread_id, cx, |t| {
+                    s.update_thread(env, *thread_id, cx, |t| {
                         t.title = title.clone();
                         true
                     })
                 });
-                if changed && self.selected(cx) == Some(*thread_id) {
+                if changed && self.is_selected(env, *thread_id, cx) {
                     cx.notify();
                 }
             }
             EventKind::ThreadArchived { thread_id } => {
-                let selected = self.selected(cx) == Some(*thread_id);
+                let selected = self.is_selected(env, *thread_id, cx);
                 self.sidebar.update(cx, |s, cx| {
-                    s.threads.retain(|t| t.id != *thread_id);
+                    s.envs[env].threads.retain(|t| t.id != *thread_id);
                     if selected {
                         s.selected = None;
                     }
@@ -502,7 +723,7 @@ impl Shell {
                 pending_context,
             } => {
                 self.sidebar.update(cx, |s, cx| {
-                    s.update_thread(*thread_id, cx, |t| {
+                    s.update_thread(env, *thread_id, cx, |t| {
                         t.provider = *provider;
                         t.model = model.clone();
                         t.provider_thread_id = provider_thread_id.clone();
@@ -517,7 +738,7 @@ impl Shell {
                 provider_thread_id,
             } => {
                 self.sidebar.update(cx, |s, cx| {
-                    s.update_thread(*thread_id, cx, |t| {
+                    s.update_thread(env, *thread_id, cx, |t| {
                         t.provider_thread_id = Some(provider_thread_id.clone());
                         t.pending_context = None;
                         false
@@ -525,7 +746,7 @@ impl Shell {
                 });
             }
             EventKind::RunCreated { run } => {
-                if self.selected(cx) == Some(run.thread_id) {
+                if self.is_selected(env, run.thread_id, cx) {
                     self.runs.push((run.id, run.status));
                     if run.status == RunStatus::Queued {
                         self.queued.push((run.id, SharedString::default()));
@@ -536,7 +757,7 @@ impl Shell {
                     }
                 }
                 if let Some(status) = run.status.thread_status() {
-                    self.set_thread_status(run.thread_id, status, cx);
+                    self.set_thread_status(env, run.thread_id, status, cx);
                 }
             }
             EventKind::RunStatusChanged {
@@ -545,7 +766,7 @@ impl Shell {
                 status,
                 ..
             } => {
-                if self.selected(cx) == Some(*thread_id) {
+                if self.is_selected(env, *thread_id, cx) {
                     if let Some(r) = self.runs.iter_mut().find(|(id, _)| id == run_id) {
                         r.1 = *status;
                     }
@@ -561,23 +782,24 @@ impl Shell {
                     }
                 }
                 if let Some(status) = status.thread_status() {
-                    self.set_thread_status(*thread_id, status, cx);
+                    self.set_thread_status(env, *thread_id, status, cx);
                 }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
-                if let (ItemKind::UserMessage, Some(run_id)) = (&item.kind, item.run_id)
+                if self.is_selected(env, item.thread_id, cx)
+                    && let (ItemKind::UserMessage, Some(run_id)) = (&item.kind, item.run_id)
                     && let Some(q) = self.queued.iter_mut().find(|(id, _)| *id == run_id)
                     && q.1.is_empty()
                 {
                     q.1 = SharedString::from(item.text.to_string());
                     cx.notify();
                 }
-                if let Some(timeline) = self.timeline_for(item.thread_id, cx) {
+                if let Some(timeline) = self.timeline_for(env, item.thread_id, cx) {
                     timeline.update(cx, |t, cx| t.apply(kind, cx));
                 }
             }
             EventKind::ItemFinished { thread_id, .. } => {
-                if let Some(timeline) = self.timeline_for(*thread_id, cx) {
+                if let Some(timeline) = self.timeline_for(env, *thread_id, cx) {
                     timeline.update(cx, |t, cx| t.apply(kind, cx));
                 }
             }
@@ -589,18 +811,19 @@ impl Shell {
 
     fn set_thread_status(
         &mut self,
+        env: EnvId,
         thread_id: ThreadId,
         status: ThreadStatus,
         cx: &mut Context<Self>,
     ) {
         let changed = self.sidebar.update(cx, |s, cx| {
-            s.update_thread(thread_id, cx, |t| {
+            s.update_thread(env, thread_id, cx, |t| {
                 let changed = t.status != status;
                 t.status = status;
                 changed
             })
         });
-        if changed && self.selected(cx) == Some(thread_id) {
+        if changed && self.is_selected(env, thread_id, cx) {
             if let Some(timeline) = &self.timeline {
                 timeline.update(cx, |t, cx| t.set_status(status, cx));
             }
@@ -610,16 +833,21 @@ impl Shell {
 
     // --------------------------------------------------------------- actions
 
-    fn dispatch(&self, command: Command) {
-        self.core.dispatch(CommandEnvelope::new(command));
+    fn dispatch(&self, env: EnvId, command: Command) {
+        self.backend(env).dispatch(CommandEnvelope::new(command));
     }
 
-    fn select(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        if self.selected(cx) == Some(thread_id) {
+    /// Send a command about the open thread to its environment.
+    fn dispatch_selected(&self, command: Command, cx: &App) {
+        self.dispatch(self.selected_env(cx), command);
+    }
+
+    fn select(&mut self, env: EnvId, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if self.selected(cx) == Some((env, thread_id)) {
             return;
         }
         self.sidebar.update(cx, |s, cx| {
-            s.selected = Some(thread_id);
+            s.selected = Some((env, thread_id));
             cx.notify();
         });
         self.pending_focus = Some(self.composer.focus_handle(cx));
@@ -631,26 +859,35 @@ impl Shell {
         self.picker = None;
         // The terminal belongs to the thread's workspace.
         self.terminal = None;
-        self.core.open_thread(thread_id);
+        self.backend(env).open_thread(thread_id);
         cx.notify();
     }
 
-    fn new_thread(&mut self, project_id: ProjectId, worktree: bool, cx: &mut Context<Self>) {
+    fn new_thread(
+        &mut self,
+        env: EnvId,
+        project_id: ProjectId,
+        worktree: bool,
+        cx: &mut Context<Self>,
+    ) {
         let thread_id = ThreadId::new();
-        self.pending_select = Some(thread_id);
-        self.dispatch(Command::ThreadCreate {
-            thread_id,
-            project_id,
-            title: String::new(),
-            provider: self.default_provider,
-            model: None,
-            worktree,
-        });
+        self.pending_select = Some((env, thread_id));
+        self.dispatch(
+            env,
+            Command::ThreadCreate {
+                thread_id,
+                project_id,
+                title: String::new(),
+                provider: self.default_provider,
+                model: None,
+                worktree,
+            },
+        );
         cx.notify();
     }
 
     fn send(&mut self, delivery: Delivery, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.selected(cx) else {
+        let Some((env, thread_id)) = self.selected(cx) else {
             return;
         };
         let text = self.composer.read(cx).text().trim_end().to_owned();
@@ -664,8 +901,8 @@ impl Shell {
             text: text.clone(),
             delivery,
         });
-        self.pending_message = Some((envelope.command_id, text));
-        self.core.dispatch(envelope);
+        self.pending_message = Some((env, envelope.command_id, text));
+        self.backend(env).dispatch(envelope);
         self.notice = None;
         self.picker = None;
         self.composer.update(cx, |c, cx| c.set_text("", cx));
@@ -673,22 +910,25 @@ impl Shell {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(thread_id) = self.selected(cx) {
-            self.dispatch(Command::RunInterrupt { thread_id });
+        if let Some((env, thread_id)) = self.selected(cx) {
+            self.dispatch(env, Command::RunInterrupt { thread_id });
         }
     }
 
     fn fork(&mut self, up_to_run_id: Option<RunId>, cx: &mut Context<Self>) {
-        let Some(source_thread_id) = self.selected(cx) else {
+        let Some((env, source_thread_id)) = self.selected(cx) else {
             return;
         };
         let thread_id = ThreadId::new();
-        self.pending_select = Some(thread_id);
-        self.dispatch(Command::ThreadFork {
-            source_thread_id,
-            thread_id,
-            up_to_run_id,
-        });
+        self.pending_select = Some((env, thread_id));
+        self.dispatch(
+            env,
+            Command::ThreadFork {
+                source_thread_id,
+                thread_id,
+                up_to_run_id,
+            },
+        );
     }
 
     /// Ask before rolling back: it rewrites files (of every thread in the
@@ -697,6 +937,7 @@ impl Shell {
         let Some(thread) = self.selected_thread(cx) else {
             return;
         };
+        let env = self.selected_env(cx);
         let Some(pos) = self.runs.iter().position(|(id, _)| *id == run_id) else {
             return;
         };
@@ -709,18 +950,27 @@ impl Shell {
                 )
             })
             .count();
-        let sidebar = self.sidebar.read(cx);
-        let sharers = sidebar
+        // Paths of a remote environment are the server's: compared as
+        // written (canonicalizing them here would look at this machine).
+        let local = env == LOCAL;
+        let norm = |p: &str| {
+            if local {
+                canonical(p)
+            } else {
+                PathBuf::from(p)
+            }
+        };
+        let view = &self.sidebar.read(cx).envs[env];
+        let sharers = view
             .project(thread.project_id)
             .map(|project| {
-                let mine = canonical(thread.cwd(project));
-                sidebar
-                    .threads
+                let mine = norm(thread.cwd(project));
+                view.threads
                     .iter()
                     .filter(|t| t.id != thread.id && !t.archived)
                     .filter(|t| {
-                        sidebar.project(t.project_id).is_some_and(|p| {
-                            let theirs = canonical(t.cwd(p));
+                        view.project(t.project_id).is_some_and(|p| {
+                            let theirs = norm(t.cwd(p));
                             theirs.starts_with(&mine) || mine.starts_with(&theirs)
                         })
                     })
@@ -730,6 +980,7 @@ impl Shell {
             .unwrap_or_default();
         self.notice = None;
         self.confirm_rollback = Some(RollbackConfirm {
+            env,
             thread_id: thread.id,
             run_id,
             turns,
@@ -742,11 +993,14 @@ impl Shell {
         let Some(confirm) = self.confirm_rollback.take() else {
             return;
         };
-        self.dispatch(Command::ThreadRollback {
-            thread_id: confirm.thread_id,
-            run_id: confirm.run_id,
-            acknowledged_sharers: confirm.sharers.iter().map(|(id, _)| *id).collect(),
-        });
+        self.dispatch(
+            confirm.env,
+            Command::ThreadRollback {
+                thread_id: confirm.thread_id,
+                run_id: confirm.run_id,
+                acknowledged_sharers: confirm.sharers.iter().map(|(id, _)| *id).collect(),
+            },
+        );
         cx.notify();
     }
 
@@ -845,24 +1099,32 @@ impl Shell {
             return;
         };
         if thread.provider != provider || thread.model != model {
-            self.dispatch(Command::ThreadSetProvider {
-                thread_id: thread.id,
-                provider,
-                model,
-            });
+            self.dispatch_selected(
+                Command::ThreadSetProvider {
+                    thread_id: thread.id,
+                    provider,
+                    model,
+                },
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    /// Models the open thread's environment offered for `provider`.
+    fn models(&self, provider: ProviderKind, cx: &App) -> Arc<[ModelInfo]> {
+        self.envs[self.selected_env(cx)]
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| Arc::from([]))
     }
 
     fn next_model(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.selected_thread(cx) else {
             return;
         };
-        let models = self
-            .models
-            .get(&thread.provider)
-            .cloned()
-            .unwrap_or_default();
+        let models = self.models(thread.provider, cx);
         // Cycle: default → each offered model → default.
         let ids: Vec<Option<String>> = std::iter::once(None)
             .chain(models.iter().map(|m| Some(m.id.clone())))
@@ -883,20 +1145,34 @@ impl Shell {
         }
     }
 
-    /// Open a shell in the open thread's workspace (worktree or project).
+    /// Open a shell in the open thread's workspace (worktree or project):
+    /// on this machine for the local core, on the server for a remote
+    /// environment.
     fn open_terminal(&mut self, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
         let thread = self.selected_thread(cx)?;
+        let env = self.selected_env(cx);
         let cwd = match &thread.worktree {
             Some(w) => PathBuf::from(&w.path),
-            None => self
-                .sidebar
-                .read(cx)
+            None => self.sidebar.read(cx).envs[env]
                 .project(thread.project_id)
                 .map(|p| PathBuf::from(&p.path))
                 .unwrap_or_else(|| ".".into()),
         };
-        let shell = std::env::var("BLONGO_TERMINAL_SHELL").ok();
-        match TerminalView::open(&cwd, shell, cx) {
+        let result = if self.backend(env).is_remote() {
+            let id = self.next_terminal;
+            self.next_terminal = self.next_terminal.wrapping_add(1).max(1);
+            let title: SharedString = format!(
+                "{} — {}",
+                self.sidebar.read(cx).envs[env].name,
+                cwd.display()
+            )
+            .into();
+            TerminalView::open_remote(self.backend(env).clone(), id, thread.id, title, cx)
+        } else {
+            let shell = std::env::var("BLONGO_TERMINAL_SHELL").ok();
+            TerminalView::open(&cwd, shell, cx)
+        };
+        match result {
             Ok(term) => {
                 self.terminal = Some(term.clone());
                 cx.notify();
@@ -915,7 +1191,7 @@ impl Shell {
             return;
         };
         let (no_projects, first_project, no_threads) = {
-            let s = self.sidebar.read(cx);
+            let s = &self.sidebar.read(cx).envs[LOCAL];
             (
                 s.projects.is_empty(),
                 s.projects.first().map(|p| p.id),
@@ -924,29 +1200,36 @@ impl Shell {
         };
         if no_projects {
             let project_id = ProjectId::new();
-            self.dispatch(Command::ProjectCreate {
-                project_id,
-                name: String::new(),
-                path: auto.project_dir.to_string_lossy().into_owned(),
-            });
-            self.new_thread(project_id, false, cx);
+            self.dispatch(
+                LOCAL,
+                Command::ProjectCreate {
+                    project_id,
+                    name: String::new(),
+                    path: auto.project_dir.to_string_lossy().into_owned(),
+                },
+            );
+            self.new_thread(LOCAL, project_id, false, cx);
         } else if no_threads && let Some(project_id) = first_project {
-            self.new_thread(project_id, false, cx);
+            self.new_thread(LOCAL, project_id, false, cx);
         }
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(auto.delay).await;
             this.update(cx, |this, cx| {
-                let thread_id =
-                    this.selected(cx)
-                        .or(this.sidebar.read(cx).threads.first().map(|t| t.id));
-                if let Some(thread_id) = thread_id {
-                    this.dispatch(Command::MessageDispatch {
-                        thread_id,
-                        message_id: ItemId::new(),
-                        run_id: RunId::new(),
-                        text: auto.prompt.clone(),
-                        delivery: Delivery::Queue,
-                    });
+                let target = this.selected(cx).or(this.sidebar.read(cx).envs[LOCAL]
+                    .threads
+                    .first()
+                    .map(|t| (LOCAL, t.id)));
+                if let Some((env, thread_id)) = target {
+                    this.dispatch(
+                        env,
+                        Command::MessageDispatch {
+                            thread_id,
+                            message_id: ItemId::new(),
+                            run_id: RunId::new(),
+                            text: auto.prompt.clone(),
+                            delivery: Delivery::Queue,
+                        },
+                    );
                 }
                 cx.notify();
             })
@@ -1028,7 +1311,8 @@ impl Shell {
                                         .child("Install")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.picker = None;
-                                            this.core.install_antigravity();
+                                            this.backend(this.selected_env(cx))
+                                                .install_antigravity();
                                             cx.notify();
                                         })),
                                 )
@@ -1041,7 +1325,7 @@ impl Shell {
                                         .child("Sign in")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.picker = None;
-                                            this.core.login(provider);
+                                            this.backend(this.selected_env(cx)).login(provider);
                                             cx.notify();
                                         })),
                                 ),
@@ -1063,11 +1347,7 @@ impl Shell {
                         this.set_provider(provider, None, cx)
                     })),
                 );
-                let models = self
-                    .models
-                    .get(&thread.provider)
-                    .cloned()
-                    .unwrap_or_default();
+                let models = self.models(thread.provider, cx);
                 if models.is_empty() {
                     menu = menu.child(
                         div()
@@ -1112,7 +1392,13 @@ impl Shell {
                 .into_any_element();
         }
         let Some(thread) = self.selected_thread(cx) else {
-            let hint = if self.sidebar.read(cx).projects.is_empty() {
+            let hint = if self
+                .sidebar
+                .read(cx)
+                .envs
+                .iter()
+                .all(|e| e.projects.is_empty())
+            {
                 "Add a project folder to get started (+ Project, top left)."
             } else {
                 "Select a thread, or start one with “+ New” next to a project."
@@ -1128,22 +1414,24 @@ impl Shell {
                 .child(hint)
                 .into_any_element();
         };
-        let location = match &thread.worktree {
+        let env = self.selected_env(cx);
+        let mut location = match &thread.worktree {
             Some(w) => format!("{}  ⑂ {}", w.path, w.branch),
-            None => self
-                .sidebar
-                .read(cx)
+            None => self.sidebar.read(cx).envs[env]
                 .project(thread.project_id)
                 .map(|p| p.path.clone())
                 .unwrap_or_default(),
         };
+        if env != LOCAL {
+            location = format!("{} · {location}", self.sidebar.read(cx).envs[env].name);
+        }
         let busy = matches!(thread.status, ThreadStatus::Running | ThreadStatus::Waiting);
         let provider = thread.provider;
         let model_label: SharedString = match &thread.model {
             Some(id) => self
-                .models
-                .get(&provider)
-                .and_then(|m| m.iter().find(|m| &m.id == id))
+                .models(provider, cx)
+                .iter()
+                .find(|m| &m.id == id)
                 .map_or_else(|| id.clone(), |m| m.label.clone())
                 .into(),
             None => "Default model".into(),
@@ -1272,8 +1560,11 @@ impl Shell {
                                 .cursor_pointer()
                                 .child("×")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(thread_id) = this.selected(cx) {
-                                        this.dispatch(Command::RunCancel { thread_id, run_id });
+                                    if let Some((env, thread_id)) = this.selected(cx) {
+                                        this.dispatch(
+                                            env,
+                                            Command::RunCancel { thread_id, run_id },
+                                        );
                                     }
                                 })),
                         )
@@ -1462,14 +1753,16 @@ impl Render for Shell {
         div()
             .key_context("Shell")
             .on_action(cx.listener(|this, _: &NewThread, _, cx| {
+                let env = this.selected_env(cx);
                 let project = this.selected_thread(cx).map(|t| t.project_id).or(this
                     .sidebar
                     .read(cx)
+                    .envs[env]
                     .projects
                     .first()
                     .map(|p| p.id));
                 if let Some(project_id) = project {
-                    this.new_thread(project_id, false, cx);
+                    this.new_thread(env, project_id, false, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ForkThread, _, cx| this.fork(None, cx)))
@@ -1500,6 +1793,7 @@ impl Render for Shell {
 }
 
 struct RollbackConfirm {
+    env: EnvId,
     thread_id: ThreadId,
     run_id: RunId,
     /// Turns the rollback drops.

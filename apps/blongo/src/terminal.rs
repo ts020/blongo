@@ -11,6 +11,10 @@
 //! [`SCROLLBACK`] lines. Closing the panel (or dropping it) hangs up the
 //! shell this panel started — and only that process — and reaps it off the
 //! UI thread.
+//!
+//! A remote environment's terminal runs on the server (`blongo serve`): the
+//! same emulator here, fed with the output the backend relays, and keys
+//! sent back through it.
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -32,6 +36,9 @@ use gpui::{
     ScrollWheelEvent, SharedString, StyledText, Window, div, prelude::*, px, rgb,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use blongo_client::Backend;
+use blongo_protocol::ThreadId;
 
 use crate::theme;
 
@@ -78,11 +85,24 @@ impl EventListener for Listener {
     }
 }
 
+enum Kind {
+    /// A shell on this machine's PTY.
+    Local {
+        master: Box<dyn MasterPty + Send>,
+        child: Option<Box<dyn Child + Send + Sync>>,
+    },
+    /// A shell on a remote environment's server.
+    Remote {
+        backend: Arc<dyn Backend>,
+        id: u32,
+        processor: Box<Processor>,
+    },
+}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
     writer: mpsc::Sender<Vec<u8>>,
-    master: Box<dyn MasterPty + Send>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    kind: Kind,
     size: GridSize,
     exited: Arc<AtomicBool>,
     /// Tells the reader thread to stop (set when the panel goes away).
@@ -145,8 +165,10 @@ impl TerminalView {
             Self {
                 term,
                 writer,
-                master,
-                child: Some(child),
+                kind: Kind::Local {
+                    master,
+                    child: Some(child),
+                },
                 size,
                 exited,
                 closed,
@@ -154,6 +176,84 @@ impl TerminalView {
                 focus_handle: cx.focus_handle(),
             }
         }))
+    }
+
+    /// Start a shell on `backend`'s server in `thread_id`'s folder. Output
+    /// arrives through [`TerminalView::feed`].
+    pub fn open_remote(
+        backend: Arc<dyn Backend>,
+        id: u32,
+        thread_id: ThreadId,
+        title: SharedString,
+        cx: &mut gpui::App,
+    ) -> anyhow::Result<gpui::Entity<Self>> {
+        let size = GridSize {
+            columns: 100,
+            lines: 12,
+        };
+        // Keys and emulator replies go to the backend from a small thread,
+        // like the local PTY writer (the backend call itself never blocks,
+        // but the emulator's listener runs with the emulator locked).
+        let (writer, rx) = mpsc::channel::<Vec<u8>>();
+        let sink = backend.clone();
+        std::thread::Builder::new()
+            .name("blongo-term-remote".into())
+            .spawn(move || {
+                while let Ok(bytes) = rx.recv() {
+                    sink.terminal_input(id, bytes);
+                }
+            })?;
+        backend.terminal_open(id, thread_id, size.columns as u16, size.lines as u16);
+        let config = Config {
+            scrolling_history: SCROLLBACK,
+            ..Config::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            config,
+            &size,
+            Listener {
+                writer: writer.clone(),
+            },
+        )));
+        Ok(cx.new(|cx| Self {
+            term,
+            writer,
+            kind: Kind::Remote {
+                backend,
+                id,
+                processor: Box::new(Processor::new()),
+            },
+            size,
+            exited: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            title,
+            focus_handle: cx.focus_handle(),
+        }))
+    }
+
+    /// The server-side terminal id (remote terminals only).
+    pub fn remote_id(&self) -> Option<u32> {
+        match &self.kind {
+            Kind::Remote { id, .. } => Some(*id),
+            Kind::Local { .. } => None,
+        }
+    }
+
+    /// Output of a remote terminal.
+    pub fn feed(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        if let Kind::Remote { processor, .. } = &mut self.kind {
+            processor.advance(&mut *self.term.lock(), data);
+            cx.notify();
+        }
+    }
+
+    /// A remote terminal ended (or could not start: `message`).
+    pub fn set_exited(&mut self, message: Option<String>, cx: &mut Context<Self>) {
+        self.exited.store(true, Ordering::Relaxed);
+        if let Some(message) = message {
+            self.title = format!("{}: {message}", self.title).into();
+        }
+        cx.notify();
     }
 
     /// The thread that owns the PTY writer; it ends when every sender
@@ -239,7 +339,14 @@ impl TerminalView {
             return;
         }
         self.size = size;
-        let _ = self.master.resize(pty_size(size));
+        match &self.kind {
+            Kind::Local { master, .. } => {
+                let _ = master.resize(pty_size(size));
+            }
+            Kind::Remote { backend, id, .. } => {
+                backend.terminal_resize(*id, size.columns as u16, size.lines as u16)
+            }
+        }
         self.term.lock().resize(size);
     }
 
@@ -279,7 +386,14 @@ impl Drop for TerminalView {
     fn drop(&mut self) {
         // The reader stops even if a background job keeps the PTY open.
         self.closed.store(true, Ordering::Relaxed);
-        let Some(mut child) = self.child.take() else {
+        let child = match &mut self.kind {
+            Kind::Local { child, .. } => child.take(),
+            Kind::Remote { backend, id, .. } => {
+                backend.terminal_close(*id);
+                None
+            }
+        };
+        let Some(mut child) = child else {
             return;
         };
         // Hang up the shell we started (its own PID only), escalate if it

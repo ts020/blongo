@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use blongo_core::CoreClient;
+use blongo_client::Backend;
 use blongo_protocol::{
     ApprovalDecision, ApprovalState, Command, CommandEnvelope, EventKind, ItemId, ItemKind,
     PlanStatus, PlanStep, RunId, RunStatus, ThreadId, ThreadSnapshot, ThreadStatus, ToolStatus,
@@ -166,7 +166,7 @@ enum Row {
 
 pub struct Timeline {
     pub thread_id: ThreadId,
-    core: CoreClient,
+    backend: Arc<dyn Backend>,
     entries: Vec<Entry>,
     index: HashMap<ItemId, usize>,
     rows: Vec<Row>,
@@ -193,12 +193,12 @@ fn hides(status: Option<&RunStatus>) -> bool {
 }
 
 impl Timeline {
-    pub fn new(snapshot: &ThreadSnapshot, status: ThreadStatus, core: CoreClient) -> Self {
+    pub fn new(snapshot: &ThreadSnapshot, status: ThreadStatus, backend: Arc<dyn Backend>) -> Self {
         let list_state = ListState::new(0, ListAlignment::Bottom, px(600.));
         list_state.set_follow_mode(FollowMode::Tail);
         let mut this = Self {
             thread_id: snapshot.thread_id,
-            core,
+            backend,
             entries: Vec::with_capacity(snapshot.items.len()),
             index: HashMap::with_capacity(snapshot.items.len()),
             rows: Vec::new(),
@@ -382,7 +382,7 @@ impl Timeline {
     }
 
     fn respond(&self, item_id: ItemId, decision: ApprovalDecision) {
-        self.core
+        self.backend
             .dispatch(CommandEnvelope::new(Command::RuntimeRequestRespond {
                 thread_id: self.thread_id,
                 item_id,
@@ -1047,7 +1047,13 @@ mod tests {
                 ),
             ],
         };
-        let mut t = Timeline::new(&snapshot, ThreadStatus::Idle, CoreClient::disconnected());
+        let mut t = Timeline::new(
+            &snapshot,
+            ThreadStatus::Idle,
+            Arc::new(blongo_client::LocalBackend(
+                blongo_core::CoreClient::disconnected(),
+            )),
+        );
         assert_eq!(shape(&t), ["0.0", "1.0", "1.1", "1.2"]);
         // Assistant body is held once, in blocks, not in the item.
         assert_eq!(&*t.entries[1].item.text, "");

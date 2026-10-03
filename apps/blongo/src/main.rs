@@ -18,6 +18,13 @@
 //! `blongo import-t3 [PATH]` imports t3code's history without opening a
 //! window (one-way, read-only: the source database is copied first).
 //!
+//! Remote environments (Phase 3):
+//! - `blongo serve [ARGS]` runs the headless server (`blongo-serve`, next to
+//!   this executable or on PATH; no GPUI in that process).
+//! - `blongo env add NAME TARGET [CODE]` pairs with a server and saves the
+//!   credential (0600) in `$BLONGO_CONFIG_DIR` (default: the platform
+//!   config dir); `blongo env list`, `blongo env remove NAME`.
+//!
 //! - Profiling (tools/profile.py): `BLONGO_PROFILE_PROMPT` is sent in a
 //!   project for `BLONGO_PROFILE_PROJECT` (default: cwd) after
 //!   `BLONGO_PROFILE_START_MS`; "blongo: replay done" is printed when the
@@ -34,6 +41,7 @@ mod timeline;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use blongo_core::CoreConfig;
@@ -52,8 +60,11 @@ actions!(blongo, [Quit]);
 fn main() {
     let config = CoreConfig::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("import-t3") {
-        std::process::exit(import_t3(config, args.get(1).map(Into::into)));
+    match args.first().map(String::as_str) {
+        Some("import-t3") => std::process::exit(import_t3(config, args.get(1).map(Into::into))),
+        Some("serve") => std::process::exit(serve(&args[1..])),
+        Some("env") => std::process::exit(env_command(&args[1..])),
+        _ => {}
     }
     let (core, events) = match blongo_core::spawn(config.clone()) {
         Ok(core) => core,
@@ -79,7 +90,8 @@ fn main() {
                 .unwrap_or_else(|| ".".into()),
             terminal: std::env::var_os("BLONGO_PROFILE_TERMINAL").is_some(),
         });
-    let client = core.client();
+    let client: Arc<dyn blongo_client::Backend> =
+        Arc::new(blongo_client::LocalBackend(core.client()));
     // Owned by the app; taken and shut down cleanly when the window closes.
     let core = Rc::new(RefCell::new(Some(core)));
     let events = RefCell::new(Some(events));
@@ -170,4 +182,104 @@ fn import_t3(config: CoreConfig, source: Option<std::path::PathBuf>) -> i32 {
     };
     core.shutdown();
     code
+}
+
+/// `blongo serve ...`: hand over to the headless server binary, so the
+/// server process never loads the UI.
+fn serve(args: &[String]) -> i32 {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("blongo-serve")))
+        .filter(|p| p.exists());
+    let program = sibling.unwrap_or_else(|| "blongo-serve".into());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&program).args(args).exec();
+        eprintln!("blongo: cannot run {}: {err}", program.display());
+        1
+    }
+    #[cfg(not(unix))]
+    match std::process::Command::new(&program).args(args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("blongo: cannot run {}: {err}", program.display());
+            1
+        }
+    }
+}
+
+/// `blongo env add|list|remove`.
+fn env_command(args: &[String]) -> i32 {
+    use blongo_client::environments::{EnvironmentFile, default_path};
+    let path = default_path();
+    let mut file = match EnvironmentFile::load(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("blongo: {err}");
+            return 1;
+        }
+    };
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    match (arg(0), arg(1), arg(2)) {
+        (Some("list"), None, None) => {
+            for env in &file.environments {
+                let auth = if env.credential.is_some() {
+                    "paired"
+                } else {
+                    "transport-authenticated"
+                };
+                println!("{}\t{}\t{auth}", env.name, env.target);
+            }
+            0
+        }
+        (Some("remove"), Some(name), None) => {
+            if !file.remove(name) {
+                eprintln!("blongo: no environment named {name}");
+                return 1;
+            }
+            match file.save(&path) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("blongo: {err}");
+                    1
+                }
+            }
+        }
+        (Some("add"), Some(name), Some(target)) => {
+            let (name, target) = (name.to_owned(), target.to_owned());
+            let code = arg(3).map(str::to_owned);
+            let (tx, rx) = std::sync::mpsc::channel();
+            blongo_client::net::handle().spawn(async move {
+                let device = blongo_client::pairing::device_name();
+                let result =
+                    blongo_client::pairing::pair(&name, &target, code.as_deref(), &device).await;
+                let _ = tx.send(result);
+            });
+            match rx.recv() {
+                Ok(Ok(env)) => {
+                    let name = env.name.clone();
+                    file.upsert(env);
+                    if let Err(err) = file.save(&path) {
+                        eprintln!("blongo: {err}");
+                        return 1;
+                    }
+                    println!("added {name} ({})", path.display());
+                    0
+                }
+                Ok(Err(err)) => {
+                    eprintln!("blongo: {err}");
+                    1
+                }
+                Err(_) => 1,
+            }
+        }
+        _ => {
+            eprintln!(
+                "usage: blongo env add NAME TARGET [PAIRING-CODE] | blongo env list | blongo env remove NAME\n\
+                 targets: ws://HOST[:PORT], ssh://[USER@]HOST?port=N, ssh+stdio://[USER@]HOST"
+            );
+            2
+        }
+    }
 }
