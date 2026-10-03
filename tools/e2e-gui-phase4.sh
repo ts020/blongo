@@ -134,9 +134,15 @@ echo "1. a turn that edits a file; notification on completion"
 launch
 typ "$WORK/myproject"; xdotool key Return; sleep 1.5
 typ "write README.md changed"; xdotool key Return
-wait_for 10 "the run" grep -q 'a run finished|Completed' "$WORK/notify.log"
+wait_for 10 "the run" grep -qs 'a run finished|Completed' "$WORK/notify.log"
 echo "  notified: $(head -1 "$WORK/notify.log")"
 shot p4-01-turn
+
+echo "1b. token usage in the thread header"
+typ "usage"; xdotool key Return
+wait_for 10 "the usage" has "SELECT usage FROM runs WHERE usage IS NOT NULL"
+sleep 0.5
+shot p4-01b-usage
 
 echo "2. keybinding override: alt-d removed, alt-g opens the diff"
 xdotool key alt+d; sleep 0.5
@@ -146,13 +152,16 @@ ran view.diff || fail "alt-g did not open the diff"
 shot p4-02-diff
 
 echo "3. inline comment sent back to the agent"
+click 388 55; sleep 1                       # per-turn diff: Turn 1
+shot p4-03b-turn-diff
+click 314 55; sleep 1                       # back to all changes
 click 600 184; sleep 0.6                    # the added line
 typ "Please keep the heading"; xdotool key Return; sleep 0.6
 shot p4-03-comment
 click 1212 89; sleep 2                      # Send to agent
 [ -n "$(sql "SELECT id FROM turn_items WHERE body LIKE 'Review comments on your changes:%README.md:1%Please keep the heading%'")" ] ||
   fail "the review comment did not reach the thread"
-wait_for 10 "the approval notification" grep -q 'approval needed' "$WORK/notify.log"
+wait_for 10 "the approval notification" grep -qs 'approval needed' "$WORK/notify.log"
 shot p4-04-comment-sent
 click 1140 757; sleep 1.5                   # Stop (the fake agent asks to run ls)
 
