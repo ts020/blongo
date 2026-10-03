@@ -304,7 +304,28 @@ fn lock_database(database: &std::path::Path) -> Result<std::fs::File, String> {
         .write(true)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    match file.try_lock() {
+    // std opens files with O_CLOEXEC, so agents and terminals this core
+    // spawns never inherit (and keep) the lock. A core that just stopped
+    // may still be releasing it (its thread ends after `shutdown`
+    // returns): retry briefly before calling it a second process.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => break lock_result(other, file, database, &path),
+        }
+    }
+}
+
+fn lock_result(
+    result: Result<(), std::fs::TryLockError>,
+    file: std::fs::File,
+    database: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::fs::File, String> {
+    match result {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
             "another Blongo process is already using {} (an open window or `blongo serve`); \
