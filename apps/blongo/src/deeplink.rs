@@ -241,9 +241,16 @@ mod tests {
             parse(&format!("blongo://thread/{id}/")),
             Ok(Link::Thread(id))
         );
+        // Absolute means a drive (or UNC) path on Windows.
+        #[cfg(unix)]
         assert_eq!(
             parse("blongo://project?path=%2Fhome%2Fme%2Fmy%20app"),
             Ok(Link::Project("/home/me/my app".into()))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            parse("blongo://project?path=C%3A%5CUsers%5Cme%5Cmy%20app"),
+            Ok(Link::Project(r"C:\Users\me\my app".into()))
         );
         assert_eq!(parse("blongo://settings"), Ok(Link::Settings));
         assert_eq!(parse(" blongo://inbox\n"), Ok(Link::Inbox));

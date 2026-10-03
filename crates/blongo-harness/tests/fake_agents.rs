@@ -273,7 +273,16 @@ async fn missing_executable_is_an_error() {
 #[tokio::test(flavor = "current_thread")]
 async fn crash_mid_turn_reports_failure() {
     // `true` exits immediately: the turn must still end, as Failed.
-    let mut session = claude::start(SessionConfig::new(".").executable("/bin/true"))
+    // (macOS has no /bin/true; Windows has no `true` at all.)
+    #[cfg(unix)]
+    let exits_at_once = PathBuf::from("/usr/bin/true");
+    #[cfg(windows)]
+    let exits_at_once = {
+        let path = std::env::temp_dir().join(format!("blongo-true-{}.cmd", std::process::id()));
+        std::fs::write(&path, "@exit /b 0\r\n").unwrap();
+        path
+    };
+    let mut session = claude::start(SessionConfig::new(".").executable(exits_at_once))
         .await
         .unwrap();
     session.prompt("hi").unwrap();
