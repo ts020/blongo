@@ -1,0 +1,40 @@
+{
+  "binary": "target/release/blongo-serve",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.517112970352173,
+      "serve": {
+        "peakRssMiB": 16.765625,
+        "endRssMiB": 16.765625,
+        "cpuPercent": 0.0,
+        "threads": 3,
+        "peakPssMiB": 14.8876953125
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 17.548640727996826,
+      "serve": {
+        "peakRssMiB": 19.96484375,
+        "endRssMiB": 19.96484375,
+        "cpuPercent": 0.6838136460823081,
+        "threads": 2,
+        "peakPssMiB": 17.947265625
+      },
+      "harnessPeakRssMiB": 10.94140625
+    },
+    "settled": {
+      "durationSeconds": 14.553409099578857,
+      "serve": {
+        "peakRssMiB": 19.96484375,
+        "endRssMiB": 19.96484375,
+        "cpuPercent": 0.0,
+        "threads": 2,
+        "peakPssMiB": 17.947265625
+      },
+      "harnessPeakRssMiB": 10.94140625
+    }
+  },
+  "client": "drive: done (Completed, 444 deltas, 52622 bytes)"
+}

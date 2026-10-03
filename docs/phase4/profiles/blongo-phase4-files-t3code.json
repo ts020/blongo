@@ -1,0 +1,36 @@
+{
+  "binary": "target/release/blongo",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "prompt": "",
+  "view": "files",
+  "project": "/home/claude/t3code",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.59195065498352,
+      "blongo": {
+        "peakRssMiB": 180.8671875,
+        "endRssMiB": 180.8671875,
+        "cpuPercent": 0.31276224283340537,
+        "threads": 34,
+        "peakPssMiB": 157.93359375
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 0.0,
+      "blongo": null,
+      "harnessPeakRssMiB": 0
+    },
+    "settled": {
+      "durationSeconds": 14.6319580078125,
+      "blongo": {
+        "peakRssMiB": 208.171875,
+        "endRssMiB": 202.421875,
+        "cpuPercent": 0.341717765819881,
+        "threads": 34,
+        "peakPssMiB": 185.23828125
+      },
+      "harnessPeakRssMiB": 0
+    }
+  }
+}
