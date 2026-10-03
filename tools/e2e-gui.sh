@@ -17,6 +17,7 @@ WORK=$(mktemp -d)
 mkdir -p "$OUT" "$WORK/data" "$WORK/myproject"
 export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
 export BLONGO_DATA_DIR="$WORK/data"
+export BLONGO_CONFIG_DIR="$WORK/config"   # never the machine's saved environments
 FIX="$ROOT/crates/blongo-harness/tests/fixtures"
 export BLONGO_CODEX_EXE="$FIX/fake_codex.py"
 export BLONGO_CLAUDE_EXE="$FIX/fake_claude.py"

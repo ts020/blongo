@@ -19,6 +19,12 @@ process; agent children (the fake codex) are reported separately under
 
 Linux only. DISPLAY must name a working X server (e.g. Xvfb with lavapipe).
 Thresholds: BLONGO_MAX_RSS_MIB fails the run if any phase peak exceeds it.
+
+The app gets its own config dir (OUTPUT_DIR/config), so saved remote
+environments of the machine are never picked up. `--environments FILE`
+copies an environments.json there (tools/profile_serve.py --app makes one
+for a running `blongo serve`): the profile then includes a connected
+remote environment.
 """
 import argparse
 import json
@@ -93,6 +99,7 @@ def main():
     ap.add_argument("--idle", type=float, default=10.0)
     ap.add_argument("--settled", type=float, default=15.0)
     ap.add_argument("--timeout", type=float, default=240.0)
+    ap.add_argument("--environments", help="environments.json to give the app")
     args = ap.parse_args()
 
     os.makedirs(args.output)
@@ -102,9 +109,15 @@ def main():
     os.makedirs(project)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     startup = 2.0
+    config = os.path.join(os.path.abspath(args.output), "config")
+    os.makedirs(config)
+    if args.environments:
+        shutil.copy(args.environments, os.path.join(config, "environments.json"))
+        os.chmod(os.path.join(config, "environments.json"), 0o600)
     env = dict(
         os.environ,
         BLONGO_DATA_DIR=os.path.join(os.path.abspath(args.output), "data"),
+        BLONGO_CONFIG_DIR=config,
         BLONGO_CODEX_EXE=os.path.join(root, "crates/blongo-harness/tests/fixtures/fake_codex.py"),
         BLONGO_PROFILE_PROMPT="replay",
         BLONGO_PROFILE_PROJECT=os.path.abspath(project),
