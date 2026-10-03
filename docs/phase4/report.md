@@ -5,15 +5,16 @@
 - 結論: **計画にあった 8 項目はすべて、少なくともコアのロジックとテストまで入った。** 1〜5、7、8 は UI までつながっていて、GUI e2e で通しで確かめた（§2.3）。6（追加エージェント）は汎用 ACP プロバイダーを実装し、評価は文書にした
   - diff／レビューパネル: スレッド全体とターンごとの差分をチェックポイントから出す。行は仮想化し、ファイルの本文は 1 ファイルずつ遅延で読む。行コメントは 1 通のメッセージにまとめてエージェントへ送る
   - コマンドパレット、when 句つきのキーバインド（`keybindings.json` で上書き）、`settings.json` に保存する設定画面
-  - エージェント向け MCP サーバー: `t3_thread_*`、`delegate_task`、`task_status`、`schedule_task` など 10 ツール。Codex、Claude、ACP の各セッションに渡し、呼び出し元のプロジェクトの外は見えない
+  - エージェント向け MCP サーバー: `t3_thread_*`、`delegate_task`、`task_status`、`schedule_task` など 10 ツール。Codex、Claude、ACP の各セッションに渡し、呼び出し元のプロジェクトの外は見えない。エージェントが増やせるスレッドは深さ・同時数とも上限つきで、定期実行はユーザーの承認まで走らない（§5）
   - ファイルブラウザ、`.gitignore` を守るファジー検索、git 操作（状態、ブランチの切替・作成、コミット）
   - スケジュール実行（5 項目の cron、ローカル時刻）と、ターンごとのトークン数・費用の表示
   - GitHub／GitLab の PR 受信箱とレビュー投稿。偽のサーバーでだけ確かめた
   - 更新の確認（ed25519 署名のマニフェスト、SHA-256 を確かめるダウンロード）、`blongo://` ディープリンク、デスクトップ通知
-- メモリ: idle PSS 157.8 / 157.5 MiB（上限 165）、stream PSS 177.2 / 176.0 MiB（上限 185）、idle CPU 0.31%（§2.4）。Phase 3 より idle で約 +1.5 MiB。大きな diff（200 ファイル × 500 行）を開いた瞬間は 192.5 MiB まで上がり、172.6 MiB に落ち着く
+- メモリ（レビュー対応後の最終バイナリ）: idle PSS 155.8 / 157.7 MiB（上限 165）、stream PSS 176.1 / 177.5 MiB（上限 185）、idle CPU 0.42 / 0.31%（§2.4）。大きな diff（200 ファイル × 500 行）を開いた瞬間は 192.5 MiB まで上がり、172.6 MiB に落ち着く。diff の画面を閉じると 168〜172 MiB
 - `blongo-serve`: idle PSS 14.9 / stream 17.9 MiB（Phase 3: 13.5 / 16.5）
 - 新しいサードパーティのクレートは入れていない。HTTP はシステムの `curl` を使う。ライセンス文の同梱（Phase 3 の持ち越し）は `THIRD_PARTY_LICENSES.txt` で済ませた
 - 実エージェント、本物の GitHub／GitLab、本物の更新サーバーには一度もつないでいない。macOS・Windows 固有の部分（URL スキームの登録、通知、MCP の名前付きパイプ）は手順の文書だけ（§3）
+- 独立したセキュリティレビューで「要修正」になった 4 件（一時ディレクトリの権限、エージェントによるスレッド増殖と定期実行、リンクからのプロジェクト追加、夏時間の cron）と、指摘された細かい点を直した（§5）
 
 ## 1. 作ったもの
 
@@ -93,7 +94,7 @@ crates/blongo-client
   - ACP: `session/new` の `mcpServers`
   - `blongo-serve` の中のエージェントには `blongo-serve mcp-bridge` を渡す
 - トークンはセッションごとにランダムに作り、そのスレッドに結びつける。セッションが終わると失効して、ファイルも消える
-- ツール: `t3_thread_list` / `read` / `create` / `send` / `wait` / `interrupt`、`delegate_task`（子スレッド、深さ 2、同時 4 つまで、`wait` / `async`）、`task_status`、`list_scheduled_tasks`、`schedule_task`
+- ツール: `t3_thread_list` / `read` / `create` / `send` / `wait` / `interrupt`、`delegate_task`（子スレッド、深さ 2、同時 4 つまで、`wait` / `async`）、`task_status`、`list_scheduled_tasks`、`schedule_task`（提案だけ。ユーザーの承認まで無効）。`t3_thread_create` のスレッドも呼び出し元の子になり、同じ上限に入る（§5）
 - どのツールも呼び出し元のプロジェクトのスレッドしか扱わない。他のプロジェクトの ID には「unknown thread」と答え、存在も漏らさない
 - 待つツールは最大 30 分で返る
 - JSON-RPC は手書きの最小実装（`initialize`、`ping`、`tools/list`、`tools/call`）
@@ -114,7 +115,8 @@ crates/blongo-client
 - **スケジュール**: 5 項目の cron（ローカル時刻）を SQLite に保存する（マイグレーション 3）
   - コアのタイマーが、決めたスレッドへ送るか、毎回新しいスレッドを作る
   - Blongo が止まっている間に過ぎた時刻は、起動時に 1 回だけ走らせる
-  - 設定画面の Scheduled runs タブで作成・一時停止・今すぐ実行・削除ができる。MCP の `schedule_task` からも登録できる
+  - 設定画面の Scheduled runs タブで作成・一時停止・今すぐ実行・削除ができる。MCP の `schedule_task` で作られたものは「proposed by an agent」と出て、「Approve」を押すまで走らない
+  - 時刻は壁時計の分を暦の上で進めて探すので、23 時間・25 時間の日（夏時間の切り替え）でも飛ばしたり二重に走ったりしない（§5）
 - **使用量**: ターンごとのトークン数（入力・キャッシュ・出力）と費用を、run に保存する
   - Codex は `tokenUsage`、Claude は result フレーム（費用つき）、ACP は `usage_update` から取る
   - スレッドのヘッダーに合計（例: `321 tokens`、費用があれば `· $0.12`）を出す
@@ -149,7 +151,7 @@ crates/blongo-client
   - インストールはしない
   - リリース用の鍵はまだ無いので、既定では無効（`BLONGO_UPDATE_URL` / `BLONGO_UPDATE_KEY` で有効にする）
 - **ディープリンク**（`docs/phase4/deep-links.md`）:
-  - リンク: `blongo://thread/<id>`、`project/<id>`、`settings`、`inbox`
+  - リンク: `blongo://thread/<id>`、`project?path=…`、`settings`、`inbox`。どれも画面の移動だけで、無いフォルダをプロジェクトに足すときだけ確認を出す（§5）
   - 2 つ目のプロセスは `<data_dir>/app.sock`（0600）で、動いている Blongo へリンクを渡してすぐ終わる（e2e で 26 ms）
   - Linux では `blongo register-url-handler` で `.desktop` と `xdg-mime` を登録する。GPUI の `on_open_urls` も同じ経路に流す
 - **通知**（`docs/phase4/notifications.md`）:
@@ -174,19 +176,19 @@ crates/blongo-client
 
 ### 2.1 テストと静的検査
 
-`cargo test --workspace` は **252 本**（Phase 3: 206 本）。2 回続けて全部通した。すべてオフラインで動き、実エージェントのターンは走らせていない。環境変数のトークンで何かを認証することもしていない。
+`cargo test --workspace` は **262 本**と ignored 1 本（夏時間テストが子プロセスで走らせる本体）。Phase 3: 206 本、レビュー前: 252 本。レビュー対応の後、3 回続けて全部通した。すべてオフラインで動き、実エージェントのターンは走らせていない。環境変数のトークンで何かを認証することもしていない。
 
 | バイナリ | 本数 | Phase 4 で増えた主なもの |
 |---|---:|---|
 | blongo（アプリ） | 28 | キーマップ（既定値が正しい、when 句の解析と評価、ユーザーファイルの追加・削除・誤りの報告、表示）、ファジー採点、コメントのメッセージ、設定の往復、通知コマンド、ディープリンク（解析、**2 つ目のプロセスからの受け渡し**、desktop entry） |
-| blongo-client 単体 / forge_update（新規） | 19 / 3 | トークンファイル、バージョン比較、**署名の検証**（鍵違い・改ざん）。偽の HTTP サーバーで GitHub（受信箱、ファイル、レビュー）、GitLab（受信箱、変更、discussion）、更新確認とダウンロード（**ハッシュ違いと鍵違いを拒否**） |
-| blongo-core 単体 | 11 | cron（解析、ローカル時刻の次回、UTC 変換）、MCP（プロトコルの往復と未知のトークン、待ちの上限）、検索の順位と上限 |
-| **core_phase4（新規）** | 7 | 下記 |
+| blongo-client 単体 / forge_update（新規） | 22 / 3 | トークンファイル、バージョン比較、**署名の検証**（鍵違い・改ざん）。偽の HTTP サーバーで GitHub（受信箱、ファイル、レビュー）、GitLab（受信箱、変更、discussion）、更新確認とダウンロード（**ハッシュ違いと鍵違いを拒否**） |
+| blongo-core 単体 | 15（+ ignored 1） | cron（解析、ローカル時刻の次回、UTC 変換）、MCP（プロトコルの往復と未知のトークン、待ちの上限）、検索の順位と上限 |
+| **core_phase4（新規）** | 8 | 下記 |
 | core_codex / core_phase2 / t3_import | 10 / 27 / 3 | |
 | blongo-git | 16 | スナップショットの差分（リネーム、上限）、`.gitignore` を守る一覧、porcelain の解析 |
-| harness 単体 / acp・claude・codex のリプレイ / fake_agents / antigravity_install | 26 / 8・10・9 / 11 / 3 | Claude の `--mcp-config` |
+| harness 単体 / acp・claude・codex のリプレイ / fake_agents / antigravity_install | 27 / 8・10・9 / 11 / 3 | Claude の `--mcp-config` |
 | blongo-protocol | 19 | hunk と行番号、行の上限、ファジー採点、Query / Reply の往復 |
-| blongo-server 単体 / remote | 10 / 17 | **`queries_over_the_wire_and_agents_use_the_real_mcp_bridge`**: リモートの問い合わせと、サーバー内のエージェントが本物の `blongo-serve mcp-bridge` で MCP を使う |
+| blongo-server 単体 / remote | 11 / 17 | **`queries_over_the_wire_and_agents_use_the_real_mcp_bridge`**: リモートの問い合わせと、サーバー内のエージェントが本物の `blongo-serve mcp-bridge` で MCP を使う |
 | store | 15 | 使用量・親スレッド・スケジュールの往復、2 接続の交互書き込み |
 
 `crates/blongo-core/tests/core_phase4.rs`（本物のコアとフェイク Codex、本物の git リポジトリ）:
@@ -197,7 +199,8 @@ crates/blongo-client
 4. `usage_is_recorded_per_turn`
 5. `auto_approve_answers_without_waiting`
 6. `schedules_fire_persist_and_catch_up_after_a_restart`
-7. `mcp_tools_see_only_their_project_and_delegate_to_children`: 他のプロジェクトのスレッドは見えない（list に出ない、read は unknown thread）。`delegate_task` が子スレッドを作って結果を返す。深さと同時数の上限、失効したトークン
+7. `mcp_tools_see_only_their_project_and_delegate_to_children`: 他のプロジェクトのスレッドは見えない（list に出ない、read は unknown thread）。`delegate_task` が子スレッドを作って結果を返す。async モードと `task_status`（親以外は読めない）
+8. `agents_cannot_escape_the_spawn_limits`（レビュー対応）: 上限を破ろうとする攻撃のテスト。§5 を参照
 
 静的検査:
 
@@ -232,22 +235,22 @@ crates/blongo-client
 | 7 | ファイル検索とブラウザ | Ctrl+P で `main` → Enter。`.gitignore` の対象は出ない（p4-10, p4-11） |
 | 8 | ブランチ | `feature-x` を作って切り替わる（git で検査、p4-12） |
 | 9 | PR 受信箱 | acme/widgets#7 の差分、行コメントとサマリー、Submit review。偽サーバーのログで、パス、Bearer トークン、commit_id、`side: RIGHT`、本文を検査（p4-13〜16） |
-| 10 | ディープリンク | 2 つ目のプロセスで `blongo://settings` → 26 ms で終わり、動いている側で設定が開く（p4-17） |
+| 10 | ディープリンク | 未知のフォルダの `blongo://project` で確認が出て、プロジェクトは増えない。Cancel でも増えない（p4-17a）。既知のプロジェクトのリンクを 2 回送っても、スレッドは増えない（p4-17b）。`blongo://settings` → 25 ms で終わり、動いている側で設定が開く（p4-17c） |
 | 11 | 終了 | エージェントのプロセスが残らず、`app.sock` も消える |
 
 Phase 2・3 の `tools/e2e-gui.sh`（15 場面）と `tools/e2e-gui-remote.sh`（8 場面）も、最終のデバッグビルドで再実行して最後まで通った。
 
 ### 2.4 メモリと CPU（`tools/profile.py`、Phase 0〜3 と同じ負荷）
 
-release ビルド（fat LTO）で、最終コミットのバイナリを 2 回測った。結果は `docs/phase4/profiles/`。データフォルダは短いパス（`/home/claude/p4`）に置いた。長いパスだと MCP のソケットが作れず、MCP サーバーが無効のまま測ることになるため（§3）。
+release ビルド（fat LTO）で、レビュー対応後の最終バイナリを 2 回測った（レビュー前は 157.8 / 157.5、177.2 / 176.0）。結果は `docs/phase4/profiles/`。データフォルダは短いパス（`/home/claude/p4`）に置いた。長いパスだと MCP のソケットが作れず、MCP サーバーが無効のまま測ることになるため（§3）。
 
 | | Phase 3（記録） | **Phase 4** | 上限 |
 |---|---:|---:|---:|
-| idle ピーク PSS | 156.1 / 156.1 | **157.8 / 157.5** | 165 |
-| stream ピーク PSS | 173.2 / 176.2 | **177.2 / 176.0** | 185 |
-| settled ピーク PSS | 170.6 / 173.6 | 174.0 / 175.2 | |
-| idle CPU | 0.31 / 0.31% | **0.31 / 0.31%** | 1% |
-| stream 中 CPU | 126〜127% | 124〜126% | |
+| idle ピーク PSS | 156.1 / 156.1 | **155.8 / 157.7** | 165 |
+| stream ピーク PSS | 173.2 / 176.2 | **176.1 / 177.5** | 185 |
+| settled ピーク PSS | 170.6 / 173.6 | 169.6 / 175.7 | |
+| idle CPU | 0.31 / 0.31% | **0.42 / 0.31%** | 1% |
+| stream 中 CPU | 126〜127% | 122〜125% | |
 | スレッド数 | 32 | 33（`blongo-links`） | |
 
 - idle の +1.5 MiB の内訳:
@@ -263,6 +266,7 @@ release ビルド（fat LTO）で、最終コミットのバイナリを 2 回�
 | diff パネル、小さな差分（1 ファイル） | 165.4 | 165.4 | `blongo-phase4-diff-small.json` |
 | diff パネル、大きな差分（200 ファイル × 500 行 = 10 万行） | 192.5 | 172.6 | 開いた直後に先頭 12 ファイルを読む分。約 10 秒で戻る（tokio の blocking プールのスレッドが消える時間と一致）。`diff-big` |
 | ファイルブラウザ、t3code（24k ファイル）+ 検索 `index` | 185.2 | 179.5 | 一覧と検索の結果を持つ分。`files-t3code` |
+| 大きな差分を開いて 10 秒後にチャットへ戻る（レビュー対応） | 180.5 / 184.6 | 168.1 / 171.6 | 閉じると DiffView ごと捨て、glibc に `malloc_trim` で返す。開いたままの 172.6 より 1〜4.5 MiB 少ない。idle（約 156）との差の残りは、tokio の blocking スレッドなど diff 以外のもの。`diff-big-closed-run1/2` |
 
 **`blongo-serve`**（`tools/profile_serve.py`、`blongo-serve.json`）: idle PSS 14.9 MiB、stream 17.9 MiB（Phase 3: 13.5 / 16.5）。増えたのは MCP サーバーとワークスペース問い合わせのコードの分。
 
@@ -276,7 +280,7 @@ release ビルド（fat LTO）で、最終コミットのバイナリを 2 回�
 - **MCP サーバー**:
   - Unix ソケットなので、Windows では無効
   - データフォルダのパスが長いと、ソケットのパスが上限（約 108 バイト）を超えて無効になる。理由はログに出すが UI には出ない。`$XDG_RUNTIME_DIR` へ逃がす処理が要る
-  - トークンファイルは同じユーザーの他のプロセスから読める
+  - トークンのフォルダは一覧できないようにしたが、同じユーザーのプロセスは権限を戻せるので、意図的に探せば他のセッションのトークンを読める。分けるには別ユーザーかサンドボックスが要る（§5）
 - **更新はインストールしない**: ダウンロードと検証まで。リリース用の鍵と配布の仕組み（macOS の署名・公証、Windows のインストーラ）が無いので、既定では無効
 - **macOS／Windows**:
   - URL スキームの登録は手順の文書だけ。Windows では 2 つ目のプロセスからの受け渡しも未実装（2 つ目のウィンドウになる）
@@ -302,3 +306,78 @@ release ビルド（fat LTO）で、最終コミットのバイナリを 2 回�
 - **設定画面の形**: スクロールする 1 ページではなく、タブ式にした
 - **自動更新**: 確認とダウンロードまでにした。インストールは配布の仕組みと一緒に作る
 - **追加エージェント**: 専用ドライバは作らず、汎用 ACP と評価の文書にした（OpenCode の HTTP+SSE、Pi の JSONL は Phase 5 以降の候補）
+
+## 5. レビュー対応（review fixes）
+
+独立したセキュリティ重視のレビューで「要修正」になった。指摘ごとの対応は次のとおり。
+
+### 要修正（4 件）
+
+1. **一時ディレクトリの権限を変えていた**（`http.rs` → `secret::write_private` → `private_dir`）
+   - 原因: PR レビューの本文を `temp_dir()` に書くとき、親（`/tmp`）を 0700 に chmod していた。root で走るテストが `/tmp` を壊し（コーディネーターが 1777 に戻した）、一般ユーザーでは EPERM で POST が全部失敗していた
+   - 修正:
+     - 本文は一時ファイルに書かず、curl の設定（stdin）の `data-raw` で渡す。テキスト（JSON）だけを許し、NUL などの制御文字と 8 MiB 超は拒否する
+     - `private_dir` は、無いフォルダを 0700 で作る。既存のフォルダは、自分の持ち物で共有（sticky）でないときだけ 0700 に締める。共有・他人のフォルダは chmod せずにエラーにする
+     - `write_private` は既存の親フォルダに触らない
+     - ダウンロード先のファイルは `create_new` + 0600 で作る
+     - curl は `-q` を最初に付け、`~/.curlrc` を読まない
+   - テスト:
+     - `existing_and_shared_directories_keep_their_mode`: 0755 と 1777 の自前のフォルダが書き込み後も同じモード。sticky には `private_dir` がエラー
+     - `config_quotes_values_and_never_takes_headers_with_newlines`: 本文が設定の中で正しく引用される
+     - forge_update: 偽サーバーで本物の curl の POST 本文が届く
+     - `blongo-client` の単体テストと forge_update を `setpriv --reuid=65534`（nobody）で走らせて全部通り、`/tmp` は 1777 のまま
+2. **エージェントが委任の上限をすり抜けられた**（`orchestrator/tools.rs`）
+   - 修正:
+     - `t3_thread_create` のスレッドも呼び出し元の子にし、`delegate_task` と同じ `check_spawn`（深さ 2、子 4 つ、プロジェクトあたり 8 つ）を通す
+     - 同時数には、実行中やジョブ中の子に加えて、まだ列にいる作成（`ThreadCreate`）と子へのメッセージを数える
+     - `schedule_task` は提案だけにした。`proposed_by` つきの無効な定期実行を作り（マイグレーション 4）、ユーザーが設定画面で「Approve」（オン）を押して初めて走る
+     - 提案は 15 分以上の間隔だけ（`Cron::min_gap` で次の 500 回を確かめる）、承認待ちは 1 プロジェクト 10 件まで
+     - 定期実行のターンの承認ポリシーは全体の設定のままで、作ったエージェントより緩くならない
+   - テスト `agents_cannot_escape_the_spawn_limits`（本物のコア、フェイク Codex、本物のブリッジ）:
+     1. `t3_thread_create` の入れ子で深さを破ろうとすると、孫が「limited to 2 levels」で断られ、スレッドは 2 つしか増えない。孫からの `delegate_task` も断られる
+     2. post-checkout フックで 4 秒かかるブランチ切替（グローバルなジョブ）が列を止めている間に、`delegate_task` を 6 本同時に呼ぶ。4 本だけ通り、2 本は断られる。通った分の返事は、切替のあとにしか来ない。キューを数えない版ではこのテストが落ちることを、一時的に壊して確かめた
+     3. `* * * * *` の提案は拒否される。`*/30` の提案は無効・次回なし・`proposed_by` つきで作られる。ユーザーがオンにすると有効になり、`proposed_by` が消える
+     4. スレッドをアーカイブすると、トークンファイルが消える。古いトークンでソケットにつないでも、何も返らない
+3. **`blongo://project` リンクが確認なしにプロジェクトとスレッドを作っていた**（`shell.rs`）
+   - 修正: 既知のプロジェクトなら最新のスレッドを選ぶだけ。未知のフォルダなら確認（パスと注意書き、Cancel / Add project）を出し、追加はユーザーが押したときだけ。リンクでスレッドは作らない
+   - 他のリンクも見直した: `thread` / `settings` は移動だけ。`inbox` は開くと設定済みフォージへの読み取りが走る（`deep-links.md` に明記）
+   - GUI e2e の場面 10 で確かめた（DB の件数で検査）
+4. **cron が夏時間で飛ばす・二重に走る**（`cron.rs`）
+   - 原因: 1 日を 24 時間として進めていた
+   - 修正:
+     - 壁時計の分を暦の上で進めて合う時刻を探し、`mktime` で時刻に直す（`tm_isdst` を -1 / 0 / 1 で試し、`after` より後で最も早いもの）
+     - 存在しない時刻（02:30）は `mktime` の正規化どおり 03:30 に走る
+     - 繰り返す 1 時間は、最初の 1 回だけ走る
+     - 再起動などで時計が戻ったときは、前回の実行の壁時計以下の分を飛ばす（`next_run`）
+   - テスト: `daylight_saving_changes_neither_skip_nor_repeat` が自分自身を `TZ=America/New_York` の子プロセスで走らせる（他のテストの時刻帯を変えないため）。確かめたこと:
+     - 2026-03-09 の月曜 0 時が飛ばない
+     - 02:30 は 03:30 に走る
+     - 毎時は 01:00 の次が 03:00
+     - 2026-11-01 の 01:30 は 1 回だけ
+     - 毎分は 01:59 EDT の次が 02:00 EST
+     - 繰り返す 1 時間の中で再起動しても二重に走らない
+
+### 細かい指摘
+
+| 指摘 | 対応 |
+|---|---|
+| 更新: リリース鍵があっても `BLONGO_UPDATE_KEY` で差し替えられる | `RELEASE_KEY` があればそれだけを使う（`trusted_key` のテスト）。マニフェストに `platform` と `expires` を足し、署名の中で確かめる（他の OS 用と期限切れを拒否） |
+| curl が `~/.curlrc` を読む | `-q` を最初に付けた |
+| 16 MiB を超えるリモートの返事が黙って捨てられ、クライアントが待ち続ける | エンコード後 8 MiB（フレームの半分）を超える返事は「too large」のエラーに置き換える（`answers_too_large_for_a_frame_become_errors`）。Outbox は返事の実サイズで数えるので、大きな返事は単独のフレームで送られる |
+| ジョブだけのスレッドへの `t3_thread_wait` が返らない | ジョブが終わって何も残っていなければ、待っている呼び出しに答える（`on_job_done`） |
+| MCP の接続ごとの上限 | 同時のツール呼び出しは 8 つまで（`one_connection_runs_a_bounded_number_of_calls`）。返事の列は 32 件の有限、ブリッジは全体で 64 本まで |
+| MCP のトークンを他のセッションが読める | トークンファイル名を乱数にし、フォルダを 0300（一覧不可）にした。同じユーザーなら権限を戻せるので、完全には防げない（§3） |
+| スケジュールのタイマーが毎分起きる | 次の予定まで眠る。サスペンドや時計の変更に備えて、最長 15 分で見直す |
+| ACP の使用量の数えすぎ（セッションの合計を run ごとに保存して足していた） | ターン開始時の合計との差を、そのターンの分として記録する（`usage_totals_become_per_turn_shares`） |
+| `read_file` が FIFO で止まる | 普通のファイル以外は拒否し、`O_NONBLOCK` で開く（FIFO とフォルダのテスト） |
+| when 句の入れ子の深さ | 512 文字まで、`(` と `!` の入れ子は 32 段まで |
+| desktop entry の Exec のエスケープ | `"` `` ` `` `$` `\` と `%` を規則どおりに書き、制御文字を含むパスは登録しない（テストつき） |
+| 環境変数名の食い違い（`BLONGO_ACP_EXECUTABLE` と `BLONGO_ACP_EXE`） | 文書どおり `BLONGO_ACP_EXE` に統一した（ハーネスの定数をコアも使う） |
+| diff の画面を閉じても読み込んだパッチが残る | 書きかけのコメントがなければ、閉じたときに DiffView ごと捨て、glibc では `malloc_trim` を呼ぶ。閉じたあとは 168〜172 MiB（§2.4） |
+| cron の日の欄の `*/N` | Vixie cron と同じく、`*` で始まる日の欄は「制限なし」として扱う（曜日と OR にならない） |
+
+### 残したもの（§3 にも記載）
+
+- MCP のトークンは、同じユーザーのプロセスからは守り切れない。継承した fd で渡す方法は、エージェント（Codex、Claude など）が MCP サーバーのプロセスを自分で起動するため使えなかった
+- diff を閉じたあとの常駐量は、開く前（約 156 MiB）までは戻らない（残りは diff 以外のスレッドやヒープ）
+

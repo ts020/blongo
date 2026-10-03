@@ -3,40 +3,41 @@
   "fixture": "/home/claude/blongo/tools/fixtures/resource-stream.jsonl",
   "prompt": "replay",
   "view": null,
+  "closeAfter": null,
   "project": "/home/claude/p4/prof2/project",
   "phases": {
     "idle": {
-      "durationSeconds": 9.59290361404419,
+      "durationSeconds": 9.586997032165527,
       "blongo": {
-        "peakRssMiB": 180.4296875,
-        "endRssMiB": 180.4296875,
-        "cpuPercent": 0.31273117303169207,
+        "peakRssMiB": 180.5078125,
+        "endRssMiB": 180.5078125,
+        "cpuPercent": 0.3129238477841019,
         "threads": 33,
-        "peakPssMiB": 157.4794921875
+        "peakPssMiB": 157.662109375
       },
       "harnessPeakRssMiB": 0
     },
     "stream": {
-      "durationSeconds": 17.69093155860901,
+      "durationSeconds": 17.69638705253601,
       "blongo": {
-        "peakRssMiB": 199.02734375,
-        "endRssMiB": 196.18359375,
-        "cpuPercent": 124.24444652437641,
+        "peakRssMiB": 200.42578125,
+        "endRssMiB": 196.59375,
+        "cpuPercent": 125.33631827871586,
         "threads": 33,
-        "peakPssMiB": 175.990234375
+        "peakPssMiB": 177.4892578125
       },
-      "harnessPeakRssMiB": 10.9296875
+      "harnessPeakRssMiB": 11.0
     },
     "settled": {
-      "durationSeconds": 14.64422082901001,
+      "durationSeconds": 14.646889925003052,
       "blongo": {
-        "peakRssMiB": 198.21875,
-        "endRssMiB": 198.21875,
-        "cpuPercent": 0.2731452937445444,
+        "peakRssMiB": 198.609375,
+        "endRssMiB": 198.609375,
+        "cpuPercent": 0.6144649168583214,
         "threads": 33,
-        "peakPssMiB": 175.181640625
+        "peakPssMiB": 175.6728515625
       },
-      "harnessPeakRssMiB": 10.9296875
+      "harnessPeakRssMiB": 11.0
     }
   }
 }
