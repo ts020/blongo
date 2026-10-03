@@ -251,6 +251,55 @@ impl Drop for TunnelDir {
     }
 }
 
+/// Remove tunnel folders a crashed Blongo left in the temp folder: ours
+/// (same owner), older than a minute, whose socket no longer answers.
+/// Returns how many were removed. Cheap; run once at startup.
+pub fn clean_stale_tunnel_dirs() -> usize {
+    clean_stale_tunnel_dirs_in(&std::env::temp_dir(), Duration::from_secs(60))
+}
+
+fn clean_stale_tunnel_dirs_in(tmp: &std::path::Path, min_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("blongo-ssh-") {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !old {
+            continue;
+        }
+        #[cfg(unix)]
+        if std::os::unix::net::UnixStream::connect(entry.path().join("t.sock")).is_ok() {
+            continue; // a live tunnel of another Blongo
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 static SSH_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Use this SSH client instead of `$BLONGO_SSH` / `ssh` (tests).
@@ -437,6 +486,31 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_tunnel_folders_are_removed_live_and_young_ones_kept() {
+        let tmp = std::env::temp_dir().join(format!(
+            "blongo-tunnels-{}",
+            crate::secret::b64(&crate::secret::random::<6>())
+        ));
+        std::fs::create_dir_all(tmp.join("blongo-ssh-stale")).unwrap();
+        std::fs::create_dir_all(tmp.join("blongo-ssh-live")).unwrap();
+        std::fs::create_dir_all(tmp.join("other")).unwrap();
+        let _live =
+            std::os::unix::net::UnixListener::bind(tmp.join("blongo-ssh-live/t.sock")).unwrap();
+        // Too young: kept.
+        assert_eq!(
+            clean_stale_tunnel_dirs_in(&tmp, Duration::from_secs(3600)),
+            0
+        );
+        assert_eq!(clean_stale_tunnel_dirs_in(&tmp, Duration::ZERO), 1);
+        assert!(!tmp.join("blongo-ssh-stale").exists());
+        assert!(tmp.join("blongo-ssh-live").exists());
+        assert!(tmp.join("other").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     use super::*;
 
     #[test]

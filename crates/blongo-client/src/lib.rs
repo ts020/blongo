@@ -6,13 +6,16 @@
 pub mod backend;
 pub mod backoff;
 pub mod environments;
+pub mod forge;
 pub mod handshake;
+pub mod http;
 pub mod net;
 pub mod pairing;
 pub mod remote;
 pub mod secret;
 pub mod target;
 pub mod transport;
+pub mod update;
 
 #[cfg(feature = "local")]
 pub use backend::LocalBackend;
