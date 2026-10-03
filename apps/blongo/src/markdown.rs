@@ -5,6 +5,11 @@
 //! highlights) and never re-parsed. Inline Markdown (emphasis, code spans,
 //! links, strikethrough, lists, task lists) is parsed with pulldown-cmark;
 //! fenced code keeps its language for lazy syntax highlighting.
+//!
+//! The live tail is rendered cheaply ([`LiveTail`]): its complete lines are
+//! parsed once each, the line being typed is shown as it arrives, and code
+//! lines are cut into strings once. A streamed token therefore costs work
+//! proportional to the current line, not to the whole tail.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +70,8 @@ pub struct Block {
     pub lang: Option<Lang>,
     /// Code: shared by every snapshot of a finished block.
     pub highlight: Option<Arc<CodeHighlight>>,
+    /// Code: one display string per line (built once, cloned per frame).
+    pub lines: Arc<[SharedString]>,
 }
 
 impl Block {
@@ -78,9 +85,11 @@ impl Block {
                     .next()
                     .and_then(|l| l.trim_start().strip_prefix("```"))
                     .and_then(Lang::from_info);
+                let text = SharedString::from(code_body(raw));
                 Self {
                     kind,
-                    text: SharedString::from(code_body(raw)),
+                    lines: text.split('\n').map(|l| l.to_owned().into()).collect(),
+                    text,
                     inline: Arc::new([]),
                     lang,
                     highlight: (finished && lang.is_some()).then(Default::default),
@@ -99,12 +108,120 @@ impl Block {
             inline: inline.into(),
             lang: None,
             highlight: None,
+            lines: Arc::new([]),
         }
     }
 
     /// Compute the highlight now (call off the UI thread).
     pub fn compute_highlight(lang: Lang, text: &str, target: &CodeHighlight) {
         target.set(highlight::highlight(lang, text));
+    }
+}
+
+/// Inline style ranges of a block.
+type Spans = Arc<[(Range<usize>, Inline)]>;
+
+/// The live tail block, kept up to date per flush at a cost proportional to
+/// the line being streamed.
+///
+/// - Paragraph / heading: the complete lines are parsed with
+///   [`parse_inline`] once (again only when a line completes); the partial
+///   last line is appended as plain text until its line ends.
+/// - Code: complete lines are kept as strings and only the partial last
+///   line is rebuilt. `text` stays empty (live code is never highlighted).
+#[derive(Default)]
+pub struct LiveTail {
+    kind: Option<BlockKind>,
+    /// Paragraph: byte length of the parsed complete-lines prefix (of the
+    /// tail with leading blank space removed) and its parse.
+    parsed_len: usize,
+    parsed: (String, Spans),
+    /// Code: complete body lines and the body bytes they cover.
+    code_lines: Vec<SharedString>,
+    code_len: usize,
+    lang: Option<Lang>,
+}
+
+impl LiveTail {
+    pub fn block(&mut self, kind: BlockKind, raw: &str) -> Block {
+        if self.kind != Some(kind) {
+            *self = Self {
+                kind: Some(kind),
+                ..Self::default()
+            };
+        }
+        match kind {
+            BlockKind::Code => self.code(raw),
+            BlockKind::Heading => Block {
+                kind,
+                text: raw.trim_start_matches('#').trim().to_owned().into(),
+                inline: Arc::new([]),
+                lang: None,
+                highlight: None,
+                lines: Arc::new([]),
+            },
+            BlockKind::Paragraph => self.paragraph(raw.trim_start_matches([' ', '\n'])),
+        }
+    }
+
+    fn paragraph(&mut self, src: &str) -> Block {
+        let complete = src.rfind('\n').unwrap_or(0);
+        if complete != self.parsed_len {
+            let (text, inline) = parse_inline(&src[..complete]);
+            self.parsed = (text, inline.into());
+            self.parsed_len = complete;
+        }
+        let partial = src[complete..].trim_start_matches('\n');
+        let mut text = String::with_capacity(self.parsed.0.len() + 1 + partial.len());
+        text.push_str(&self.parsed.0);
+        if !text.is_empty() && !partial.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(partial);
+        Block {
+            kind: BlockKind::Paragraph,
+            text: text.into(),
+            inline: self.parsed.1.clone(),
+            lang: None,
+            highlight: None,
+            lines: Arc::new([]),
+        }
+    }
+
+    fn code(&mut self, raw: &str) -> Block {
+        // The tail starts at its opening fence line.
+        let (fence, body) = match raw.find('\n') {
+            Some(nl) => (&raw[..nl], &raw[nl + 1..]),
+            None => (raw, ""),
+        };
+        if self.code_len == 0 && self.code_lines.is_empty() {
+            self.lang = fence
+                .trim_start()
+                .strip_prefix("```")
+                .and_then(Lang::from_info);
+        }
+        if body.len() < self.code_len {
+            self.code_lines.clear();
+            self.code_len = 0;
+        }
+        while let Some(nl) = body[self.code_len..].find('\n') {
+            let line = &body[self.code_len..self.code_len + nl];
+            self.code_lines.push(line.to_owned().into());
+            self.code_len += nl + 1;
+        }
+        let mut lines = self.code_lines.clone();
+        let partial = &body[self.code_len..];
+        if !partial.is_empty() {
+            lines.push(partial.to_owned().into());
+        }
+        Block {
+            kind: BlockKind::Code,
+            text: SharedString::default(),
+            inline: Arc::new([]),
+            lang: self.lang,
+            highlight: None,
+            lines: lines.into(),
+        }
     }
 }
 
@@ -487,10 +604,48 @@ mod tests {
         assert!(doc.blocks[1].lang.is_none() && doc.blocks[1].highlight.is_none());
         // A live tail is never highlighted.
         doc.push("```rust\nlet");
-        assert!(
-            Block::new(doc.tail_kind(), &doc.tail, false)
-                .highlight
-                .is_none()
+        let tail = LiveTail::default().block(doc.tail_kind(), &doc.tail);
+        assert!(tail.highlight.is_none());
+        assert_eq!(tail.lang, Some(Lang::Rust));
+    }
+
+    fn lines(block: &Block) -> Vec<&str> {
+        block.lines.iter().map(|l| l.as_ref()).collect()
+    }
+
+    #[test]
+    fn live_tail_parses_complete_lines_and_shows_the_partial_one() {
+        let mut live = LiveTail::default();
+        let b = live.block(BlockKind::Paragraph, "\nUse **bold**");
+        assert_eq!(
+            b.text.as_ref(),
+            "Use **bold**",
+            "the partial line is shown raw"
         );
+        assert!(b.inline.is_empty());
+        let b = live.block(BlockKind::Paragraph, "\nUse **bold**\nand `co");
+        assert_eq!(b.text.as_ref(), "Use bold\nand `co");
+        assert_eq!(&b.inline[..], &[(4..8, bold())]);
+        let b = live.block(BlockKind::Paragraph, "\nUse **bold**\nand `code`\n");
+        assert_eq!(b.text.as_ref(), "Use bold\nand code");
+        // Same as a full parse of the finished block.
+        let full = Block::new(BlockKind::Paragraph, "Use **bold**\nand `code`", true);
+        assert_eq!(b.text, full.text);
+        assert_eq!(b.inline, full.inline);
+        let b = live.block(BlockKind::Heading, "## Ti");
+        assert_eq!(b.text.as_ref(), "Ti");
+    }
+
+    #[test]
+    fn live_code_tail_builds_lines_incrementally() {
+        let mut live = LiveTail::default();
+        assert!(live.block(BlockKind::Code, "```py").lines.is_empty());
+        let b = live.block(BlockKind::Code, "```py\ndef f():\n    re");
+        assert_eq!(lines(&b), vec!["def f():", "    re"]);
+        assert_eq!(b.lang, Some(Lang::Python));
+        let b = live.block(BlockKind::Code, "```py\ndef f():\n    return 1\n");
+        assert_eq!(lines(&b), vec!["def f():", "    return 1"]);
+        let full = Block::new(BlockKind::Code, "```py\ndef f():\n    return 1\n```", true);
+        assert_eq!(lines(&full), lines(&b));
     }
 }

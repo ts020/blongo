@@ -23,7 +23,7 @@ use gpui::{
     div, list, prelude::*, px,
 };
 
-use crate::markdown::{Block, BlockKind, BlockSplitter};
+use crate::markdown::{Block, BlockKind, BlockSplitter, LiveTail};
 use crate::theme;
 
 /// Turn actions the shell carries out (they create or select threads).
@@ -44,7 +44,11 @@ enum Body {
     None,
     /// Assistant messages: block-split Markdown plus a per-frame snapshot of
     /// the live tail.
-    Markdown { doc: BlockSplitter, tail: Block },
+    Markdown {
+        doc: BlockSplitter,
+        tail: Block,
+        live: Box<LiveTail>,
+    },
     /// User messages and reasoning. `snapshot` is what renders; a finished
     /// body shares the core's `Arc<str>` (no copy). Only while text streams
     /// in does `live` hold the growing buffer, snapshotted once per frame.
@@ -69,8 +73,9 @@ impl Entry {
                 if !streaming {
                     doc.finish();
                 }
-                let tail = Block::new(doc.tail_kind(), &doc.tail, false);
-                Body::Markdown { doc, tail }
+                let mut live = Box::<LiveTail>::default();
+                let tail = live.block(doc.tail_kind(), &doc.tail);
+                Body::Markdown { doc, tail, live }
             }
             ItemKind::UserMessage | ItemKind::Reasoning { .. } => Body::Plain {
                 live: None,
@@ -118,7 +123,7 @@ impl Entry {
     /// Refresh per-frame snapshots of growing text.
     fn snapshot(&mut self) {
         match &mut self.body {
-            Body::Markdown { doc, tail } => *tail = Block::new(doc.tail_kind(), &doc.tail, false),
+            Body::Markdown { doc, tail, live } => *tail = live.block(doc.tail_kind(), &doc.tail),
             Body::Plain {
                 live: Some(text),
                 snapshot,
@@ -477,7 +482,7 @@ impl Timeline {
                     )
                     .into_any_element()
             }
-            (ItemKind::AssistantMessage { .. }, Body::Markdown { doc, tail }) => {
+            (ItemKind::AssistantMessage { .. }, Body::Markdown { doc, tail, .. }) => {
                 let block = doc.blocks.get(part).unwrap_or(tail);
                 if let (Some(lang), Some(hl)) = (block.lang, &block.highlight)
                     && hl.claim()
@@ -884,7 +889,7 @@ fn render_block(block: &Block) -> AnyElement {
                     .text_xs()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .children(code_lines(&block.text, spans.map(|s| &s[..]))),
+                    .children(code_lines(&block.lines, spans.map(|s| &s[..]))),
             )
             .into_any_element()
         }
@@ -893,13 +898,13 @@ fn render_block(block: &Block) -> AnyElement {
 
 /// One element per line of a code block, with syntax colors when the
 /// (lazily computed) highlight is ready.
-fn code_lines(text: &SharedString, spans: Option<&[(Range<usize>, u8)]>) -> Vec<AnyElement> {
-    let mut out = Vec::new();
+fn code_lines(lines: &[SharedString], spans: Option<&[(Range<usize>, u8)]>) -> Vec<AnyElement> {
+    let mut out = Vec::with_capacity(lines.len());
     let mut next = 0;
     let mut start = 0;
-    for line in text.split('\n') {
+    for line in lines {
         let end = start + line.len();
-        let line_text = SharedString::from(line.to_owned());
+        let line_text = line.clone();
         let el = match spans {
             Some(spans) => {
                 let mut highlights = Vec::new();
