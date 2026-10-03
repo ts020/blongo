@@ -184,6 +184,7 @@ impl Sidebar {
     pub fn environment_added(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         self.form_notice = None;
+        self.footer_notice = None;
         self.env_input.update(cx, |i, cx| i.set_text("", cx));
         cx.notify();
     }
@@ -228,7 +229,7 @@ fn connection_badge(state: &ConnectionState) -> (Hsla, SharedString) {
         } => (
             theme::warning().into(),
             format!(
-                "reconnecting in {}s (#{attempt})",
+                "offline, retrying in {}s (attempt {attempt})",
                 retry_in_ms.div_ceil(1000)
             )
             .into(),
@@ -353,15 +354,7 @@ impl Render for Sidebar {
                                         .text_color(theme::text())
                                         .child(env.name.clone()),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_xs()
-                                        .text_color(theme::text_faint())
-                                        .child(label),
-                                )
+                                .child(div().flex_1())
                                 .when(env.status.is_some(), |d| {
                                     d.child(
                                         small_action(
@@ -375,6 +368,15 @@ impl Render for Sidebar {
                                         ),
                                     )
                                 }),
+                        )
+                        .child(
+                            div()
+                                .pl_4()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_xs()
+                                .text_color(theme::text_faint())
+                                .child(label),
                         )
                         .when_some(error, |d, e| {
                             d.child(

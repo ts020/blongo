@@ -578,7 +578,11 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::Notice { message } => {
-                self.notice = Some(message.into());
+                self.notice = Some(if env == LOCAL {
+                    message.into()
+                } else {
+                    format!("{}: {message}", self.sidebar.read(cx).envs[env].name).into()
+                });
                 cx.notify();
             }
             CoreEvent::Imported(result) => {

@@ -431,7 +431,7 @@ impl Hub {
                 self.stats
                     .connections
                     .store(self.conns.len(), Ordering::Relaxed);
-                if let (true, Some(r)) = (resumed, resume) {
+                if let (true, Some(r)) = (resumed, &resume) {
                     let replay: Vec<(u64, Payload)> = self
                         .ring
                         .iter()
@@ -442,10 +442,20 @@ impl Hub {
                     self.stats
                         .replayed
                         .fetch_add(replay.len() as u64, Ordering::Relaxed);
+                    eprintln!(
+                        "blongo-serve: connection {conn}: resumed after seq {}, replaying {}",
+                        r.last_seq,
+                        replay.len()
+                    );
                     for (seq, payload) in replay {
                         self.push(conn, ServerMsg::Seq(Sequenced { seq, payload }));
                     }
                 } else {
+                    if resume.is_some() {
+                        eprintln!(
+                            "blongo-serve: connection {conn}: cannot resume (other epoch or too old); sending snapshots"
+                        );
+                    }
                     self.request_shell(conn);
                 }
                 let models: Vec<ServerMsg> = self

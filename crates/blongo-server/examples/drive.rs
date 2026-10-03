@@ -1,7 +1,9 @@
 //! Headless client for profiling `blongo serve` (tools/profile_serve.py):
 //! pairs with the server, creates a project + thread, sends one prompt
 //! (the fake Codex streams its replay), prints `drive: done` when the run
-//! ends and then stays connected and idle until it is killed.
+//! ends and then stays connected and idle until it is killed. Between
+//! `drive: ready` (paired, thread open) and the prompt it waits for a line
+//! on stdin (or its end), so the profiler controls when streaming starts.
 //!
 //! Usage: drive TARGET PAIRING-CODE PROJECT-DIR PROMPT
 
@@ -61,6 +63,12 @@ fn main() {
             backend.dispatch(CommandEnvelope::new(command));
         }
         backend.open_thread(thread_id);
+        println!("drive: ready");
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)
+        })
+        .await;
         backend.dispatch(CommandEnvelope::new(Command::MessageDispatch {
             thread_id,
             message_id: ItemId::new(),

@@ -98,3 +98,14 @@ Linked, not copied: pulldown-cmark (MIT), tree-sitter, tree-sitter-highlight
 and the tree-sitter grammars for Rust, Python, JavaScript, TypeScript, Bash,
 JSON, Go and C (MIT), portable-pty (MIT) and alacritty_terminal
 (Apache-2.0). `deny.toml` keeps every dependency on a permissive license.
+
+## Remote environments (Phase 3)
+
+Linked, not copied: tokio-tungstenite and tungstenite (MIT), futures-util
+(MIT OR Apache-2.0), rmp-serde (MIT), serde_bytes (MIT OR Apache-2.0),
+ed25519-dalek and curve25519-dalek (BSD-3-Clause), subtle (BSD-3-Clause),
+sha2 (MIT OR Apache-2.0), getrandom (MIT OR Apache-2.0), base64
+(MIT OR Apache-2.0) and libc (MIT OR Apache-2.0). Binary distributions must
+carry each linked crate's license text; this repository does not yet
+generate that bundle (for example with `cargo about`), see
+`docs/phase3/report.md`.

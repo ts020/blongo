@@ -268,9 +268,11 @@ impl StreamState {
             ServerMsg::Install(state) => vec![CoreEvent::Install(state)],
             ServerMsg::Notice { message } => vec![CoreEvent::Notice { message }],
             ServerMsg::Imported(result) => vec![CoreEvent::Imported(result)],
-            ServerMsg::Failed { message } => vec![CoreEvent::Connection(ConnectionState::Failed(
-                format!("the server stopped: {message}"),
-            ))],
+            // The server is going away (shutdown, its core stopped): the
+            // link drops next and is retried like any other loss.
+            ServerMsg::Failed { message } => vec![CoreEvent::Notice {
+                message: format!("the server stopped: {message}"),
+            }],
             ServerMsg::TerminalOutput { id, data } => {
                 vec![CoreEvent::Terminal(TerminalEvent::Output {
                     id,

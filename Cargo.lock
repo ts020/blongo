@@ -682,6 +682,7 @@ version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "blongo-client",
  "blongo-core",
  "blongo-protocol",
  "gpui",
