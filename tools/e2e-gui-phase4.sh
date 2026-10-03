@@ -238,13 +238,28 @@ print("  review posted:", c["path"], c["line"])
 PY
 shot p4-16-review-sent
 
-echo "10. a blongo:// link handed to the running instance"
+echo "10. blongo:// links handed to the running instance only navigate"
 click 305 19; sleep 0.5                     # back to the chat
+projects=$(sql "SELECT count(*) FROM projects")
+threads=$(sql "SELECT count(*) FROM threads")
+mkdir -p "$WORK/linked"
+timeout 10 "$BIN" "blongo://project?path=$WORK/linked" >>"$WORK/app.log" 2>&1 || fail "the link process failed"
+sleep 1
+shot p4-17a-link-confirm
+[ "$(sql "SELECT count(*) FROM projects")" = "$projects" ] || fail "a link added a project without asking"
+click 753 186; sleep 0.5                    # Cancel
+[ "$(sql "SELECT count(*) FROM projects")" = "$projects" ] || fail "Cancel added the project"
+# A known project is only selected: no new thread per link.
+timeout 10 "$BIN" "blongo://project?path=$WORK/myproject" >>"$WORK/app.log" 2>&1 || fail "the link process failed"
+timeout 10 "$BIN" "blongo://project?path=$WORK/myproject" >>"$WORK/app.log" 2>&1 || fail "the link process failed"
+sleep 1
+[ "$(sql "SELECT count(*) FROM threads")" = "$threads" ] || fail "a link created a thread"
+shot p4-17b-link-known
 start=$(date +%s%N)
 timeout 10 "$BIN" "blongo://settings" >>"$WORK/app.log" 2>&1 || fail "the link process failed"
 echo "  second process exited in $(( ($(date +%s%N) - start) / 1000000 )) ms"
 sleep 1
-shot p4-17-deeplink-settings
+shot p4-17c-deeplink-settings
 
 echo "11. quit"
 quit

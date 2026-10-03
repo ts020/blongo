@@ -105,11 +105,16 @@ def main():
     ap.add_argument("--view", choices=["diff", "files"],
                     help="open this view after the run (or after the idle phase without a prompt)")
     ap.add_argument("--project", help="project folder (default: a new git repo in OUTPUT)")
+    ap.add_argument("--close-after", type=float,
+                    help="with --view: go back to the chat after this many seconds; the "
+                         "stream phase then ends when the view is closed")
     args = ap.parse_args()
     # The stream phase ends at this line of the app's log.
     marker = "view opened" if args.view and not args.prompt else "replay done"
     if args.view == "files" and not args.prompt:
         marker = "search done"
+    if args.view and args.close_after:
+        marker = "view closed"
 
     os.makedirs(args.output)
     binary = os.path.join(args.output, "blongo-profiled")
@@ -140,6 +145,7 @@ def main():
         BLONGO_CODEX_EXE=os.path.join(root, "crates/blongo-harness/tests/fixtures/fake_codex.py"),
         BLONGO_PROFILE_PROMPT=args.prompt,
         BLONGO_PROFILE_VIEW=args.view or "",
+        BLONGO_PROFILE_CLOSE_MS=str(int(args.close_after * 1000)) if args.close_after else "",
         BLONGO_PROFILE_PROJECT=os.path.abspath(project),
         BLONGO_PROFILE_START_MS=str(int((startup + args.idle) * 1000)),
         FAKE_CODEX_REPLAY=os.path.abspath(args.fixture),
@@ -189,6 +195,7 @@ def main():
         "fixture": args.fixture,
         "prompt": args.prompt,
         "view": args.view,
+        "closeAfter": args.close_after,
         "project": os.path.abspath(project),
         "phases": {},
     }
