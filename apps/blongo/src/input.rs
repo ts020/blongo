@@ -39,6 +39,7 @@ actions!(
         Cut,
         Copy,
         Submit,
+        SubmitAlt,
         Newline,
         Cancel,
     ]
@@ -66,6 +67,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, c),
         KeyBinding::new("end", End, c),
         KeyBinding::new("enter", Submit, c),
+        KeyBinding::new("secondary-enter", SubmitAlt, c),
         KeyBinding::new("shift-enter", Newline, c),
         KeyBinding::new("escape", Cancel, c),
     ]);
@@ -74,6 +76,8 @@ pub fn bind_keys(cx: &mut App) {
 pub enum InputEvent {
     /// Enter was pressed.
     Submit,
+    /// Ctrl/Cmd+Enter was pressed (the composer steers with it).
+    SubmitAlt,
     /// Escape was pressed.
     Cancel,
 }
@@ -273,6 +277,10 @@ impl TextInput {
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(InputEvent::Submit);
+    }
+
+    fn submit_alt(&mut self, _: &SubmitAlt, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::SubmitAlt);
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
@@ -939,6 +947,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::submit_alt))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

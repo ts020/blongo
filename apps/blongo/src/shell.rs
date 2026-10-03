@@ -1,23 +1,60 @@
-//! The window: sidebar (projects → threads), the open thread's timeline and
-//! the composer. Fed by the core's event channel; sends commands back.
+//! The window: sidebar (projects → threads), the open thread's timeline,
+//! the composer and the terminal panel. Fed by the core's event channel;
+//! sends commands back.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use blongo_core::{CoreClient, CoreEvent};
+use blongo_core::{CoreClient, CoreEvent, InstallState, LoginState};
 use blongo_protocol::{
-    Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, Project, ProjectId,
-    ProviderKind, RunId, Thread, ThreadId, ThreadStatus,
+    Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, ItemKind, ModelInfo,
+    ProjectId, ProviderKind, RunId, RunStatus, Thread, ThreadId, ThreadSnapshot, ThreadStatus,
 };
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, FontWeight, SharedString, Subscription, Window,
-    div, prelude::*, px,
+    App, Context, Entity, FocusHandle, Focusable, FontWeight, SharedString, StyleRefinement,
+    Subscription, Window, actions, div, prelude::*, px,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::input::{InputEvent, TextInput};
+use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::terminal::{self, GridSize, TerminalView};
 use crate::theme;
-use crate::timeline::{Timeline, button};
+use crate::timeline::{Timeline, TimelineEvent, button};
+
+actions!(
+    shell,
+    [
+        NewThread,
+        ForkThread,
+        UndoLastTurn,
+        ToggleTerminal,
+        UseCodex,
+        UseClaudeCode,
+        UseAntigravity,
+        NextModel,
+    ]
+);
+
+pub fn bind_keys(cx: &mut App) {
+    use gpui::KeyBinding;
+    let c = Some("Shell");
+    cx.bind_keys([
+        KeyBinding::new("secondary-n", NewThread, c),
+        KeyBinding::new("alt-f", ForkThread, c),
+        KeyBinding::new("alt-z", UndoLastTurn, c),
+        KeyBinding::new("secondary-`", ToggleTerminal, c),
+        KeyBinding::new("alt-1", UseCodex, c),
+        KeyBinding::new("alt-2", UseClaudeCode, c),
+        KeyBinding::new("alt-3", UseAntigravity, c),
+        KeyBinding::new("alt-m", NextModel, c),
+    ]);
+}
+
+const SIDEBAR_WIDTH: f32 = 260.;
+const TERMINAL_HEIGHT: f32 = 240.;
 
 /// Profiling hook: once the shell is up, make sure a project + thread exist,
 /// then send `prompt` after `delay` (see tools/profile.py).
@@ -26,28 +63,43 @@ pub struct AutoPrompt {
     pub prompt: String,
     pub delay: Duration,
     pub project_dir: PathBuf,
+    /// Also open the terminal panel (memory with a terminal open).
+    pub terminal: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Picker {
+    Provider,
+    Model,
 }
 
 pub struct Shell {
     core: CoreClient,
-    projects: Vec<Project>,
-    /// Newest first.
-    threads: Vec<Thread>,
-    selected: Option<ThreadId>,
+    sidebar: Entity<Sidebar>,
     timeline: Option<Entity<Timeline>>,
     composer: Entity<TextInput>,
-    project_input: Entity<TextInput>,
-    adding_project: bool,
     pending_project: Option<CommandId>,
     /// A sent message the core has not accepted yet: its text comes back
     /// into the composer if the command is rejected.
     pending_message: Option<(CommandId, String)>,
     /// Select this thread when its creation event arrives.
     pending_select: Option<ThreadId>,
+    /// Queued messages of the open thread, oldest first.
+    queued: Vec<(RunId, SharedString)>,
+    /// The open thread's run id → status (for the last-turn undo).
+    runs: Vec<(RunId, RunStatus)>,
+    /// Models each provider offered in its last handshake.
+    models: HashMap<ProviderKind, Arc<[ModelInfo]>>,
+    /// Provider for new threads: the last one picked.
+    default_provider: ProviderKind,
+    picker: Option<Picker>,
     /// Last rejected command's reason.
     notice: Option<SharedString>,
+    /// Sign-in / install progress.
+    provider_notice: Option<SharedString>,
     /// The core stopped; shown instead of the main area.
     fatal: Option<SharedString>,
+    terminal: Option<Entity<TerminalView>>,
     auto_prompt: Option<AutoPrompt>,
     /// Focus to apply on the next render (set where no window is at hand).
     pending_focus: Option<FocusHandle>,
@@ -65,47 +117,45 @@ impl Shell {
     ) -> Self {
         let composer = cx.new(|cx| {
             TextInput::new(
-                "Ask Codex anything…  (Enter to send, Shift+Enter for a new line)",
+                "Ask anything…  (Enter to send or queue, Ctrl+Enter to steer, Shift+Enter for a new line)",
                 true,
                 cx,
             )
         });
-        let project_input = cx.new(|cx| TextInput::new("/path/to/project", false, cx));
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
         let subscriptions = vec![
-            cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
-                if let InputEvent::Submit = event {
-                    this.send(window, cx);
-                }
-            }),
             cx.subscribe_in(
-                &project_input,
+                &composer,
                 window,
                 |this, _, event, window, cx| match event {
-                    InputEvent::Submit => this.add_project(cx),
+                    InputEvent::Submit => this.send(Delivery::Queue, window, cx),
+                    InputEvent::SubmitAlt => this.send(Delivery::Steer, window, cx),
                     InputEvent::Cancel => {
-                        this.adding_project = false;
-                        this.notice = None;
-                        window.focus(&this.composer.focus_handle(cx), cx);
+                        this.picker = None;
                         cx.notify();
                     }
                 },
             ),
+            cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
         ];
         Self::pump(events, cx);
         Self {
             core,
-            projects: Vec::new(),
-            threads: Vec::new(),
-            selected: None,
+            sidebar,
             timeline: None,
             composer,
-            project_input,
-            adding_project: false,
             pending_project: None,
             pending_message: None,
             pending_select: None,
+            queued: Vec::new(),
+            runs: Vec::new(),
+            models: HashMap::new(),
+            default_provider: ProviderKind::Codex,
+            picker: None,
             notice: None,
+            provider_notice: None,
             fatal: None,
+            terminal: None,
             auto_prompt,
             pending_focus: None,
             focus_handle: cx.focus_handle(),
@@ -136,45 +186,99 @@ impl Shell {
         .detach();
     }
 
-    fn thread(&self, id: ThreadId) -> Option<&Thread> {
-        self.threads.iter().find(|t| t.id == id)
+    fn selected(&self, cx: &App) -> Option<ThreadId> {
+        self.sidebar.read(cx).selected
     }
 
-    fn thread_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
-        self.threads.iter_mut().find(|t| t.id == id)
+    fn selected_thread(&self, cx: &App) -> Option<Thread> {
+        let sidebar = self.sidebar.read(cx);
+        sidebar.selected.and_then(|id| sidebar.thread(id)).cloned()
     }
 
-    fn selected_status(&self) -> ThreadStatus {
-        self.selected
-            .and_then(|id| self.thread(id))
+    fn selected_status(&self, cx: &App) -> ThreadStatus {
+        self.selected_thread(cx)
             .map_or(ThreadStatus::Idle, |t| t.status)
+    }
+
+    fn on_sidebar_event(
+        &mut self,
+        _: &Entity<Sidebar>,
+        event: &SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SidebarEvent::Select(id) => {
+                self.select(*id, cx);
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
+            SidebarEvent::NewThread {
+                project_id,
+                worktree,
+            } => self.new_thread(*project_id, *worktree, cx),
+            SidebarEvent::Archive(id) => self.dispatch(Command::ThreadArchive { thread_id: *id }),
+            SidebarEvent::AddProject(path) => {
+                let envelope = CommandEnvelope::new(Command::ProjectCreate {
+                    project_id: ProjectId::new(),
+                    name: String::new(),
+                    path: path.clone(),
+                });
+                self.pending_project = Some(envelope.command_id);
+                self.core.dispatch(envelope);
+            }
+            SidebarEvent::Dismissed => {
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
+            SidebarEvent::ImportT3 => {
+                let source = std::env::var_os("BLONGO_T3_DB")
+                    .map(PathBuf::from)
+                    .or_else(blongo_core::t3_import::default_source);
+                let message = match source {
+                    Some(source) => {
+                        let text = format!("Importing {}…", source.display());
+                        self.core.import_t3(source);
+                        text
+                    }
+                    None => "No home directory: cannot find t3code's database".into(),
+                };
+                self.sidebar.update(cx, |s, cx| {
+                    s.footer_notice = Some(message.into());
+                    cx.notify();
+                });
+            }
+        }
     }
 
     fn on_core_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
             CoreEvent::Shell(shell) => {
-                self.projects = shell.projects.clone();
-                self.threads = shell.threads.clone();
-                self.threads
-                    .sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-                // Restore: reopen the most recently active thread.
-                let recent = shell.threads.first().map(|t| t.id);
-                if let Some(id) = recent {
-                    self.select(id, cx);
+                let first = self.sidebar.read(cx).projects.is_empty()
+                    && self.sidebar.read(cx).threads.is_empty();
+                let no_projects = shell.projects.is_empty();
+                self.sidebar.update(cx, |s, cx| {
+                    s.projects = shell.projects.clone();
+                    s.set_threads(shell.threads.clone());
+                    if no_projects && self.auto_prompt.is_none() {
+                        s.adding_project = true;
+                    }
+                    cx.notify();
+                });
+                if first {
+                    // Restore: reopen the most recently active thread.
+                    if let Some(id) = shell.threads.first().map(|t| t.id) {
+                        self.select(id, cx);
+                    }
+                    if no_projects && self.auto_prompt.is_none() {
+                        self.pending_focus =
+                            Some(self.sidebar.read(cx).project_input.focus_handle(cx));
+                    }
+                    self.start_auto_prompt(cx);
                 }
-                if self.projects.is_empty() && self.auto_prompt.is_none() {
-                    self.adding_project = true;
-                    self.pending_focus = Some(self.project_input.focus_handle(cx));
-                }
-                self.start_auto_prompt(cx);
                 cx.notify();
             }
             CoreEvent::Thread(snapshot) => {
-                if self.selected == Some(snapshot.thread_id) {
-                    let status = self.selected_status();
-                    let core = self.core.clone();
-                    self.timeline = Some(cx.new(|_| Timeline::new(&snapshot, status, core)));
-                    cx.notify();
+                if self.selected(cx) == Some(snapshot.thread_id) {
+                    self.load_thread(&snapshot, cx);
                 }
             }
             CoreEvent::TextDelta {
@@ -182,7 +286,7 @@ impl Shell {
                 item_id,
                 chunk,
             } => {
-                if let Some(timeline) = self.timeline_for(thread_id) {
+                if let Some(timeline) = self.timeline_for(thread_id, cx) {
                     timeline.update(cx, |t, cx| t.append(item_id, &chunk, cx));
                 }
             }
@@ -197,6 +301,11 @@ impl Shell {
             CoreEvent::CommandRejected { command_id, reason } => {
                 if self.pending_project == Some(command_id) {
                     self.pending_project = None;
+                    let reason: SharedString = reason.clone().into();
+                    self.sidebar.update(cx, |s, cx| {
+                        s.form_notice = Some(reason);
+                        cx.notify();
+                    });
                 }
                 if let Some((_, text)) = self.pending_message.take_if(|(id, _)| *id == command_id)
                     && self.composer.read(cx).text().is_empty()
@@ -206,11 +315,7 @@ impl Shell {
                 self.notice = Some(reason.into());
                 cx.notify();
             }
-            CoreEvent::CommandDuplicate { .. }
-            | CoreEvent::Models { .. }
-            | CoreEvent::Login { .. }
-            | CoreEvent::Install(_)
-            | CoreEvent::Imported(_) => {}
+            CoreEvent::CommandDuplicate { .. } => {}
             CoreEvent::Failed { message } => {
                 self.fatal = Some(message.into());
                 cx.notify();
@@ -221,13 +326,85 @@ impl Shell {
                     eprintln!("blongo: replay done");
                 }
             }
+            CoreEvent::Models { provider, models } => {
+                self.models.insert(provider, models);
+                cx.notify();
+            }
+            CoreEvent::Login { provider, state } => {
+                self.provider_notice = Some(match state {
+                    LoginState::Url(url) => {
+                        cx.open_url(&url);
+                        format!("{provider}: finish signing in in your browser — {url}").into()
+                    }
+                    LoginState::Succeeded => format!("{provider}: signed in").into(),
+                    LoginState::Failed(err) => format!("{provider}: sign-in failed: {err}").into(),
+                });
+                cx.notify();
+            }
+            CoreEvent::Install(state) => {
+                self.provider_notice = Some(match state {
+                    InstallState::Progress(p) => format!("Antigravity: {p}").into(),
+                    InstallState::Done(path) => {
+                        format!("Antigravity installed: {}", path.display()).into()
+                    }
+                    InstallState::Failed(err) => {
+                        format!("Antigravity install failed: {err}").into()
+                    }
+                });
+                cx.notify();
+            }
+            CoreEvent::Imported(result) => {
+                let message: SharedString = match result {
+                    Ok(r) => format!(
+                        "Imported {} projects, {} threads ({} already there)",
+                        r.projects, r.threads, r.skipped_threads
+                    )
+                    .into(),
+                    Err(err) => format!("Import failed: {err}").into(),
+                };
+                self.sidebar.update(cx, |s, cx| {
+                    s.footer_notice = Some(message);
+                    cx.notify();
+                });
+            }
         }
     }
 
-    fn timeline_for(&self, thread_id: ThreadId) -> Option<Entity<Timeline>> {
+    fn load_thread(&mut self, snapshot: &ThreadSnapshot, cx: &mut Context<Self>) {
+        let status = self.selected_status(cx);
+        let core = self.core.clone();
+        let timeline = cx.new(|_| Timeline::new(snapshot, status, core));
+        let sub = cx.subscribe(
+            &timeline,
+            |this, _, event: &TimelineEvent, cx| match event {
+                TimelineEvent::Fork(run_id) => this.fork(Some(*run_id), cx),
+                TimelineEvent::Rollback(run_id) => this.rollback(*run_id, cx),
+            },
+        );
+        self._subscriptions.push(sub);
+        self.timeline = Some(timeline);
+        self.runs = snapshot.runs.iter().map(|r| (r.id, r.status)).collect();
+        self.queued = snapshot
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Queued)
+            .map(|r| {
+                let text = snapshot
+                    .items
+                    .iter()
+                    .find(|i| i.run_id == Some(r.id) && i.kind == ItemKind::UserMessage)
+                    .map(|i| SharedString::from(i.text.to_string()))
+                    .unwrap_or_default();
+                (r.id, text)
+            })
+            .collect();
+        cx.notify();
+    }
+
+    fn timeline_for(&self, thread_id: ThreadId, cx: &App) -> Option<Entity<Timeline>> {
         self.timeline
             .as_ref()
-            .filter(|_| self.selected == Some(thread_id))
+            .filter(|_| self.selected(cx) == Some(thread_id))
             .cloned()
     }
 
@@ -239,64 +416,151 @@ impl Shell {
     ) {
         match kind {
             EventKind::ProjectCreated { project } => {
-                self.projects.push(project.clone());
-                if command_id.is_some() && command_id == self.pending_project {
+                let ours = command_id.is_some() && command_id == self.pending_project;
+                let project = project.clone();
+                let project_id = project.id;
+                self.sidebar.update(cx, |s, cx| {
+                    s.projects.push(project);
+                    if ours {
+                        s.adding_project = false;
+                        s.form_notice = None;
+                        s.project_input.update(cx, |i, cx| i.set_text("", cx));
+                    }
+                    cx.notify();
+                });
+                if ours {
                     self.pending_project = None;
-                    self.adding_project = false;
                     self.notice = None;
-                    self.project_input.update(cx, |i, cx| i.set_text("", cx));
                     // A new project starts with a thread, like t3code.
-                    self.new_thread(project.id, cx);
+                    self.new_thread(project_id, false, cx);
                 }
-                cx.notify();
             }
             EventKind::ThreadCreated { thread } => {
-                self.threads.insert(0, thread.clone());
-                if self.pending_select == Some(thread.id) {
+                let thread = thread.clone();
+                let id = thread.id;
+                self.sidebar.update(cx, |s, cx| {
+                    s.threads.insert(0, thread);
+                    cx.notify();
+                });
+                if self.pending_select == Some(id) {
                     self.pending_select = None;
-                    self.select(thread.id, cx);
+                    self.select(id, cx);
                 }
-                cx.notify();
             }
             EventKind::ThreadRenamed { thread_id, title } => {
-                if let Some(t) = self.thread_mut(*thread_id) {
-                    t.title = title.clone();
+                let changed = self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(*thread_id, cx, |t| {
+                        t.title = title.clone();
+                        true
+                    })
+                });
+                if changed && self.selected(cx) == Some(*thread_id) {
                     cx.notify();
                 }
             }
             EventKind::ThreadArchived { thread_id } => {
-                self.threads.retain(|t| t.id != *thread_id);
-                if self.selected == Some(*thread_id) {
-                    self.selected = None;
+                let selected = self.selected(cx) == Some(*thread_id);
+                self.sidebar.update(cx, |s, cx| {
+                    s.threads.retain(|t| t.id != *thread_id);
+                    if selected {
+                        s.selected = None;
+                    }
+                    cx.notify();
+                });
+                if selected {
                     self.timeline = None;
+                    self.terminal = None;
                 }
                 cx.notify();
             }
+            EventKind::ThreadProviderChanged {
+                thread_id,
+                provider,
+                model,
+                provider_thread_id,
+                pending_context,
+            } => {
+                self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(*thread_id, cx, |t| {
+                        t.provider = *provider;
+                        t.model = model.clone();
+                        t.provider_thread_id = provider_thread_id.clone();
+                        t.pending_context = pending_context.clone();
+                        true
+                    })
+                });
+                cx.notify();
+            }
+            EventKind::ThreadProviderBound {
+                thread_id,
+                provider_thread_id,
+            } => {
+                self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(*thread_id, cx, |t| {
+                        t.provider_thread_id = Some(provider_thread_id.clone());
+                        t.pending_context = None;
+                        false
+                    })
+                });
+            }
             EventKind::RunCreated { run } => {
+                if self.selected(cx) == Some(run.thread_id) {
+                    self.runs.push((run.id, run.status));
+                    if run.status == RunStatus::Queued {
+                        self.queued.push((run.id, SharedString::default()));
+                        cx.notify();
+                    }
+                    if let Some(timeline) = &self.timeline {
+                        timeline.update(cx, |t, cx| t.set_run_status(run.id, run.status, cx));
+                    }
+                }
                 if let Some(status) = run.status.thread_status() {
                     self.set_thread_status(run.thread_id, status, cx);
                 }
             }
             EventKind::RunStatusChanged {
-                thread_id, status, ..
+                thread_id,
+                run_id,
+                status,
+                ..
             } => {
+                if self.selected(cx) == Some(*thread_id) {
+                    if let Some(r) = self.runs.iter_mut().find(|(id, _)| id == run_id) {
+                        r.1 = *status;
+                    }
+                    if *status != RunStatus::Queued {
+                        let before = self.queued.len();
+                        self.queued.retain(|(id, _)| id != run_id);
+                        if before != self.queued.len() {
+                            cx.notify();
+                        }
+                    }
+                    if let Some(timeline) = &self.timeline {
+                        timeline.update(cx, |t, cx| t.set_run_status(*run_id, *status, cx));
+                    }
+                }
                 if let Some(status) = status.thread_status() {
                     self.set_thread_status(*thread_id, status, cx);
                 }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
-                if let Some(timeline) = self.timeline_for(item.thread_id) {
+                if let (EventKind::ItemAdded { .. }, ItemKind::UserMessage, Some(run_id)) =
+                    (kind, &item.kind, item.run_id)
+                    && let Some(q) = self.queued.iter_mut().find(|(id, _)| *id == run_id)
+                {
+                    q.1 = SharedString::from(item.text.to_string());
+                    cx.notify();
+                }
+                if let Some(timeline) = self.timeline_for(item.thread_id, cx) {
                     timeline.update(cx, |t, cx| t.apply(kind, cx));
                 }
             }
             EventKind::ItemFinished { thread_id, .. } => {
-                if let Some(timeline) = self.timeline_for(*thread_id) {
+                if let Some(timeline) = self.timeline_for(*thread_id, cx) {
                     timeline.update(cx, |t, cx| t.apply(kind, cx));
                 }
             }
-            EventKind::ThreadProviderBound { .. }
-            | EventKind::ThreadProviderChanged { .. }
-            | EventKind::RunProviderTurn { .. }
+            EventKind::RunProviderTurn { .. }
             | EventKind::RunCheckpointed { .. }
             | EventKind::ItemTextAppended { .. } => {}
         }
@@ -308,11 +572,15 @@ impl Shell {
         status: ThreadStatus,
         cx: &mut Context<Self>,
     ) {
-        if let Some(t) = self.thread_mut(thread_id)
-            && t.status != status
-        {
-            t.status = status;
-            if let Some(timeline) = self.timeline_for(thread_id) {
+        let changed = self.sidebar.update(cx, |s, cx| {
+            s.update_thread(thread_id, cx, |t| {
+                let changed = t.status != status;
+                t.status = status;
+                changed
+            })
+        });
+        if changed && self.selected(cx) == Some(thread_id) {
+            if let Some(timeline) = &self.timeline {
                 timeline.update(cx, |t, cx| t.set_status(status, cx));
             }
             cx.notify();
@@ -321,58 +589,49 @@ impl Shell {
 
     // --------------------------------------------------------------- actions
 
+    fn dispatch(&self, command: Command) {
+        self.core.dispatch(CommandEnvelope::new(command));
+    }
+
     fn select(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        if self.selected == Some(thread_id) {
+        if self.selected(cx) == Some(thread_id) {
             return;
         }
-        self.selected = Some(thread_id);
+        self.sidebar.update(cx, |s, cx| {
+            s.selected = Some(thread_id);
+            cx.notify();
+        });
         self.pending_focus = Some(self.composer.focus_handle(cx));
         // Only the open thread's timeline is kept in memory.
         self.timeline = None;
+        self.queued.clear();
+        self.runs.clear();
         self.notice = None;
+        self.picker = None;
+        // The terminal belongs to the thread's workspace.
+        self.terminal = None;
         self.core.open_thread(thread_id);
         cx.notify();
     }
 
-    fn new_thread(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+    fn new_thread(&mut self, project_id: ProjectId, worktree: bool, cx: &mut Context<Self>) {
         let thread_id = ThreadId::new();
         self.pending_select = Some(thread_id);
-        self.core
-            .dispatch(CommandEnvelope::new(Command::ThreadCreate {
-                thread_id,
-                project_id,
-                title: String::new(),
-                provider: ProviderKind::Codex,
-                model: None,
-                worktree: false,
-            }));
+        self.dispatch(Command::ThreadCreate {
+            thread_id,
+            project_id,
+            title: String::new(),
+            provider: self.default_provider,
+            model: None,
+            worktree,
+        });
         cx.notify();
     }
 
-    fn add_project(&mut self, cx: &mut Context<Self>) {
-        let path = self.project_input.read(cx).text().trim().to_owned();
-        if path.is_empty() {
-            return;
-        }
-        let envelope = CommandEnvelope::new(Command::ProjectCreate {
-            project_id: ProjectId::new(),
-            name: String::new(),
-            path,
-        });
-        self.pending_project = Some(envelope.command_id);
-        self.core.dispatch(envelope);
-    }
-
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.selected else {
+    fn send(&mut self, delivery: Delivery, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected(cx) else {
             return;
         };
-        if matches!(
-            self.selected_status(),
-            ThreadStatus::Running | ThreadStatus::Waiting
-        ) {
-            return;
-        }
         let text = self.composer.read(cx).text().trim_end().to_owned();
         if text.trim().is_empty() {
             return;
@@ -382,260 +641,326 @@ impl Shell {
             message_id: ItemId::new(),
             run_id: RunId::new(),
             text: text.clone(),
-            delivery: Delivery::Queue,
+            delivery,
         });
         self.pending_message = Some((envelope.command_id, text));
         self.core.dispatch(envelope);
         self.notice = None;
+        self.picker = None;
         self.composer.update(cx, |c, cx| c.set_text("", cx));
         window.focus(&self.composer.focus_handle(cx), cx);
     }
 
-    fn stop(&mut self, _cx: &mut Context<Self>) {
-        if let Some(thread_id) = self.selected {
-            self.core
-                .dispatch(CommandEnvelope::new(Command::RunInterrupt { thread_id }));
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread_id) = self.selected(cx) {
+            self.dispatch(Command::RunInterrupt { thread_id });
         }
     }
 
-    fn archive(&mut self, thread_id: ThreadId) {
-        self.core
-            .dispatch(CommandEnvelope::new(Command::ThreadArchive { thread_id }));
+    fn fork(&mut self, up_to_run_id: Option<RunId>, cx: &mut Context<Self>) {
+        let Some(source_thread_id) = self.selected(cx) else {
+            return;
+        };
+        let thread_id = ThreadId::new();
+        self.pending_select = Some(thread_id);
+        self.dispatch(Command::ThreadFork {
+            source_thread_id,
+            thread_id,
+            up_to_run_id,
+        });
+    }
+
+    fn rollback(&mut self, run_id: RunId, cx: &mut Context<Self>) {
+        if let Some(thread_id) = self.selected(cx) {
+            self.notice = None;
+            self.dispatch(Command::ThreadRollback { thread_id, run_id });
+        }
+    }
+
+    /// Undo the latest turn that is still part of the conversation.
+    fn undo_last(&mut self, cx: &mut Context<Self>) {
+        let last = self
+            .runs
+            .iter()
+            .rev()
+            .find(|(_, s)| {
+                !matches!(
+                    s,
+                    RunStatus::Queued | RunStatus::Cancelled | RunStatus::RolledBack
+                )
+            })
+            .map(|(id, _)| *id);
+        if let Some(run_id) = last {
+            self.rollback(run_id, cx);
+        }
+    }
+
+    fn set_provider(
+        &mut self,
+        provider: ProviderKind,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker = None;
+        self.default_provider = provider;
+        let Some(thread) = self.selected_thread(cx) else {
+            cx.notify();
+            return;
+        };
+        if thread.provider != provider || thread.model != model {
+            self.dispatch(Command::ThreadSetProvider {
+                thread_id: thread.id,
+                provider,
+                model,
+            });
+        }
+        cx.notify();
+    }
+
+    fn next_model(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.selected_thread(cx) else {
+            return;
+        };
+        let models = self
+            .models
+            .get(&thread.provider)
+            .cloned()
+            .unwrap_or_default();
+        // Cycle: default → each offered model → default.
+        let ids: Vec<Option<String>> = std::iter::once(None)
+            .chain(models.iter().map(|m| Some(m.id.clone())))
+            .collect();
+        let at = ids.iter().position(|m| *m == thread.model).unwrap_or(0);
+        let next = ids[(at + 1) % ids.len()].clone();
+        self.set_provider(thread.provider, next, cx);
+    }
+
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal.take().is_some() {
+            window.focus(&self.composer.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
+        if let Some(term) = self.open_terminal(cx) {
+            window.focus(&term.focus_handle(cx), cx);
+        }
+    }
+
+    /// Open a shell in the open thread's workspace (worktree or project).
+    fn open_terminal(&mut self, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
+        let thread = self.selected_thread(cx)?;
+        let cwd = match &thread.worktree {
+            Some(w) => PathBuf::from(&w.path),
+            None => self
+                .sidebar
+                .read(cx)
+                .project(thread.project_id)
+                .map(|p| PathBuf::from(&p.path))
+                .unwrap_or_else(|| ".".into()),
+        };
+        let shell = std::env::var("BLONGO_TERMINAL_SHELL").ok();
+        match TerminalView::open(&cwd, shell, cx) {
+            Ok(term) => {
+                self.terminal = Some(term.clone());
+                cx.notify();
+                Some(term)
+            }
+            Err(err) => {
+                self.notice = Some(format!("Cannot open a terminal: {err:#}").into());
+                cx.notify();
+                None
+            }
+        }
     }
 
     fn start_auto_prompt(&mut self, cx: &mut Context<Self>) {
         let Some(auto) = self.auto_prompt.clone() else {
             return;
         };
-        if self.projects.is_empty() {
+        let (no_projects, first_project, no_threads) = {
+            let s = self.sidebar.read(cx);
+            (
+                s.projects.is_empty(),
+                s.projects.first().map(|p| p.id),
+                s.threads.is_empty(),
+            )
+        };
+        if no_projects {
             let project_id = ProjectId::new();
-            self.core
-                .dispatch(CommandEnvelope::new(Command::ProjectCreate {
-                    project_id,
-                    name: String::new(),
-                    path: auto.project_dir.to_string_lossy().into_owned(),
-                }));
-            self.new_thread(project_id, cx);
-        } else if self.threads.is_empty() {
-            self.new_thread(self.projects[0].id, cx);
+            self.dispatch(Command::ProjectCreate {
+                project_id,
+                name: String::new(),
+                path: auto.project_dir.to_string_lossy().into_owned(),
+            });
+            self.new_thread(project_id, false, cx);
+        } else if no_threads && let Some(project_id) = first_project {
+            self.new_thread(project_id, false, cx);
         }
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(auto.delay).await;
             this.update(cx, |this, cx| {
-                let thread_id = this.selected.or(this.threads.first().map(|t| t.id));
+                let thread_id =
+                    this.selected(cx)
+                        .or(this.sidebar.read(cx).threads.first().map(|t| t.id));
                 if let Some(thread_id) = thread_id {
-                    this.core
-                        .dispatch(CommandEnvelope::new(Command::MessageDispatch {
-                            thread_id,
-                            message_id: ItemId::new(),
-                            run_id: RunId::new(),
-                            text: auto.prompt.clone(),
-                            delivery: Delivery::Queue,
-                        }));
+                    this.dispatch(Command::MessageDispatch {
+                        thread_id,
+                        message_id: ItemId::new(),
+                        run_id: RunId::new(),
+                        text: auto.prompt.clone(),
+                        delivery: Delivery::Queue,
+                    });
                 }
                 cx.notify();
             })
             .ok();
+            if auto.terminal {
+                this.update(cx, |this, cx| {
+                    this.open_terminal(cx);
+                })
+                .ok();
+            }
         })
         .detach();
     }
 
     // ------------------------------------------------------------- rendering
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("blongo"),
-            )
-            .child(
-                div()
-                    .id("add-project")
-                    .px_2()
-                    .rounded_md()
-                    .text_color(theme::text_muted())
-                    .hover(|d| d.bg(theme::surface_hover()))
-                    .cursor_pointer()
-                    .child("+ Project")
-                    .text_xs()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.adding_project = !this.adding_project;
-                        this.notice = None;
-                        if this.adding_project {
-                            window.focus(&this.project_input.focus_handle(cx), cx);
-                        }
-                        cx.notify();
-                    })),
-            );
-
-        let add_form = self.adding_project.then(|| {
-            div()
-                .mx_2()
-                .mb_2()
-                .p_2()
-                .rounded_md()
-                .bg(theme::surface())
-                .border_1()
-                .border_color(theme::border())
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text_muted())
-                        .child("Add a project folder (Enter to add, Esc to cancel)"),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::code_bg())
-                        .text_sm()
-                        .child(self.project_input.clone()),
-                )
-                .when_some(
-                    self.notice
-                        .clone()
-                        .filter(|_| self.pending_project.is_none() && self.adding_project),
-                    |d, notice| d.child(div().text_xs().text_color(theme::danger()).child(notice)),
-                )
-        });
-
-        let mut list = div()
-            .id("projects")
+    fn render_picker(&self, thread: &Thread, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let picker = self.picker?;
+        let mut menu = div()
+            .absolute()
+            .bottom(px(46.))
+            .left(px(8.))
+            .w(px(300.))
+            .p_1()
+            .rounded_md()
+            .bg(theme::surface_hover())
+            .border_1()
+            .border_color(theme::border())
             .flex()
             .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            .px_2()
-            .gap_0p5();
-        for project in &self.projects {
-            let project_id = project.id;
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("p-{project_id}")))
-                    .group("project")
-                    .mt_2()
-                    .px_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .rounded_md()
-                    .child(
-                        div().flex().flex_col().overflow_hidden().child(
+            .text_sm();
+        let row = |id: SharedString, label: SharedString, active: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|d| d.bg(theme::surface()))
+                .flex()
+                .justify_between()
+                .child(label)
+                .when(active, |d| {
+                    d.child(div().text_color(theme::accent()).child("✓"))
+                })
+        };
+        match picker {
+            Picker::Provider => {
+                for provider in ProviderKind::ALL {
+                    let caps = provider.capabilities();
+                    menu =
+                        menu.child(
+                            row(
+                                format!("pick-{}", provider.id()).into(),
+                                provider.label().into(),
+                                thread.provider == provider,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.set_provider(provider, None, cx),
+                            )),
+                        );
+                    if caps.interactive_login {
+                        menu = menu.child(
                             div()
+                                .flex()
+                                .gap_2()
+                                .pl_4()
+                                .pb_1()
                                 .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::text_muted())
-                                .child(SharedString::from(project.name.clone())),
-                        ),
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "install-{}",
+                                            provider.id()
+                                        )))
+                                        .text_color(theme::text_muted())
+                                        .hover(|d| d.text_color(theme::text()))
+                                        .cursor_pointer()
+                                        .child("Install")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.picker = None;
+                                            this.core.install_antigravity();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("login-{}", provider.id())))
+                                        .text_color(theme::text_muted())
+                                        .hover(|d| d.text_color(theme::text()))
+                                        .cursor_pointer()
+                                        .child("Sign in")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.picker = None;
+                                            this.core.login(provider);
+                                            cx.notify();
+                                        })),
+                                ),
+                        );
+                    }
+                }
+            }
+            Picker::Model => {
+                menu = menu.child(
+                    row(
+                        "model-default".into(),
+                        "Default".into(),
+                        thread.model.is_none(),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("new-{project_id}")))
-                            .px_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(theme::text_muted())
-                            .hover(|d| d.bg(theme::surface_hover()))
-                            .cursor_pointer()
-                            .child("+ New")
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.new_thread(project_id, cx)),
-                            ),
-                    ),
-            );
-            for thread in self.threads.iter().filter(|t| t.project_id == project_id) {
-                let thread_id = thread.id;
-                let selected = self.selected == Some(thread_id);
-                let dot = match thread.status {
-                    ThreadStatus::Running => Some(theme::accent()),
-                    ThreadStatus::Waiting => Some(theme::warning().into()),
-                    ThreadStatus::Failed => Some(theme::danger().into()),
-                    ThreadStatus::Idle => None,
-                };
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("t-{thread_id}")))
-                        .group("thread")
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pl_3()
-                        .pr_1()
-                        .py_1()
-                        .rounded_md()
-                        .text_sm()
-                        .cursor_pointer()
-                        .text_color(if selected {
-                            theme::text()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .when(selected, |d| d.bg(theme::surface_hover()))
-                        .hover(|d| d.bg(theme::surface()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select(thread_id, cx);
-                            window.focus(&this.composer.focus_handle(cx), cx);
-                        }))
-                        .child(
-                            div()
-                                .size(px(7.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .when_some(dot, |d, c| d.bg(c)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .child(SharedString::from(thread.title.clone())),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("archive-{thread_id}")))
-                                .invisible()
-                                .group_hover("thread", |d| d.visible())
-                                .px_1()
-                                .text_xs()
-                                .text_color(theme::text_faint())
-                                .hover(|d| d.text_color(theme::danger()))
-                                .child("×")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.archive(thread_id);
-                                })),
-                        ),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let provider = this
+                            .selected_thread(cx)
+                            .map_or(this.default_provider, |t| t.provider);
+                        this.set_provider(provider, None, cx)
+                    })),
                 );
+                let models = self
+                    .models
+                    .get(&thread.provider)
+                    .cloned()
+                    .unwrap_or_default();
+                if models.is_empty() {
+                    menu = menu.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme::text_faint())
+                            .child("Models appear once the provider has started."),
+                    );
+                }
+                for (ix, model) in models.iter().enumerate() {
+                    let id = model.id.clone();
+                    let provider = thread.provider;
+                    menu = menu.child(
+                        row(
+                            format!("model-{ix}").into(),
+                            model.label.clone().into(),
+                            thread.model.as_deref() == Some(&model.id),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_provider(provider, Some(id.clone()), cx)
+                        })),
+                    );
+                }
             }
         }
-
-        div()
-            .flex()
-            .flex_col()
-            .w(px(260.))
-            .h_full()
-            .flex_shrink_0()
-            .bg(theme::sidebar())
-            .border_r_1()
-            .border_color(theme::border())
-            .child(header)
-            .children(add_form)
-            .child(list)
+        Some(menu.into_any_element())
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(fatal) = self.fatal.clone() {
             return div()
                 .flex_1()
@@ -649,8 +974,8 @@ impl Shell {
                 .child(fatal)
                 .into_any_element();
         }
-        let Some(thread) = self.selected.and_then(|id| self.thread(id)).cloned() else {
-            let hint = if self.projects.is_empty() {
+        let Some(thread) = self.selected_thread(cx) else {
+            let hint = if self.sidebar.read(cx).projects.is_empty() {
                 "Add a project folder to get started (+ Project, top left)."
             } else {
                 "Select a thread, or start one with “+ New” next to a project."
@@ -666,13 +991,26 @@ impl Shell {
                 .child(hint)
                 .into_any_element();
         };
-        let project = self
-            .projects
-            .iter()
-            .find(|p| p.id == thread.project_id)
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
+        let location = match &thread.worktree {
+            Some(w) => format!("{}  ⑂ {}", w.path, w.branch),
+            None => self
+                .sidebar
+                .read(cx)
+                .project(thread.project_id)
+                .map(|p| p.path.clone())
+                .unwrap_or_default(),
+        };
         let busy = matches!(thread.status, ThreadStatus::Running | ThreadStatus::Waiting);
+        let provider = thread.provider;
+        let model_label: SharedString = match &thread.model {
+            Some(id) => self
+                .models
+                .get(&provider)
+                .and_then(|m| m.iter().find(|m| &m.id == id))
+                .map_or_else(|| id.clone(), |m| m.label.clone())
+                .into(),
+            None => "Default model".into(),
+        };
 
         let header = div()
             .flex()
@@ -695,13 +1033,22 @@ impl Shell {
                     .whitespace_nowrap()
                     .text_xs()
                     .text_color(theme::text_faint())
-                    .child(SharedString::from(project)),
+                    .child(SharedString::from(location)),
             )
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::text_faint())
-                    .child("Codex"),
+                header_action("fork-thread", "Fork")
+                    .on_click(cx.listener(|this, _, _, cx| this.fork(None, cx))),
+            )
+            .child(
+                header_action(
+                    "toggle-terminal",
+                    if self.terminal.is_some() {
+                        "Close terminal"
+                    } else {
+                        "Terminal"
+                    },
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
             );
 
         let timeline = match &self.timeline {
@@ -709,24 +1056,94 @@ impl Shell {
             None => div().flex_1(),
         };
 
-        let action = if busy {
-            button(
-                "stop".into(),
-                "Stop",
-                theme::danger_bg(),
-                theme::danger(),
-                cx.listener(|this, _, _, cx| this.stop(cx)),
-            )
+        let has_text = !self.composer.read(cx).text().trim().is_empty();
+        let actions = if busy {
+            div()
+                .flex()
+                .gap_2()
+                .when(has_text, |d| {
+                    d.child(button(
+                        "queue".into(),
+                        "Queue",
+                        theme::surface_hover(),
+                        theme::text(),
+                        cx.listener(|this, _, window, cx| this.send(Delivery::Queue, window, cx)),
+                    ))
+                    .child(button(
+                        "steer".into(),
+                        "Steer",
+                        theme::accent_bg(),
+                        theme::text(),
+                        cx.listener(|this, _, window, cx| this.send(Delivery::Steer, window, cx)),
+                    ))
+                })
+                .child(button(
+                    "stop".into(),
+                    "Stop",
+                    theme::danger_bg(),
+                    theme::danger(),
+                    cx.listener(|this, _, _, cx| this.stop(cx)),
+                ))
         } else {
-            button(
+            div().child(button(
                 "send".into(),
                 "Send",
                 theme::accent_bg(),
                 theme::text(),
-                cx.listener(|this, _, window, cx| this.send(window, cx)),
-            )
+                cx.listener(|this, _, window, cx| this.send(Delivery::Queue, window, cx)),
+            ))
         };
 
+        let status_text: SharedString = match thread.status {
+            ThreadStatus::Running => format!("{provider} is working…").into(),
+            ThreadStatus::Waiting => format!("{provider} is waiting for your approval").into(),
+            _ => "on-request approvals".into(),
+        };
+
+        let queued = (!self.queued.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(self.queued.iter().map(|(run_id, text)| {
+                    let run_id = *run_id;
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme::surface())
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_xs()
+                        .child(div().text_color(theme::text_faint()).child("Queued"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(text.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("cancel-{run_id}")))
+                                .px_1()
+                                .text_color(theme::text_faint())
+                                .hover(|d| d.text_color(theme::danger()))
+                                .cursor_pointer()
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(thread_id) = this.selected(cx) {
+                                        this.dispatch(Command::RunCancel { thread_id, run_id });
+                                    }
+                                })),
+                        )
+                }))
+        });
+
+        let picker = self.render_picker(&thread, cx);
         let composer = div().flex().justify_center().px_6().pb_4().child(
             div()
                 .w_full()
@@ -734,12 +1151,21 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .when_some(
-                    self.notice.clone().filter(|_| !self.adding_project),
-                    |d, notice| d.child(div().text_xs().text_color(theme::danger()).child(notice)),
-                )
+                .children(queued)
+                .when_some(self.notice.clone(), |d, notice| {
+                    d.child(div().text_xs().text_color(theme::danger()).child(notice))
+                })
+                .when_some(self.provider_notice.clone(), |d, notice| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_muted())
+                            .child(notice),
+                    )
+                })
                 .child(
                     div()
+                        .relative()
                         .p_3()
                         .rounded_lg()
                         .bg(theme::surface())
@@ -754,19 +1180,78 @@ impl Shell {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(div().text_xs().text_color(theme::text_faint()).child(
-                                    match thread.status {
-                                        ThreadStatus::Running => "Codex is working…",
-                                        ThreadStatus::Waiting => {
-                                            "Codex is waiting for your approval"
-                                        }
-                                        _ => "Codex · on-request approvals",
-                                    },
-                                ))
-                                .child(action),
-                        ),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            pill("provider-picker", provider.label().into())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.picker = match this.picker {
+                                                        Some(Picker::Provider) => None,
+                                                        _ => Some(Picker::Provider),
+                                                    };
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(pill("model-picker", model_label).on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.picker = match this.picker {
+                                                    Some(Picker::Model) => None,
+                                                    _ => Some(Picker::Model),
+                                                };
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::text_faint())
+                                                .child(status_text),
+                                        ),
+                                )
+                                .child(actions),
+                        )
+                        .children(picker),
                 ),
         );
+
+        let terminal = self.terminal.clone().map(|term| {
+            // Fit the grid to the panel (cell size from the mono font).
+            let font = gpui::Font {
+                family: theme::MONO.into(),
+                ..gpui::Font::default()
+            };
+            let ts = window.text_system();
+            let cell_w = ts
+                .resolve_font(&font)
+                .pipe(|id| ts.advance(id, px(terminal::FONT_SIZE), 'm').ok())
+                .map_or(7.2, |a| f32::from(a.width));
+            let width = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 16.;
+            let size = GridSize {
+                columns: (width / cell_w).floor().max(10.) as usize,
+                lines: ((TERMINAL_HEIGHT - 30.) / terminal::LINE_HEIGHT).floor() as usize,
+            };
+            term.update(cx, |t, _| t.resize(size));
+            let title = term.read(cx).title.clone();
+            div()
+                .h(px(TERMINAL_HEIGHT))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(theme::border())
+                .child(
+                    div()
+                        .px_3()
+                        .py_0p5()
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                        .child(title),
+                )
+                .child(div().flex_1().min_h_0().child(term))
+        });
 
         div()
             .flex_1()
@@ -777,8 +1262,47 @@ impl Shell {
             .child(header)
             .child(timeline)
             .child(composer)
+            .children(terminal)
             .into_any_element()
     }
+}
+
+trait Pipe: Sized {
+    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
+
+fn header_action(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .text_xs()
+        .text_color(theme::text_muted())
+        .hover(|d| d.bg(theme::surface_hover()).text_color(theme::text()))
+        .cursor_pointer()
+        .child(label)
+}
+
+fn pill(id: &'static str, label: SharedString) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .gap_1()
+        .whitespace_nowrap()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .bg(theme::surface_hover())
+        .text_xs()
+        .text_color(theme::text_muted())
+        .hover(|d| d.text_color(theme::text()))
+        .cursor_pointer()
+        .child(label)
+        .child("▾")
 }
 
 impl Focusable for Shell {
@@ -792,12 +1316,46 @@ impl Render for Shell {
         if let Some(handle) = self.pending_focus.take() {
             window.focus(&handle, cx);
         }
+        let mut sidebar_style = StyleRefinement::default();
+        sidebar_style.size.width = Some(px(SIDEBAR_WIDTH).into());
+        sidebar_style.size.height = Some(gpui::relative(1.).into());
+        sidebar_style.flex_shrink = Some(0.);
         div()
+            .key_context("Shell")
+            .on_action(cx.listener(|this, _: &NewThread, _, cx| {
+                let project = this.selected_thread(cx).map(|t| t.project_id).or(this
+                    .sidebar
+                    .read(cx)
+                    .projects
+                    .first()
+                    .map(|p| p.id));
+                if let Some(project_id) = project {
+                    this.new_thread(project_id, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ForkThread, _, cx| this.fork(None, cx)))
+            .on_action(cx.listener(|this, _: &UndoLastTurn, _, cx| this.undo_last(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &UseCodex, _, cx| {
+                this.set_provider(ProviderKind::Codex, None, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseClaudeCode, _, cx| {
+                this.set_provider(ProviderKind::ClaudeCode, None, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseAntigravity, _, cx| {
+                this.set_provider(ProviderKind::Antigravity, None, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextModel, _, cx| this.next_model(cx)))
             .flex()
             .size_full()
             .bg(theme::bg())
             .text_color(theme::text())
-            .child(self.render_sidebar(cx))
-            .child(self.render_main(cx))
+            // Cached: re-rendered only when the sidebar itself is notified.
+            .child(self.sidebar.clone().cached(sidebar_style))
+            .child(self.render_main(window, cx))
     }
 }

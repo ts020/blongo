@@ -9,14 +9,26 @@
 //!   dir).
 //! - `BLONGO_CODEX_EXE`: Codex executable (default: `codex` on PATH, with
 //!   the npm shim swapped for its native binary).
+//! - `BLONGO_CLAUDE_EXE`, `BLONGO_ANTIGRAVITY_EXE`: the other providers.
+//! - `BLONGO_T3_DB`: t3code database for the sidebar's import action
+//!   (default `~/.t3/userdata/statev2.sqlite`, read through a copy).
+//! - `BLONGO_TERMINAL_SHELL`: shell for the terminal panel (default
+//!   `$SHELL`).
+//!
+//! `blongo import-t3 [PATH]` imports t3code's history without opening a
+//! window (one-way, read-only: the source database is copied first).
+//!
 //! - Profiling (tools/profile.py): `BLONGO_PROFILE_PROMPT` is sent in a
 //!   project for `BLONGO_PROFILE_PROJECT` (default: cwd) after
 //!   `BLONGO_PROFILE_START_MS`; "blongo: replay done" is printed when the
 //!   run ends.
 
+mod highlight;
 mod input;
 mod markdown;
 mod shell;
+mod sidebar;
+mod terminal;
 mod theme;
 mod timeline;
 
@@ -39,6 +51,10 @@ actions!(blongo, [Quit]);
 
 fn main() {
     let config = CoreConfig::from_env();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("import-t3") {
+        std::process::exit(import_t3(config, args.get(1).map(Into::into)));
+    }
     let (core, events) = match blongo_core::spawn(config.clone()) {
         Ok(core) => core,
         Err(err) => {
@@ -61,6 +77,7 @@ fn main() {
                 .map(Into::into)
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| ".".into()),
+            terminal: std::env::var_os("BLONGO_PROFILE_TERMINAL").is_some(),
         });
     let client = core.client();
     // Owned by the app; taken and shut down cleanly when the window closes.
@@ -69,6 +86,7 @@ fn main() {
 
     application().run(move |cx: &mut App| {
         input::bind_keys(cx);
+        shell::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         let quit_core = core.clone();
         cx.on_action(move |_: &Quit, cx| {
@@ -106,4 +124,48 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+/// `blongo import-t3 [PATH]`: run the import through the core and report.
+fn import_t3(config: CoreConfig, source: Option<std::path::PathBuf>) -> i32 {
+    let Some(source) = source.or_else(blongo_core::t3_import::default_source) else {
+        eprintln!("blongo: no t3code database given and no home directory");
+        return 2;
+    };
+    let (core, mut events) = match blongo_core::spawn(config) {
+        Ok(core) => core,
+        Err(err) => {
+            eprintln!("blongo: cannot start the core: {err:#}");
+            return 1;
+        }
+    };
+    core.client().import_t3(source.clone());
+    let code = loop {
+        match events.blocking_recv() {
+            Some(blongo_core::CoreEvent::Imported(Ok(r))) => {
+                println!(
+                    "imported from {}: {} projects, {} threads, {} runs, {} items ({} threads already imported)",
+                    source.display(),
+                    r.projects,
+                    r.threads,
+                    r.runs,
+                    r.items,
+                    r.skipped_threads
+                );
+                break 0;
+            }
+            Some(blongo_core::CoreEvent::Imported(Err(err))) => {
+                eprintln!("blongo: import failed: {err}");
+                break 1;
+            }
+            Some(blongo_core::CoreEvent::Failed { message }) => {
+                eprintln!("blongo: {message}");
+                break 1;
+            }
+            Some(_) => {}
+            None => break 1,
+        }
+    };
+    core.shutdown();
+    code
 }

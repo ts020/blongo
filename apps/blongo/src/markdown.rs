@@ -2,13 +2,18 @@
 //!
 //! One timeline row is one block, so a streamed token re-measures only the
 //! live tail row. Finished blocks are frozen once (display text + inline
-//! highlights) and never re-parsed. Inline support is deliberately small:
-//! `**bold**`, `` `code` `` and list bullets.
+//! highlights) and never re-parsed. Inline Markdown (emphasis, code spans,
+//! links, strikethrough, lists, task lists) is parsed with pulldown-cmark;
+//! fenced code keeps its language for lazy syntax highlighting.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use gpui::SharedString;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+use crate::highlight::{self, Lang};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -17,45 +22,89 @@ pub enum BlockKind {
     Code,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Inline {
-    Bold,
-    Code,
+/// Inline styles; several may cover the same text (bold inside a link).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Inline {
+    pub bold: bool,
+    pub italic: bool,
+    pub code: bool,
+    pub link: bool,
+    pub strike: bool,
 }
 
-#[derive(Clone, Debug)]
+/// Syntax highlighting of a code block, computed at most once, lazily.
+#[derive(Default)]
+pub struct CodeHighlight {
+    started: AtomicBool,
+    spans: OnceLock<Arc<highlight::Spans>>,
+}
+
+impl CodeHighlight {
+    /// True exactly once: the caller should compute the spans now.
+    pub fn claim(&self) -> bool {
+        !self.started.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn set(&self, spans: highlight::Spans) {
+        let _ = self.spans.set(Arc::new(spans));
+    }
+
+    pub fn get(&self) -> Option<&Arc<highlight::Spans>> {
+        self.spans.get()
+    }
+}
+
+#[derive(Clone)]
 pub struct Block {
     pub kind: BlockKind,
     /// Display text: markers stripped (code: fence lines removed).
     pub text: SharedString,
+    /// Non-overlapping, sorted.
     pub inline: Arc<[(Range<usize>, Inline)]>,
+    /// Code: the fence's language, when Blongo can highlight it.
+    pub lang: Option<Lang>,
+    /// Code: shared by every snapshot of a finished block.
+    pub highlight: Option<Arc<CodeHighlight>>,
 }
 
 impl Block {
-    pub fn new(kind: BlockKind, raw: &str) -> Self {
+    /// `finished`: the block will not change any more (only those are
+    /// highlighted).
+    pub fn new(kind: BlockKind, raw: &str, finished: bool) -> Self {
         match kind {
-            BlockKind::Code => Self {
-                kind,
-                text: SharedString::from(code_body(raw)),
-                inline: Arc::new([]),
-            },
-            BlockKind::Heading => {
-                let (text, inline) = parse_inline(raw.trim_start_matches('#').trim());
+            BlockKind::Code => {
+                let lang = raw
+                    .lines()
+                    .next()
+                    .and_then(|l| l.trim_start().strip_prefix("```"))
+                    .and_then(Lang::from_info);
                 Self {
                     kind,
-                    text: text.into(),
-                    inline: inline.into(),
+                    text: SharedString::from(code_body(raw)),
+                    inline: Arc::new([]),
+                    lang,
+                    highlight: (finished && lang.is_some()).then(Default::default),
                 }
             }
-            BlockKind::Paragraph => {
-                let (text, inline) = parse_inline(raw.trim_start_matches([' ', '\n']));
-                Self {
-                    kind,
-                    text: text.into(),
-                    inline: inline.into(),
-                }
-            }
+            BlockKind::Heading => Self::text(kind, raw.trim_start_matches('#').trim()),
+            BlockKind::Paragraph => Self::text(kind, raw.trim_start_matches([' ', '\n'])),
         }
+    }
+
+    fn text(kind: BlockKind, src: &str) -> Self {
+        let (text, inline) = parse_inline(src);
+        Self {
+            kind,
+            text: text.into(),
+            inline: inline.into(),
+            lang: None,
+            highlight: None,
+        }
+    }
+
+    /// Compute the highlight now (call off the UI thread).
+    pub fn compute_highlight(lang: Lang, text: &str, target: &CodeHighlight) {
+        target.set(highlight::highlight(lang, text));
     }
 }
 
@@ -151,7 +200,7 @@ impl BlockSplitter {
         } else {
             kind
         };
-        self.blocks.push(Block::new(kind, trimmed));
+        self.blocks.push(Block::new(kind, trimmed, true));
     }
 }
 
@@ -173,57 +222,147 @@ pub fn code_body(raw: &str) -> String {
     lines.join("\n")
 }
 
-/// Strip `**` / `` ` `` markers and list dashes; return display text and
-/// highlight ranges in it.
+/// Render inline Markdown to display text plus non-overlapping style
+/// ranges. List items become `• ` / `1. ` lines; soft breaks stay line
+/// breaks (agents format replies line by line).
 pub fn parse_inline(src: &str) -> (String, Vec<(Range<usize>, Inline)>) {
     let mut out = String::with_capacity(src.len());
-    let mut spans = Vec::new();
-    for (ix, line) in src.split('\n').enumerate() {
-        if ix > 0 {
+    // Open style spans: (start, style).
+    let mut raw: Vec<(Range<usize>, Inline)> = Vec::new();
+    let mut open: Vec<(usize, Inline)> = Vec::new();
+    // Per list nesting level: the next ordinal (`None`: bullets).
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    // Right after a bullet, a (loose list) paragraph must not break the line.
+    let mut at_item_start = false;
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let newline = |out: &mut String| {
+        if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        let indent = line.len() - line.trim_start().len();
-        let rest = &line[indent..];
-        let body = if let Some(item) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
-            out.push_str(&line[..indent]);
-            out.push_str("• ");
-            item
-        } else {
-            line
-        };
-        let mut chars = body.char_indices().peekable();
-        let mut bold_start: Option<usize> = None;
-        while let Some((i, c)) = chars.next() {
-            if c == '`' {
-                if let Some(close) = body[i + 1..].find('`') {
-                    let start = out.len();
-                    out.push_str(&body[i + 1..i + 1 + close]);
-                    spans.push((start..out.len(), Inline::Code));
-                    let resume = i + 1 + close + 1;
-                    while chars.peek().is_some_and(|(j, _)| *j < resume) {
-                        chars.next();
-                    }
-                    continue;
-                }
-            } else if c == '*' && body[i..].starts_with("**") {
-                chars.next();
-                match bold_start.take() {
-                    Some(start) => spans.push((start..out.len(), Inline::Bold)),
-                    None => {
-                        if body[i + 2..].contains("**") {
-                            bold_start = Some(out.len());
-                        } else {
-                            out.push_str("**");
-                        }
-                    }
-                }
-                continue;
+    };
+    for event in Parser::new_ext(src, options) {
+        let item_start = std::mem::take(&mut at_item_start);
+        match event {
+            Event::Start(Tag::Paragraph) if item_start => at_item_start = true,
+            Event::TaskListMarker(done) => {
+                out.push_str(if done { "☑ " } else { "☐ " });
+                at_item_start = item_start;
             }
-            out.push(c);
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::BlockQuote(_)) => {
+                newline(&mut out)
+            }
+            Event::Start(Tag::List(first)) => {
+                newline(&mut out);
+                lists.push(first);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                newline(&mut out);
+                let depth = lists.len().saturating_sub(1);
+                out.extend(std::iter::repeat_n("  ", depth));
+                match lists.last_mut() {
+                    Some(Some(n)) => {
+                        out.push_str(&format!("{n}. "));
+                        *n += 1;
+                    }
+                    _ => out.push_str("• "),
+                }
+                at_item_start = true;
+            }
+            Event::Start(Tag::Strong) => open.push((
+                out.len(),
+                Inline {
+                    bold: true,
+                    ..Default::default()
+                },
+            )),
+            Event::Start(Tag::Emphasis) => open.push((
+                out.len(),
+                Inline {
+                    italic: true,
+                    ..Default::default()
+                },
+            )),
+            Event::Start(Tag::Strikethrough) => open.push((
+                out.len(),
+                Inline {
+                    strike: true,
+                    ..Default::default()
+                },
+            )),
+            Event::Start(Tag::Link { .. }) => open.push((
+                out.len(),
+                Inline {
+                    link: true,
+                    ..Default::default()
+                },
+            )),
+            Event::End(
+                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link,
+            ) => {
+                if let Some((start, style)) = open.pop()
+                    && start < out.len()
+                {
+                    raw.push((start..out.len(), style));
+                }
+            }
+            Event::Code(text) => {
+                let start = out.len();
+                out.push_str(&text);
+                raw.push((
+                    start..out.len(),
+                    Inline {
+                        code: true,
+                        ..Default::default()
+                    },
+                ));
+            }
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => out.push_str(&text),
+            Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            Event::Rule => {
+                newline(&mut out);
+                out.push_str("───");
+            }
+            _ => {}
         }
     }
-    spans.sort_by_key(|(r, _)| r.start);
-    (out, spans)
+    (out, flatten(raw))
+}
+
+/// Split possibly nested style ranges into sorted, non-overlapping ranges
+/// whose style is the union of everything covering them.
+fn flatten(raw: Vec<(Range<usize>, Inline)>) -> Vec<(Range<usize>, Inline)> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut cuts: Vec<usize> = raw.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out: Vec<(Range<usize>, Inline)> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let mut style = Inline::default();
+        let mut covered = false;
+        for (r, s) in &raw {
+            if r.start <= a && b <= r.end {
+                covered = true;
+                style.bold |= s.bold;
+                style.italic |= s.italic;
+                style.code |= s.code;
+                style.link |= s.link;
+                style.strike |= s.strike;
+            }
+        }
+        if covered {
+            match out.last_mut() {
+                Some((r, s)) if r.end == a && *s == style => r.end = b,
+                _ => out.push((a..b, style)),
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -272,15 +411,86 @@ mod tests {
         assert_eq!(code_body(&doc.tail), "code\n\nmore");
     }
 
+    fn bold() -> Inline {
+        Inline {
+            bold: true,
+            ..Default::default()
+        }
+    }
+
+    fn code() -> Inline {
+        Inline {
+            code: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn inline_markers_become_highlights() {
         let (text, spans) = parse_inline("Use **bold** and `code` here");
         assert_eq!(text, "Use bold and code here");
-        assert_eq!(spans, vec![(4..8, Inline::Bold), (13..17, Inline::Code)]);
-        let (text, spans) = parse_inline("- one\n  * two `x`\nnot ** closed");
-        assert_eq!(text, "• one\n  • two x\nnot ** closed");
-        assert_eq!(spans, vec![(18..19, Inline::Code)]);
+        assert_eq!(spans, vec![(4..8, bold()), (13..17, code())]);
+        let (text, spans) = parse_inline("- one\n  - two `x`\n\n1. first\n2. second");
+        assert_eq!(text, "• one\n  • two x\n1. first\n2. second");
+        assert_eq!(spans, vec![(18..19, code())]);
+        let (text, _) = parse_inline("not ** closed");
+        assert_eq!(text, "not ** closed");
         let (text, _) = parse_inline("界 `界` **界**");
         assert_eq!(text, "界 界 界");
+    }
+
+    #[test]
+    fn nested_styles_are_flattened() {
+        let (text, spans) = parse_inline("[a **b** c](http://x) ~~d~~ - [x] e");
+        assert_eq!(text, "a b c d - [x] e");
+        let link = Inline {
+            link: true,
+            ..Default::default()
+        };
+        let link_bold = Inline {
+            link: true,
+            bold: true,
+            ..Default::default()
+        };
+        let strike = Inline {
+            strike: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            spans,
+            vec![
+                (0..2, link),
+                (2..3, link_bold),
+                (3..5, link),
+                (6..7, strike)
+            ]
+        );
+        let (text, _) = parse_inline("- [x] done\n- [ ] todo");
+        assert_eq!(text, "• ☑ done\n• ☐ todo");
+    }
+
+    #[test]
+    fn code_blocks_keep_their_language_and_highlight_lazily() {
+        let mut doc = BlockSplitter::default();
+        doc.push("```rust\nfn main() {}\n```\n```\nplain\n```\n");
+        let rust = &doc.blocks[0];
+        assert_eq!(rust.lang, Some(Lang::Rust));
+        let hl = rust
+            .highlight
+            .clone()
+            .expect("finished code is highlightable");
+        assert!(hl.get().is_none());
+        assert!(hl.claim());
+        assert!(!hl.claim(), "claimed once");
+        Block::compute_highlight(Lang::Rust, &rust.text, &hl);
+        assert!(!hl.get().unwrap().is_empty());
+        assert!(doc.blocks[1].lang.is_none() && doc.blocks[1].highlight.is_none());
+        // A live tail is never highlighted.
+        doc.push("```rust\nlet");
+        assert!(
+            Block::new(doc.tail_kind(), &doc.tail, false)
+                .highlight
+                .is_none()
+        );
     }
 }

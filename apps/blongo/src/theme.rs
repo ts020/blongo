@@ -53,6 +53,26 @@ pub fn danger_bg() -> Rgba {
 pub fn success() -> Rgba {
     rgb(0x4cb782)
 }
+pub fn link() -> Hsla {
+    rgb(0x7fb3ff).into()
+}
+
+/// Code colors for the classes of `highlight::NAMES`.
+pub fn syntax(class: u8) -> Hsla {
+    let color = match crate::highlight::NAMES.get(class as usize).copied() {
+        Some("comment") => 0x6a737d,
+        Some("keyword") | Some("label") => 0xc792ea,
+        Some("string") | Some("escape") => 0xa5d6a7,
+        Some("number") | Some("constant") | Some("boolean") => 0xf2a65a,
+        Some("function") | Some("constructor") => 0x82aaff,
+        Some("type") | Some("module") => 0xffcb6b,
+        Some("property") | Some("tag") | Some("attribute") => 0x89ddff,
+        Some("operator") => 0xb0b0b8,
+        Some("variable.builtin") => 0xf07178,
+        _ => 0xe8e8ea,
+    };
+    rgb(color).into()
+}
 
 #[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";

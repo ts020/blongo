@@ -7,21 +7,32 @@
 //! the thread is idle.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use blongo_core::CoreClient;
 use blongo_protocol::{
     ApprovalDecision, ApprovalState, Command, CommandEnvelope, EventKind, ItemId, ItemKind,
-    ThreadId, ThreadSnapshot, ThreadStatus, ToolStatus, TurnItem,
+    PlanStatus, PlanStep, RunId, RunStatus, ThreadId, ThreadSnapshot, ThreadStatus, ToolStatus,
+    TurnItem,
 };
 use gpui::{
-    AnyElement, Context, FollowMode, FontWeight, HighlightStyle, ListAlignment, ListState,
-    SharedString, StyledText, Window, div, list, prelude::*, px,
+    AnyElement, Context, EventEmitter, FollowMode, FontStyle, FontWeight, HighlightStyle,
+    ListAlignment, ListState, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
+    div, list, prelude::*, px,
 };
 
-use crate::markdown::{Block, BlockKind, BlockSplitter, Inline, code_body};
+use crate::markdown::{Block, BlockKind, BlockSplitter};
 use crate::theme;
+
+/// Turn actions the shell carries out (they create or select threads).
+pub enum TimelineEvent {
+    /// Fork the thread through this run.
+    Fork(RunId),
+    /// Undo this run and every later one.
+    Rollback(RunId),
+}
 
 /// Coalesce streamed deltas into at most one re-layout per frame.
 const FRAME: Duration = Duration::from_millis(16);
@@ -46,6 +57,8 @@ enum Body {
 struct Entry {
     item: Arc<TurnItem>,
     body: Body,
+    /// Its run is queued, cancelled or rolled back: not in the timeline.
+    hidden: bool,
 }
 
 impl Entry {
@@ -56,7 +69,7 @@ impl Entry {
                 if !streaming {
                     doc.finish();
                 }
-                let tail = Block::new(doc.tail_kind(), &doc.tail);
+                let tail = Block::new(doc.tail_kind(), &doc.tail, false);
                 Body::Markdown { doc, tail }
             }
             ItemKind::UserMessage | ItemKind::Reasoning { .. } => Body::Plain {
@@ -74,11 +87,18 @@ impl Entry {
                 ..(**item).clone()
             })
         };
-        Self { item, body }
+        Self {
+            item,
+            body,
+            hidden: false,
+        }
     }
 
     /// Rows this entry occupies.
     fn rows(&self) -> usize {
+        if self.hidden {
+            return 0;
+        }
         match &self.body {
             Body::Markdown { doc, .. } => doc.rows(),
             _ => 1,
@@ -98,7 +118,7 @@ impl Entry {
     /// Refresh per-frame snapshots of growing text.
     fn snapshot(&mut self) {
         match &mut self.body {
-            Body::Markdown { doc, tail } => *tail = Block::new(doc.tail_kind(), &doc.tail),
+            Body::Markdown { doc, tail } => *tail = Block::new(doc.tail_kind(), &doc.tail, false),
             Body::Plain {
                 live: Some(text),
                 snapshot,
@@ -154,6 +174,17 @@ pub struct Timeline {
     flush_scheduled: bool,
     status: ThreadStatus,
     expanded: HashSet<ItemId>,
+    /// Status of every run of the thread (hides queued / undone ones).
+    runs: HashMap<RunId, RunStatus>,
+}
+
+impl EventEmitter<TimelineEvent> for Timeline {}
+
+fn hides(status: Option<&RunStatus>) -> bool {
+    matches!(
+        status,
+        Some(RunStatus::Queued | RunStatus::Cancelled | RunStatus::RolledBack)
+    )
 }
 
 impl Timeline {
@@ -173,10 +204,13 @@ impl Timeline {
             flush_scheduled: false,
             status,
             expanded: HashSet::new(),
+            runs: snapshot.runs.iter().map(|r| (r.id, r.status)).collect(),
         };
         for item in &snapshot.items {
             this.index.insert(item.id, this.entries.len());
-            this.entries.push(Entry::new(item));
+            let mut entry = Entry::new(item);
+            entry.hidden = hides(item.run_id.as_ref().and_then(|r| this.runs.get(r)));
+            this.entries.push(entry);
         }
         this.rebuild_rows(0);
         this.list_state.reset(this.rows.len());
@@ -192,22 +226,44 @@ impl Timeline {
         }
     }
 
+    /// A run was created or changed status: show or hide its items.
+    pub fn set_run_status(&mut self, run_id: RunId, status: RunStatus, cx: &mut Context<Self>) {
+        if self.runs.insert(run_id, status) == Some(status) {
+            return;
+        }
+        let hidden = hides(Some(&status));
+        let mut first = None;
+        for (ix, entry) in self.entries.iter_mut().enumerate() {
+            if entry.item.run_id == Some(run_id) && entry.hidden != hidden {
+                entry.hidden = hidden;
+                first.get_or_insert(ix);
+            }
+        }
+        if let Some(ix) = first {
+            self.mark(ix, cx);
+        }
+    }
+
     pub fn apply(&mut self, event: &EventKind, cx: &mut Context<Self>) {
         match event {
             EventKind::ItemAdded { item } => {
                 let ix = self.entries.len();
                 self.index.insert(item.id, ix);
-                self.entries.push(Entry::new(item));
+                let mut entry = Entry::new(item);
+                entry.hidden = hides(item.run_id.as_ref().and_then(|r| self.runs.get(r)));
+                self.entries.push(entry);
                 self.mark(ix, cx);
             }
             EventKind::ItemUpdated { item } => {
                 if let Some(&ix) = self.index.get(&item.id) {
+                    let moved = self.entries[ix].item.ordinal != item.ordinal;
                     let entry = &mut self.entries[ix];
                     entry.item = Arc::new(TurnItem {
                         text: "".into(),
                         ..(**item).clone()
                     });
-                    self.mark(ix, cx);
+                    let from = if moved { self.reorder(ix) } else { ix };
+                    self.mark(from, cx);
                 }
             }
             EventKind::ItemFinished { item_id, .. } => {
@@ -218,6 +274,21 @@ impl Timeline {
             }
             _ => {}
         }
+    }
+
+    /// Entry `ix` changed ordinal (a queued message moved to where its turn
+    /// starts): move it to its sorted place. Returns the first entry whose
+    /// position changed.
+    fn reorder(&mut self, ix: usize) -> usize {
+        let entry = self.entries.remove(ix);
+        let ordinal = entry.item.ordinal;
+        let to = self.entries.partition_point(|e| e.item.ordinal <= ordinal);
+        self.entries.insert(to, entry);
+        let from = ix.min(to);
+        for (i, e) in self.entries.iter().enumerate().skip(from) {
+            self.index.insert(e.item.id, i);
+        }
+        from
     }
 
     pub fn append(&mut self, item_id: ItemId, chunk: &str, cx: &mut Context<Self>) {
@@ -356,28 +427,72 @@ impl Timeline {
         let id = item.id;
         let expanded = self.expanded.contains(&id);
         match (&item.kind, &entry.body) {
-            (ItemKind::UserMessage, Body::Plain { snapshot, .. }) => div()
-                .pt_4()
-                .pb_2()
-                .flex()
-                .justify_end()
-                .child(
+            (ItemKind::UserMessage, Body::Plain { snapshot, .. }) => {
+                let idle = !self.show_footer();
+                let actions = item.run_id.filter(|_| idle).map(|run_id| {
                     div()
-                        .max_w(px(MAX_WIDTH * 0.75))
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(theme::surface())
-                        .border_1()
-                        .border_color(theme::border())
-                        .text_sm()
-                        .child(snapshot.clone()),
-                )
-                .into_any_element(),
+                        .invisible()
+                        .group_hover("user-msg", |d| d.visible())
+                        .flex()
+                        .gap_1()
+                        .child(
+                            turn_action(format!("fork-{id}"), "Fork from here").on_click(
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(TimelineEvent::Fork(run_id))
+                                }),
+                            ),
+                        )
+                        .child(
+                            turn_action(format!("undo-{id}"), "Undo from here").on_click(
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(TimelineEvent::Rollback(run_id))
+                                }),
+                            ),
+                        )
+                });
+                div()
+                    .id(SharedString::from(format!("u-{id}")))
+                    .group("user-msg")
+                    .pt_4()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .children(actions)
+                    .child(
+                        div()
+                            .max_w(px(MAX_WIDTH * 0.75))
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(theme::surface())
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_sm()
+                            .child(snapshot.clone()),
+                    )
+                    .into_any_element()
+            }
             (ItemKind::AssistantMessage { .. }, Body::Markdown { doc, tail }) => {
                 let block = doc.blocks.get(part).unwrap_or(tail);
+                if let (Some(lang), Some(hl)) = (block.lang, &block.highlight)
+                    && hl.claim()
+                {
+                    // First time on screen: highlight off the UI thread.
+                    let (hl, text) = (hl.clone(), block.text.clone());
+                    let task = cx.background_spawn(async move {
+                        Block::compute_highlight(lang, &text, &hl);
+                    });
+                    cx.spawn(async move |this, cx| {
+                        task.await;
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    })
+                    .detach();
+                }
                 render_block(block)
             }
+            (ItemKind::Plan { steps }, _) => render_plan(steps),
             (ItemKind::Reasoning { streaming }, Body::Plain { snapshot, .. }) => {
                 let label = if *streaming { "Thinking…" } else { "Thought" };
                 let chevron = if expanded { "▾" } else { "▸" };
@@ -640,6 +755,63 @@ impl Timeline {
     }
 }
 
+fn turn_action(id: String, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id))
+        .px_2()
+        .rounded_sm()
+        .text_xs()
+        .text_color(theme::text_faint())
+        .hover(|d| d.text_color(theme::text()).bg(theme::surface_hover()))
+        .cursor_pointer()
+        .child(label)
+}
+
+fn render_plan(steps: &[PlanStep]) -> AnyElement {
+    let done = steps
+        .iter()
+        .filter(|s| s.status == PlanStatus::Completed)
+        .count();
+    div()
+        .my_2()
+        .p_3()
+        .rounded_lg()
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::border())
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_muted())
+                .child(format!("Plan · {done}/{} done", steps.len())),
+        )
+        .children(steps.iter().map(|step| {
+            let (glyph, color) = match step.status {
+                PlanStatus::Completed => ("✓", theme::success().into()),
+                PlanStatus::InProgress => ("◐", theme::accent()),
+                PlanStatus::Pending => ("○", theme::text_faint()),
+            };
+            div()
+                .flex()
+                .gap_2()
+                .text_sm()
+                .child(div().w(px(14.)).text_color(color).child(glyph))
+                .child(
+                    div()
+                        .flex_1()
+                        .when(step.status == PlanStatus::Completed, |d| {
+                            d.text_color(theme::text_muted()).line_through()
+                        })
+                        .child(SharedString::from(step.text.clone())),
+                )
+        }))
+        .into_any_element()
+}
+
 fn tool_frame(id: ItemId, _cx: &mut Context<Timeline>) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(format!("t-{id}")))
@@ -697,12 +869,7 @@ fn render_block(block: &Block) -> AnyElement {
             .child(styled(block))
             .into_any_element(),
         BlockKind::Code => {
-            // A live tail still carries its opening fence.
-            let body = if block.text.starts_with("```") {
-                SharedString::from(code_body(&block.text))
-            } else {
-                block.text.clone()
-            };
+            let spans = block.highlight.as_ref().and_then(|h| h.get());
             row.child(
                 div()
                     .p_3()
@@ -714,14 +881,53 @@ fn render_block(block: &Block) -> AnyElement {
                     .text_xs()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .children(
-                        body.lines()
-                            .map(|l| div().child(SharedString::from(l.to_owned()))),
-                    ),
+                    .children(code_lines(&block.text, spans.map(|s| &s[..]))),
             )
             .into_any_element()
         }
     }
+}
+
+/// One element per line of a code block, with syntax colors when the
+/// (lazily computed) highlight is ready.
+fn code_lines(text: &SharedString, spans: Option<&[(Range<usize>, u8)]>) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    let mut next = 0;
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        let line_text = SharedString::from(line.to_owned());
+        let el = match spans {
+            Some(spans) => {
+                let mut highlights = Vec::new();
+                while next < spans.len() && spans[next].0.end <= start {
+                    next += 1;
+                }
+                let mut i = next;
+                while i < spans.len() && spans[i].0.start < end {
+                    let (range, class) = &spans[i];
+                    let (a, b) = (range.start.max(start) - start, range.end.min(end) - start);
+                    if a < b {
+                        highlights.push((
+                            a..b,
+                            HighlightStyle {
+                                color: Some(theme::syntax(*class)),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                    i += 1;
+                }
+                div()
+                    .child(StyledText::new(line_text).with_highlights(highlights))
+                    .into_any_element()
+            }
+            None => div().child(line_text).into_any_element(),
+        };
+        out.push(el);
+        start = end + 1;
+    }
+    out
 }
 
 fn styled(block: &Block) -> StyledText {
@@ -729,30 +935,36 @@ fn styled(block: &Block) -> StyledText {
     if block.inline.is_empty() {
         return text;
     }
-    let mut end = 0;
     let highlights: Vec<_> = block
         .inline
         .iter()
-        .filter(|(range, _)| {
-            // Highlights must not overlap.
-            let ok = range.start >= end && range.end <= block.text.len();
-            if ok {
-                end = range.end;
+        .filter(|(range, _)| range.end <= block.text.len())
+        .map(|(range, s)| {
+            let mut style = HighlightStyle::default();
+            if s.bold {
+                style.font_weight = Some(FontWeight::BOLD);
             }
-            ok
-        })
-        .map(|(range, kind)| {
-            let style = match kind {
-                Inline::Bold => HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                },
-                Inline::Code => HighlightStyle {
-                    color: Some(theme::accent()),
-                    background_color: Some(theme::code_bg().into()),
-                    ..Default::default()
-                },
-            };
+            if s.italic {
+                style.font_style = Some(FontStyle::Italic);
+            }
+            if s.code {
+                style.color = Some(theme::accent());
+                style.background_color = Some(theme::code_bg().into());
+            }
+            if s.link {
+                style.color = Some(theme::link());
+                style.underline = Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(theme::link()),
+                    wavy: false,
+                });
+            }
+            if s.strike {
+                style.strikethrough = Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(theme::text_muted().into()),
+                });
+            }
             (range.clone(), style)
         })
         .collect();
