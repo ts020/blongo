@@ -696,7 +696,7 @@ async fn threads_created_until_runs(
         match core.next().await {
             CoreEvent::Event(ev) => {
                 if let EventKind::ThreadCreated { thread } = &ev.kind {
-                    created.push(thread.clone());
+                    created.push((**thread).clone());
                 }
             }
             CoreEvent::RunFinished { .. } => finished += 1,

@@ -714,6 +714,7 @@ version = "0.0.1"
 dependencies = [
  "base64",
  "blongo-core",
+ "blongo-forge",
  "blongo-protocol",
  "dirs",
  "ed25519-dalek",
@@ -733,6 +734,7 @@ name = "blongo-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blongo-forge",
  "blongo-git",
  "blongo-harness",
  "blongo-protocol",
@@ -741,6 +743,19 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "rusqlite",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "blongo-forge"
+version = "0.0.1"
+dependencies = [
+ "blongo-protocol",
+ "dirs",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -795,6 +810,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-tungstenite",
 ]
