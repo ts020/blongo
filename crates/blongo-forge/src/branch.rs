@@ -59,6 +59,68 @@ pub async fn fetch_pull(cwd: &Path, remote: &str, number: u64) -> Result<String,
     Ok(local)
 }
 
+/// How a local branch compares with a commit just fetched for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Same,
+    /// It was behind and now points at the fetched commit.
+    Forwarded,
+    /// It has commits the fetched one lacks (and maybe lacks some).
+    Differs,
+}
+
+/// Fast-forward the local `branch` (not checked out anywhere) to
+/// `target` when it is behind; never moves it otherwise. Only the local
+/// ref changes, and only if it still is what was compared.
+pub async fn fast_forward(cwd: &Path, branch: &str, target: &str) -> Result<Freshness, String> {
+    if !plain(branch) || !plain(target) {
+        return Err("not a branch name".into());
+    }
+    let local = format!("refs/heads/{branch}");
+    let old = quick(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{local}^{{commit}}"),
+        ],
+    )
+    .await?;
+    let new = quick(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{target}^{{commit}}"),
+        ],
+    )
+    .await?;
+    if old == new {
+        return Ok(Freshness::Same);
+    }
+    if quick(cwd, &["merge-base", "--is-ancestor", &old, &new])
+        .await
+        .is_err()
+    {
+        return Ok(Freshness::Differs);
+    }
+    quick(
+        cwd,
+        &[
+            "update-ref",
+            "-m",
+            "blongo: fast-forward",
+            &local,
+            &new,
+            &old,
+        ],
+    )
+    .await?;
+    Ok(Freshness::Forwarded)
+}
+
 /// The branches checked out in `cwd`'s repository (its main checkout
 /// and every worktree), with where.
 pub async fn checked_out(cwd: &Path) -> std::collections::HashMap<String, String> {

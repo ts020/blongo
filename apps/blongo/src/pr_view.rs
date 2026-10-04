@@ -490,7 +490,9 @@ impl PrView {
                         .child("Archive the thread when you are done:"),
                 );
                 // Only the thread that owns the branch may delete it.
-                if !detail.delete_branch_on_merge && detail.auto_fix.is_some() {
+                if !detail.delete_branch_on_merge
+                    && detail.auto_fix.as_ref().is_some_and(|f| !f.borrowed)
+                {
                     r = r.child(
                         div()
                             .id("pr-delete-remote")
@@ -922,6 +924,10 @@ impl Render for PrView {
         if let Some(fix) = &detail.auto_fix {
             let text = if fix.running {
                 "A fix by the agent is on its way.".to_owned()
+            } else if fix.borrowed {
+                "Failed checks are not fixed automatically on a branch opened from GitHub; ask \
+                 the agent to fix them."
+                    .to_owned()
             } else if !fix.enabled {
                 "Automatic fixes are off for this project (Settings › GitHub).".to_owned()
             } else if fix.stopped {

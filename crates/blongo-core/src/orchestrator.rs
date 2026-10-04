@@ -869,6 +869,16 @@ impl Orchestrator {
                     ),
                 });
             }
+            Reply::Internal if matches!(pending.command.command, Command::ThreadLinkPr { .. }) => {
+                if let Command::ThreadLinkPr { thread_id, .. } = pending.command.command {
+                    self.thread_notice(
+                        thread_id,
+                        &format!(
+                            "The pull request could not be linked: {reason}. Link it with Link PR."
+                        ),
+                    );
+                }
+            }
             Reply::Internal => {
                 eprintln!("blongo-core: scheduled command refused: {reason}");
                 self.emit(CoreEvent::Notice {

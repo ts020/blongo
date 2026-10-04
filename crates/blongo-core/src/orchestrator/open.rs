@@ -59,6 +59,8 @@ pub(super) struct Opening {
     /// Linked once the thread exists (`#n`).
     link: Option<String>,
     issue: Option<u64>,
+    /// On a branch someone else may own: never pushed to by itself.
+    borrowed: bool,
     draft: Option<String>,
     message: String,
 }
@@ -83,6 +85,8 @@ pub(super) struct Resolved {
     source: Source,
     link: Option<String>,
     issue: Option<u64>,
+    /// On a branch someone else may own: never pushed to by itself.
+    borrowed: bool,
     draft: Option<String>,
     message: String,
 }
@@ -110,6 +114,16 @@ impl Orchestrator {
             .ok()
             .flatten()?;
         text.parse().ok()
+    }
+
+    /// Whether `thread_id` was opened on a pull request's or an existing
+    /// branch: Blongo then never pushes to it by itself (no automatic CI
+    /// fixes), since the branch may be a teammate's.
+    pub(super) fn borrowed_branch(&self, thread_id: ThreadId) -> bool {
+        matches!(
+            self.store.forge_cache(&format!("borrowed:{thread_id}")),
+            Ok(Some(_))
+        )
     }
 
     /// `Query::ForgeCandidates`.
@@ -248,6 +262,7 @@ impl Orchestrator {
                         thread_id,
                         link: r.link,
                         issue: r.issue,
+                        borrowed: r.borrowed,
                         draft: r.draft,
                         message: r.message,
                     },
@@ -305,6 +320,13 @@ impl Orchestrator {
             && let Err(err) = self
                 .store
                 .set_forge_cache(&format!("issue:{}", o.thread_id), &n.to_string())
+        {
+            eprintln!("blongo-core: forge cache: {err:#}");
+        }
+        if o.borrowed
+            && let Err(err) = self
+                .store
+                .set_forge_cache(&format!("borrowed:{}", o.thread_id), "1")
         {
             eprintln!("blongo-core: forge cache: {err:#}");
         }
@@ -472,25 +494,40 @@ async fn resolve(
         ThreadSource::Branch { name } => {
             let name = name.trim().to_owned();
             taken(&name)?;
-            let start = if branch::has_local_branch(cwd, &name).await {
-                Start::Existing
-            } else {
-                let r = remote_name.ok_or_else(|| format!("there is no branch {name}"))?;
-                branch::fetch(cwd, &r, &name, branch::FETCH_TIMEOUT)
+            // What the remote has of it now (none: a local-only branch).
+            let fetched = match &remote_name {
+                Some(r) => branch::fetch(cwd, r, &name, branch::FETCH_TIMEOUT)
                     .await
-                    .map_err(|_| format!("there is no branch {name} here or on {r}"))?;
-                Start::At(format!("refs/remotes/{r}/{name}"))
+                    .ok()
+                    .map(|()| format!("refs/remotes/{r}/{name}")),
+                None => None,
+            };
+            let (start, note) = if branch::has_local_branch(cwd, &name).await {
+                match &fetched {
+                    Some(at) => (
+                        Start::Existing,
+                        freshen(cwd, &name, at, "the remote's").await?,
+                    ),
+                    None => (Start::Existing, String::new()),
+                }
+            } else {
+                let at = fetched.ok_or_else(|| match &remote_name {
+                    Some(r) => format!("there is no branch {name} here or on {r}"),
+                    None => format!("there is no branch {name}"),
+                })?;
+                (Start::At(at), String::new())
             };
             Ok(Resolved {
                 project_id: place.project_id,
                 title: name.clone(),
-                message: format!("Started a thread on {name}"),
+                message: format!("Started a thread on {name}{note}"),
                 source: Source {
                     branch: name,
                     start,
                 },
                 link: None,
                 issue: None,
+                borrowed: true,
                 draft: None,
             })
         }
@@ -515,18 +552,19 @@ async fn resolve(
                 .as_deref()
                 .is_some_and(|h| h.eq_ignore_ascii_case(&repo.full_name()))
                 && branch_name_ok(&pull.head_branch, false);
-            let (name, start) = if own {
+            let (name, start, note) = if own {
                 let name = pull.head_branch.clone();
                 taken(&name)?;
                 // Also brings the remote-tracking branch up to date, so
                 // the PR tab compares with GitHub's.
                 branch::fetch(cwd, &r, &name, branch::FETCH_TIMEOUT).await?;
-                let start = if branch::has_local_branch(cwd, &name).await {
-                    Start::Existing
+                let at = format!("refs/remotes/{r}/{name}");
+                if branch::has_local_branch(cwd, &name).await {
+                    let note = freshen(cwd, &name, &at, "the pull request's").await?;
+                    (name, Start::Existing, note)
                 } else {
-                    Start::At(format!("refs/remotes/{r}/{name}"))
-                };
-                (name, start)
+                    (name, Start::At(at), String::new())
+                }
             } else {
                 let name = format!("{}pr-{number}", place.prefix);
                 if !branch_name_ok(&name, false) {
@@ -534,19 +572,19 @@ async fn resolve(
                 }
                 taken(&name)?;
                 let at = branch::fetch_pull(cwd, &r, number).await?;
-                let start = if branch::has_local_branch(cwd, &name).await {
-                    Start::Existing
+                if branch::has_local_branch(cwd, &name).await {
+                    let note = freshen(cwd, &name, &at, "the pull request's").await?;
+                    (name, Start::Existing, note)
                 } else {
-                    Start::At(at)
-                };
-                (name, start)
+                    (name, Start::At(at), String::new())
+                }
             };
             let read_only = !own || !info.can_push;
             Ok(Resolved {
                 project_id: place.project_id,
                 title: short_title(&pull.title, &format!("#{number}")),
                 message: format!(
-                    "{}#{number} opened in a new worktree on {name}{}",
+                    "{}#{number} opened in a new worktree on {name}{}{note}",
                     repo.full_name(),
                     if read_only {
                         " (read-only: Blongo will not push to it)"
@@ -560,6 +598,7 @@ async fn resolve(
                 },
                 link: Some(format!("#{number}")),
                 issue: None,
+                borrowed: true,
                 draft: None,
             })
         }
@@ -625,6 +664,7 @@ async fn resolve(
                 },
                 link: None,
                 issue: Some(number),
+                borrowed: false,
                 draft: Some(draft),
             })
         }
@@ -642,6 +682,19 @@ fn github_parts(
 }
 
 /// One line of at most [`MAX_TITLE_CHARS`] (`fallback` when empty).
+/// Bring the local `branch` up to `at` (just fetched) when it is only
+/// behind; a branch with commits of its own is kept as it is. The note
+/// goes after the thread's opening message.
+async fn freshen(cwd: &Path, branch: &str, at: &str, whose: &str) -> Result<String, String> {
+    Ok(match branch::fast_forward(cwd, branch, at).await? {
+        branch::Freshness::Same => String::new(),
+        branch::Freshness::Forwarded => format!(" (fast-forwarded to {whose} latest commit)"),
+        branch::Freshness::Differs => {
+            format!(" (the local {branch} differs from {whose}; it was kept as it is)")
+        }
+    })
+}
+
 fn short_title(title: &str, fallback: &str) -> String {
     let line = title.replace(['\n', '\r'], " ");
     let line = line.trim();

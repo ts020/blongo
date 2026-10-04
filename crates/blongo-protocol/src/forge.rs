@@ -353,6 +353,10 @@ pub struct AutoFixInfo {
     pub stopped: bool,
     /// A fix turn is queued or running.
     pub running: bool,
+    /// The thread was opened on a pull request's or an existing branch:
+    /// failed checks are never fixed and pushed by themselves there.
+    #[serde(default)]
+    pub borrowed: bool,
 }
 
 impl PrDetail {

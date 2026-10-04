@@ -139,8 +139,10 @@ impl Orchestrator {
         }
         let project = self.projects.get(&thread.project_id)?;
         let state = self.fix_state(thread.id);
+        let borrowed = self.borrowed_branch(thread.id);
         Some(AutoFixInfo {
-            enabled: project.forge.auto_fix_ci,
+            enabled: project.forge.auto_fix_ci && !borrowed,
+            borrowed,
             attempts: state.attempts,
             max: project.forge.auto_fix_max,
             stopped: state.stopped,
@@ -181,6 +183,10 @@ impl Orchestrator {
         let Some(link) = thread.pr.clone().filter(|l| !l.read_only) else {
             return;
         };
+        // Someone else's branch: the user asks for a fix if they want one.
+        if self.borrowed_branch(thread_id) {
+            return;
+        }
         if !forge::owns_branch(thread) {
             return;
         }

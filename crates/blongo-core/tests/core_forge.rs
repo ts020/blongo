@@ -1486,6 +1486,7 @@ async fn failed_checks_are_fixed_and_pushed() {
             max: 3,
             stopped: false,
             running: false,
+            borrowed: false,
         })
     );
     // The third failure in a row: Blongo stops and says so, in the
@@ -2036,6 +2037,11 @@ async fn a_branch_with_new_commits_is_not_deleted() {
 // ------------------------------------------------- threads from PRs/issues
 
 impl TestCore {
+    async fn archive(&mut self, thread_id: ThreadId) {
+        let c = self.dispatch(Command::ThreadArchive { thread_id });
+        self.ok(&c).await;
+    }
+
     /// Start a thread from `source`: the reply and the thread created.
     async fn open_from(
         &mut self,
@@ -2279,6 +2285,132 @@ async fn a_fork_pull_request_opens_read_only_from_its_url() {
         .await
         .unwrap_err();
     assert!(err.contains("not this project's repository"), "{err}");
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_branch_opened_from_github_is_not_fixed_by_itself() {
+    let dir = temp_dir("forge-open-borrowed");
+    github_project(&dir);
+    let main = dir.join("project");
+    let sha = push_remote_branch(&main, "feature/a", None);
+    let bare = dir.join("remote.git");
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    gh.pull(json!({"number": 3, "title": "Feature A", "head": "feature/a", "head_sha": sha}))
+        .await;
+    let (_, thread) = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Pull {
+                reference: "#3".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let _ = core.refresh(thread.id).await;
+    // A teammate's branch: its failing checks are news, but nothing is
+    // sent to the agent and nothing is pushed.
+    gh.pull(json!({"number": 3, "head_sha": sha, "checks": [
+        {"name": "test", "workflow": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}
+    ]}))
+    .await;
+    let _ = core.refresh(thread.id).await;
+    let _ = core.refresh(thread.id).await;
+    let d = detail(&mut core, thread.id).await;
+    let fix = d.auto_fix.expect("the thread owns its worktree");
+    assert!(fix.borrowed && !fix.enabled, "{fix:?}");
+    let snapshot = core.snapshot(thread.id).await;
+    assert!(
+        !snapshot
+            .items
+            .iter()
+            .any(|i| i.kind == blongo_protocol::ItemKind::UserMessage),
+        "no fix turn"
+    );
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/feature/a"]), sha);
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_reopened_pull_request_catches_up_with_its_head() {
+    let dir = temp_dir("forge-open-reopen");
+    github_project(&dir);
+    let main = dir.join("project");
+    let first = push_remote_branch(&main, "tmp", Some("refs/pull/4/head"));
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    gh.pull(json!({"number": 4, "title": "Fix typo", "head": "patch-1",
+                   "head_repo": "someone/widgets", "head_sha": first}))
+        .await;
+    let source = || blongo_protocol::ThreadSource::Pull {
+        reference: "#4".into(),
+    };
+    let (_, thread) = core.open_from(Some(project), source()).await.unwrap();
+    core.archive(thread.id).await;
+    assert_eq!(git(&main, &["rev-parse", "blongo/pr-4"]), first);
+
+    // The author pushed more: the kept local branch moves up to it.
+    git(&main, &["checkout", "--quiet", "-b", "tmp", &first]);
+    commit_file(&main, "more.txt", "More");
+    let second = git(&main, &["rev-parse", "HEAD"]);
+    git(
+        &main,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "tmp:refs/pull/4/head",
+        ],
+    );
+    git(&main, &["checkout", "--quiet", "main"]);
+    git(&main, &["branch", "--quiet", "-D", "tmp"]);
+    gh.pull(json!({"number": 4, "head_sha": second})).await;
+    let (opened, thread) = core.open_from(Some(project), source()).await.unwrap();
+    assert!(
+        opened.message.contains("fast-forwarded"),
+        "{}",
+        opened.message
+    );
+    let wt = thread.worktree.clone().unwrap();
+    assert_eq!(git(Path::new(&wt.path), &["rev-parse", "HEAD"]), second);
+    core.archive(thread.id).await;
+    eventually("the worktree removed", || !Path::new(&wt.path).exists()).await;
+
+    // The local branch has work of its own: it is kept, and said so.
+    git(&main, &["checkout", "--quiet", "blongo/pr-4"]);
+    commit_file(&main, "mine.txt", "Mine");
+    let mine = git(&main, &["rev-parse", "HEAD"]);
+    git(&main, &["checkout", "--quiet", "main"]);
+    git(&main, &["checkout", "--quiet", "-b", "tmp", &second]);
+    commit_file(&main, "theirs.txt", "Theirs");
+    let third = git(&main, &["rev-parse", "HEAD"]);
+    git(
+        &main,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "tmp:refs/pull/4/head",
+        ],
+    );
+    git(&main, &["checkout", "--quiet", "main"]);
+    git(&main, &["branch", "--quiet", "-D", "tmp"]);
+    gh.pull(json!({"number": 4, "head_sha": third})).await;
+    let (opened, thread) = core.open_from(Some(project), source()).await.unwrap();
+    assert!(opened.message.contains("differs"), "{}", opened.message);
+    let wt = thread.worktree.clone().unwrap();
+    assert_eq!(git(Path::new(&wt.path), &["rev-parse", "HEAD"]), mine);
+    // A read-only link is never pushed to.
+    let err = core
+        .query(Query::PrPush {
+            thread_id: thread.id,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
     core.shutdown();
 }
 

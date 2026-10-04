@@ -714,6 +714,9 @@ impl Orchestrator {
                     }
                 }
                 Query::PrPush { .. } => {
+                    if let Some(p) = thread.pr.as_ref().filter(|p| p.read_only) {
+                        return Err(format!("{} is read-only here", p.label()));
+                    }
                     if thread.pr.as_ref().is_some_and(|p| p.head_branch != branch) {
                         return Err("the linked pull request is for another branch".into());
                     }
