@@ -253,10 +253,12 @@ commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCo
 checkSuite{workflowRun{workflow{name}}}} \
 ... on StatusContext{context state description targetUrl createdAt}}}}}}} \
 latestReviews(first:30){nodes{author{login} state}} \
-reviewThreads(first:50){totalCount nodes{id isResolved isOutdated path line \
+reviewThreads(first:100){totalCount nodes{id isResolved isOutdated path line \
 comments(first:20){totalCount nodes{author{login} body createdAt}}}}";
 
-const MAX_BODY: usize = 64 * 1024;
+/// GitHub allows 65,536 characters, up to four bytes each: a body it
+/// accepts is never cut.
+const MAX_BODY: usize = 4 * 65_536;
 const MAX_COMMENT: usize = 8 * 1024;
 
 fn detail_query(repo: &RepoRef, number: u64) -> String {
@@ -345,6 +347,7 @@ fn parse_detail(v: &Value) -> Result<PrDetail, GhError> {
         link: None,
         status: pr_status(p),
         body: text(&p["body"], MAX_BODY),
+        body_truncated: p["body"].as_str().is_some_and(|b| b.len() > MAX_BODY),
         author: login(&p["author"]),
         merge_state,
         additions: num("additions"),
@@ -801,6 +804,14 @@ mod tests {
         let t = &d.threads[0];
         assert_eq!((t.path.as_str(), t.line, t.more), ("src/a.rs", Some(4), 1));
         assert_eq!(t.comments[0].author, "ghost");
+        let mut long = v.clone();
+        long["data"]["repository"]["pullRequest"]["body"] = json!("界".repeat(65_536));
+        let d = parse_detail(&long).unwrap();
+        assert!(!d.body_truncated, "a body GitHub accepts is kept whole");
+        assert_eq!(d.body.chars().count(), 65_536);
+        long["data"]["repository"]["pullRequest"]["body"] = json!("x".repeat(MAX_BODY + 1));
+        let d = parse_detail(&long).unwrap();
+        assert!(d.body_truncated);
         let missing = json!({"data": {"repository": {"pullRequest": null}},
             "errors": [{"type": "NOT_FOUND", "message": "x"}]});
         assert_eq!(parse_detail(&missing).unwrap_err(), GhError::NotFound);

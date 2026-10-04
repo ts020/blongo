@@ -187,14 +187,23 @@ pub async fn ahead_behind(cwd: &Path, branch: &str) -> Option<(u32, u32)> {
     if branch.starts_with('-') || current_branch(cwd).await.as_deref() != Some(branch) {
         return None;
     }
-    let remote = remote_name(cwd).await?;
+    // The branch's upstream (a fork remote too), else origin's branch.
+    let upstream = format!("{branch}@{{upstream}}");
+    let target = if git(cwd, &["rev-parse", "--verify", "--quiet", &upstream])
+        .await
+        .is_some()
+    {
+        upstream
+    } else {
+        format!("refs/remotes/{}/{branch}", remote_name(cwd).await?)
+    };
     let counts = git(
         cwd,
         &[
             "rev-list",
             "--left-right",
             "--count",
-            &format!("HEAD...refs/remotes/{remote}/{branch}"),
+            &format!("HEAD...{target}"),
         ],
     )
     .await?;

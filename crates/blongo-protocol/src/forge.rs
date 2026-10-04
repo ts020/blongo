@@ -266,6 +266,10 @@ pub struct PrDetail {
     pub link: Option<PrLink>,
     pub status: PrStatus,
     pub body: String,
+    /// `body` was cut (longer than Blongo fetches): it is shown but never
+    /// edited, so the rest is not lost on GitHub.
+    #[serde(default)]
+    pub body_truncated: bool,
     pub author: String,
     pub merge_state: MergeState,
     pub additions: u32,

@@ -3096,6 +3096,12 @@ impl Render for Shell {
         if let Some(handle) = self.pending_focus.take() {
             window.focus(&handle, cx);
         }
+        // However the PR tab was left (a link, a vanished thread), its
+        // detail goes with it.
+        if self.pr_view.is_some() && (self.view != View::Pr || self.selected(cx).is_none()) {
+            self.pr_view = None;
+            self.pr_view_for = None;
+        }
         let mut sidebar_style = StyleRefinement::default();
         sidebar_style.size.width = Some(px(SIDEBAR_WIDTH).into());
         sidebar_style.size.height = Some(gpui::relative(1.).into());

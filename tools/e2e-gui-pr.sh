@@ -102,6 +102,7 @@ cleanup() {
   [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
   kill "$GH_PID" 2>/dev/null || true
   kill "$XVFB_PID" 2>/dev/null || true
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 

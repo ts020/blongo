@@ -29,6 +29,10 @@ pub struct PrView {
     pub thread_id: ThreadId,
     detail: Option<PrDetail>,
     loading: bool,
+    /// Something changed while a fetch was out: fetch once more after it.
+    reload_again: bool,
+    /// An edit is on its way to GitHub.
+    saving: bool,
     error: Option<SharedString>,
     editing: bool,
     title_input: Entity<TextInput>,
@@ -39,23 +43,32 @@ pub struct PrView {
     /// Focus the view at the next render (the form just closed).
     refocus: bool,
     focus: FocusHandle,
-    _subscription: gpui::Subscription,
+    _subscriptions: [gpui::Subscription; 2],
 }
 
 impl PrView {
     pub fn new(backend: Arc<dyn Backend>, thread_id: ThreadId, cx: &mut Context<Self>) -> Self {
         let title_input = cx.new(|cx| TextInput::new("Title", false, cx));
         let body_input = cx.new(|cx| TextInput::new("Description", true, cx));
-        let subscription = cx.subscribe(&title_input, |this, _, event, cx| match event {
-            InputEvent::Submit => this.save(cx),
-            InputEvent::Cancel => this.stop_edit(cx),
-            _ => {}
-        });
+        let subscriptions = [
+            cx.subscribe(&title_input, |this, _, event, cx| match event {
+                InputEvent::Submit => this.save(cx),
+                InputEvent::Cancel => this.stop_edit(cx),
+                _ => {}
+            }),
+            cx.subscribe(&body_input, |this, _, event, cx| {
+                if let InputEvent::Cancel = event {
+                    this.stop_edit(cx);
+                }
+            }),
+        ];
         let mut this = Self {
             backend,
             thread_id,
             detail: None,
             loading: false,
+            reload_again: false,
+            saving: false,
             error: None,
             editing: false,
             title_input,
@@ -64,7 +77,7 @@ impl PrView {
             show_resolved: false,
             refocus: false,
             focus: cx.focus_handle(),
-            _subscription: subscription,
+            _subscriptions: subscriptions,
         };
         this.reload(cx);
         this
@@ -73,6 +86,7 @@ impl PrView {
     /// Fetch the detail again.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.loading {
+            self.reload_again = true;
             return;
         }
         self.loading = true;
@@ -95,6 +109,9 @@ impl PrView {
                     Ok(_) => {}
                     Err(err) => this.error = Some(err.into()),
                 }
+                if std::mem::take(&mut this.reload_again) {
+                    this.reload(cx);
+                }
                 cx.notify();
             },
         );
@@ -116,8 +133,11 @@ impl PrView {
             return;
         };
         let (title, body) = (detail.status.title.clone(), detail.body.clone());
+        let body_editable = !detail.body_truncated;
         self.title_input.update(cx, |i, cx| i.set_text(&title, cx));
-        self.body_input.update(cx, |i, cx| i.set_text(&body, cx));
+        self.body_input.update(cx, |i, cx| {
+            i.set_text(if body_editable { &body } else { "" }, cx)
+        });
         self.editing = true;
         self.message = None;
         window.focus(&self.title_input.focus_handle(cx), cx);
@@ -135,10 +155,14 @@ impl PrView {
         let Some(detail) = &self.detail else {
             return;
         };
+        if self.saving {
+            return;
+        }
         let title = self.title_input.read(cx).text().trim().to_owned();
         let body = self.body_input.read(cx).text().to_owned();
         let title = (title != detail.status.title).then_some(title);
-        let body = (body != detail.body).then_some(body);
+        // A description too long to show whole is never sent back cut.
+        let body = (!detail.body_truncated && body != detail.body).then_some(body);
         if title.is_none() && body.is_none() {
             return self.stop_edit(cx);
         }
@@ -147,12 +171,15 @@ impl PrView {
             title,
             body,
         };
+        self.saving = true;
+        cx.notify();
         crate::query::ask(
             &self.backend,
             query,
             cx.weak_entity(),
             cx,
             |this, result, cx| {
+                this.saving = false;
                 match result {
                     Ok(QueryReply::Done(text)) => {
                         this.stop_edit(cx);
@@ -365,22 +392,31 @@ impl Render for PrView {
                             .border_color(theme::border())
                             .child(self.title_input.clone()),
                     )
-                    .child(
+                    .child(if detail.body_truncated {
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_muted())
+                            .child("The description is too long to edit here; edit it on GitHub.")
+                    } else {
                         div()
                             .min_h(px(160.))
                             .p_1()
                             .rounded_md()
                             .border_1()
                             .border_color(theme::border())
-                            .child(self.body_input.clone()),
-                    )
+                            .child(self.body_input.clone())
+                    })
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .child(button(
                                 "pr-save".into(),
-                                "Save to GitHub",
+                                if self.saving {
+                                    "Saving…"
+                                } else {
+                                    "Save to GitHub"
+                                },
                                 theme::accent_bg(),
                                 theme::text(),
                                 cx.listener(|this, _, _, cx| this.save(cx)),
@@ -502,23 +538,18 @@ impl Render for PrView {
                             .text_color(theme::text_muted())
                             .child(SharedString::from(check.detail.clone())),
                     )
-                    .when_some(check.duration_secs, |d, secs| {
-                        d.child(
-                            div()
-                                .w(px(64.))
-                                .text_color(theme::text_faint())
-                                .child(SharedString::from(duration(secs))),
-                        )
-                    })
-                    .when_some(url, |d, url| {
-                        d.child(
-                            div()
-                                .id(("pr-check-log", ix))
-                                .text_color(theme::accent())
-                                .cursor_pointer()
-                                .child("Logs")
-                                .on_click(move |_, _, cx| open_https(&url, cx)),
-                        )
+                    .child(div().w(px(64.)).text_color(theme::text_faint()).child(
+                        SharedString::from(check.duration_secs.map(duration).unwrap_or_default()),
+                    ))
+                    .child(match url {
+                        Some(url) => div()
+                            .id(("pr-check-log", ix))
+                            .w(px(32.))
+                            .text_color(theme::accent())
+                            .cursor_pointer()
+                            .child("Logs")
+                            .on_click(move |_, _, cx| open_https(&url, cx)),
+                        None => div().id(("pr-check-log", ix)).w(px(32.)),
                     }),
             );
         }
