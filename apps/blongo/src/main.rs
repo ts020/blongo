@@ -50,6 +50,7 @@ mod markdown;
 mod notify;
 mod palette;
 mod pr;
+mod pr_view;
 mod query;
 mod settings;
 mod settings_view;
@@ -169,6 +170,7 @@ fn main() {
     let profile_view = match std::env::var("BLONGO_PROFILE_VIEW").as_deref() {
         Ok("diff") => Some(shell::View::Diff),
         Ok("files") => Some(shell::View::Files),
+        Ok("pr") => Some(shell::View::Pr),
         _ => None,
     };
     let auto_prompt = std::env::var("BLONGO_PROFILE_PROMPT")

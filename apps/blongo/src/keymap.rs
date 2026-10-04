@@ -23,7 +23,7 @@
 //! When-clauses: context names joined with `!`, `&&`, `||` and parentheses;
 //! an unknown name is false. Names: `threadOpen`, `busy`, `remote`,
 //! `terminalOpen`, `paletteOpen`, `view.chat`, `view.diff`, `view.files`,
-//! `view.inbox`, `view.settings`.
+//! `view.pr`, `view.inbox`, `view.settings`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -111,6 +111,12 @@ pub const COMMANDS: &[CommandDef] = &[
         "view.files",
         "Browse files",
         Some("alt-e"),
+        Some("threadOpen"),
+    ),
+    c(
+        "view.pr",
+        "Show the pull request",
+        Some("alt-r"),
         Some("threadOpen"),
     ),
     c("view.inbox", "Open the review inbox", Some("alt-i"), None),

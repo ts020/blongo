@@ -9,6 +9,9 @@
 //!   API calls themselves.
 //! - [`fs`]: owner-only files and folders.
 
+// The PR detail test builds a deeply nested JSON literal.
+#![cfg_attr(test, recursion_limit = "256")]
+
 use std::path::PathBuf;
 
 pub mod auth;

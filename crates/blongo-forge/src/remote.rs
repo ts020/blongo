@@ -180,6 +180,47 @@ pub async fn branch_pushed(cwd: &Path, branch: &str) -> bool {
     .is_some()
 }
 
+/// Commits on the checked-out `branch` that its remote-tracking branch
+/// lacks, and the other way round, as of the last fetch (no network).
+/// `None`: `branch` is not checked out in `cwd` or has no remote branch.
+pub async fn ahead_behind(cwd: &Path, branch: &str) -> Option<(u32, u32)> {
+    if branch.starts_with('-') || current_branch(cwd).await.as_deref() != Some(branch) {
+        return None;
+    }
+    let remote = remote_name(cwd).await?;
+    let counts = git(
+        cwd,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...refs/remotes/{remote}/{branch}"),
+        ],
+    )
+    .await?;
+    let (ahead, behind) = counts.split_once(char::is_whitespace)?;
+    Some((ahead.trim().parse().ok()?, behind.trim().parse().ok()?))
+}
+
+/// Files changed in `cwd` and not committed (untracked ones included,
+/// ignored ones not).
+pub async fn uncommitted(cwd: &Path) -> u32 {
+    git(cwd, &["status", "--porcelain", "-z"])
+        .await
+        .map_or(0, |out| {
+            // Renames carry their old path as an extra field.
+            let mut n = 0;
+            let mut fields = out.split('\0').filter(|f| !f.is_empty());
+            while let Some(f) = fields.next() {
+                n += 1;
+                if f.starts_with('R') || f.starts_with('C') {
+                    fields.next();
+                }
+            }
+            n
+        })
+}
+
 async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = tokio::process::Command::new("git")
         .args(args)

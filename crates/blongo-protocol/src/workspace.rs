@@ -81,6 +81,18 @@ pub enum Query {
     PrRefresh {
         thread_id: ThreadId,
     },
+    /// Everything the PR tab shows (fetched now, not stored). Also
+    /// refreshes the thread's status.
+    PrDetail {
+        thread_id: ThreadId,
+    },
+    /// Change the linked pull request's title and/or body on GitHub.
+    /// Refused for read-only links.
+    PrEdit {
+        thread_id: ThreadId,
+        title: Option<String>,
+        body: Option<String>,
+    },
 }
 
 impl Query {
@@ -95,7 +107,9 @@ impl Query {
             | Self::GitBranches { thread_id }
             | Self::GitSwitch { thread_id, .. }
             | Self::GitCommit { thread_id, .. }
-            | Self::PrRefresh { thread_id } => *thread_id,
+            | Self::PrRefresh { thread_id }
+            | Self::PrDetail { thread_id }
+            | Self::PrEdit { thread_id, .. } => *thread_id,
         }
     }
 
@@ -126,6 +140,7 @@ pub enum QueryReply {
     Branches(Vec<BranchInfo>),
     /// A mutation finished; a human-readable summary.
     Done(String),
+    PrDetail(Box<crate::forge::PrDetail>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

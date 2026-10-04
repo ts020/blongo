@@ -34,6 +34,7 @@ use crate::inbox::InboxView;
 use crate::input::{InputEvent, TextInput};
 use crate::keymap::{Binding, Cmd};
 use crate::palette::{Palette, PaletteEvent};
+use crate::pr_view::PrView;
 use crate::settings::{NotifyMode, Settings, ThemeMode};
 use crate::settings_view::{SettingsEvent, SettingsView, ShellInfo};
 use crate::sidebar::{EnvId, EnvView, LOCAL, Sidebar, SidebarEvent};
@@ -64,6 +65,8 @@ pub enum View {
     Chat,
     Diff,
     Files,
+    /// The thread's pull request.
+    Pr,
     Inbox,
     Settings,
 }
@@ -124,6 +127,9 @@ pub struct Shell {
     confirm_link_project: Option<String>,
     /// Last rejected command's reason.
     notice: Option<SharedString>,
+    /// The answer to the last thing the user asked for that went well
+    /// (a pull request check), shown muted.
+    info: Option<SharedString>,
     /// Sign-in / install progress.
     provider_notice: Option<SharedString>,
     /// The local core stopped; shown instead of the main area.
@@ -142,6 +148,11 @@ pub struct Shell {
     diff_scope: DiffScope,
     files: Option<Entity<FilesView>>,
     files_for: Option<(EnvId, ThreadId)>,
+    /// The PR tab (dropped, with its detail, when the tab closes).
+    pr_view: Option<Entity<PrView>>,
+    pr_view_for: Option<(EnvId, ThreadId)>,
+    /// When a thread's branch was last looked up on GitHub on opening it.
+    pr_lookups: HashMap<(EnvId, ThreadId), std::time::Instant>,
     /// A file to open once the files view exists.
     open_file: Option<String>,
     inbox: Option<Entity<InboxView>>,
@@ -246,6 +257,10 @@ impl Shell {
             diff_scope: DiffScope::Thread,
             files: None,
             files_for: None,
+            pr_view: None,
+            pr_view_for: None,
+            pr_lookups: HashMap::new(),
+            info: None,
             open_file: None,
             inbox: None,
             settings_view: None,
@@ -878,6 +893,14 @@ impl Shell {
                     })
                 });
                 if changed && self.is_selected(env, *thread_id, cx) {
+                    if self.view == View::Pr {
+                        // Unlinked, or another pull request: start over.
+                        self.pr_view = None;
+                        self.pr_view_for = None;
+                        if pr.is_none() {
+                            self.view = View::Chat;
+                        }
+                    }
                     cx.notify();
                 }
             }
@@ -895,6 +918,11 @@ impl Shell {
                 });
                 if let Some((body, title)) = note {
                     self.notify(&body, &title, cx);
+                }
+                if let (Some(pr), Some(status)) = (&self.pr_view, status)
+                    && self.pr_view_for == Some((env, *thread_id))
+                {
+                    pr.update(cx, |p, cx| p.on_status(status, cx));
                 }
                 if changed && self.is_selected(env, *thread_id, cx) {
                     cx.notify();
@@ -1107,7 +1135,16 @@ impl Shell {
         if matches!(self.view, View::Inbox | View::Settings) {
             self.view = View::Chat;
         }
+        if self.view == View::Pr {
+            self.pr_view = None;
+            self.pr_view_for = None;
+            if self.selected_thread(cx).is_none_or(|t| t.pr.is_none()) {
+                self.view = View::Chat;
+            }
+        }
+        self.info = None;
         self.backend(env).open_thread(thread_id);
+        self.look_up_pr(env, cx);
         cx.notify();
     }
 
@@ -1548,8 +1585,27 @@ impl Shell {
     // ------------------------------------------------------ views, commands
 
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
-        if matches!(view, View::Chat | View::Diff | View::Files) && self.selected(cx).is_none() {
+        if matches!(view, View::Chat | View::Diff | View::Files | View::Pr)
+            && self.selected(cx).is_none()
+        {
             return;
+        }
+        if view == View::Pr {
+            if self.selected_thread(cx).is_none_or(|t| t.pr.is_none()) {
+                self.notice = Some("No pull request is linked to this thread".into());
+                cx.notify();
+                return;
+            }
+            if self.view == View::Pr
+                && let Some(pr) = &self.pr_view
+            {
+                // Same tab again: fetch again.
+                pr.update(cx, |p, cx| p.reload(cx));
+            }
+        }
+        if self.view == View::Pr && view != View::Pr {
+            self.pr_view = None;
+            self.pr_view_for = None;
         }
         if view == View::Diff && self.view == View::Diff {
             // Same tab again: show the latest state.
@@ -1650,6 +1706,55 @@ impl Shell {
             files.update(cx, |f, cx| f.open_file(path, cx));
         }
         files
+    }
+
+    fn ensure_pr(&mut self, cx: &mut Context<Self>) -> Entity<PrView> {
+        let (env, thread_id) = self.selected(cx).expect("PR view without a thread");
+        match (&self.pr_view, self.pr_view_for == Some((env, thread_id))) {
+            (Some(pr), true) => pr.clone(),
+            _ => {
+                let backend = self.backend(env).clone();
+                let pr = cx.new(|cx| PrView::new(backend, thread_id, cx));
+                self.pr_view = Some(pr.clone());
+                self.pr_view_for = Some((env, thread_id));
+                pr
+            }
+        }
+    }
+
+    /// Opening a thread whose branch may have a pull request nobody linked
+    /// yet (pushed by the agent, made on GitHub): look once a minute at
+    /// most. The core asks GitHub only if the branch was pushed.
+    fn look_up_pr(&mut self, env: EnvId, cx: &mut Context<Self>) {
+        let Some(thread) = self.selected_thread(cx) else {
+            return;
+        };
+        let own_branch = thread.worktree.is_some()
+            && thread.parent_thread_id.is_none()
+            && thread.forked_from.is_none();
+        if thread.pr.is_some() || thread.pr_dismissed || thread.archived || !own_branch {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let key = (env, thread.id);
+        if self
+            .pr_lookups
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.pr_lookups.insert(key, now);
+        let backend = self.backend(env).clone();
+        crate::query::ask(
+            &backend,
+            Query::PrRefresh {
+                thread_id: thread.id,
+            },
+            cx.weak_entity(),
+            cx,
+            |_, _, _| {},
+        );
     }
 
     fn ensure_inbox(&mut self, cx: &mut Context<Self>) -> Entity<InboxView> {
@@ -1857,6 +1962,7 @@ impl Shell {
             View::Chat => "view.chat",
             View::Diff => "view.diff",
             View::Files => "view.files",
+            View::Pr => "view.pr",
             View::Inbox => "view.inbox",
             View::Settings => "view.settings",
         });
@@ -1926,6 +2032,7 @@ impl Shell {
             "view.chat" => self.set_view(View::Chat, cx),
             "view.diff" => self.set_view(View::Diff, cx),
             "view.files" => self.set_view(View::Files, cx),
+            "view.pr" => self.set_view(View::Pr, cx),
             "view.inbox" => self.set_view(View::Inbox, cx),
             "view.settings" => self.set_view(View::Settings, cx),
             "model.next" => self.next_model(cx),
@@ -2017,14 +2124,17 @@ impl Shell {
             cx.weak_entity(),
             cx,
             |this, result, cx| {
-                this.notice = Some(
-                    match result {
-                        Ok(QueryReply::Done(text)) => text,
-                        Ok(_) => return,
-                        Err(err) => err,
+                match result {
+                    Ok(QueryReply::Done(text)) => {
+                        this.notice = None;
+                        this.info = Some(text.into());
                     }
-                    .into(),
-                );
+                    Ok(_) => return,
+                    Err(err) => {
+                        this.info = None;
+                        this.notice = Some(err.into());
+                    }
+                }
                 cx.notify();
             },
         );
@@ -2647,7 +2757,10 @@ impl Shell {
                     .gap_1()
                     .child(tab("tab-chat", "Chat", View::Chat, self.view))
                     .child(tab("tab-diff", "Changes", View::Diff, self.view))
-                    .child(tab("tab-files", "Files", View::Files, self.view)),
+                    .child(tab("tab-files", "Files", View::Files, self.view))
+                    .when(thread.pr.is_some(), |d| {
+                        d.child(tab("tab-pr", "PR", View::Pr, self.view))
+                    }),
             )
             .child(
                 div()
@@ -2704,6 +2817,10 @@ impl Shell {
             View::Files => {
                 let files = self.ensure_files(window, cx);
                 div().flex_1().min_h_0().child(files)
+            }
+            View::Pr => {
+                let pr = self.ensure_pr(cx);
+                div().flex_1().min_h_0().child(pr)
             }
             _ => match &self.timeline {
                 Some(t) => div().flex_1().min_h_0().child(t.clone()),
@@ -2814,6 +2931,9 @@ impl Shell {
                 .children(rollback_confirm)
                 .when_some(self.notice.clone(), |d, notice| {
                     d.child(div().text_xs().text_color(theme::danger()).child(notice))
+                })
+                .when_some(self.info.clone(), |d, info| {
+                    d.child(div().text_xs().text_color(theme::text_muted()).child(info))
                 })
                 .when_some(self.provider_notice.clone(), |d, notice| {
                     d.child(

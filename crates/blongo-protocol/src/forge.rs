@@ -169,6 +169,188 @@ impl PrStatus {
     }
 }
 
+/// GitHub's view of whether the pull request can merge now
+/// (`mergeStateStatus`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeState {
+    #[default]
+    Unknown,
+    /// Mergeable, checks passing.
+    Clean,
+    /// Mergeable, but some checks failing or pending (not required).
+    Unstable,
+    /// Mergeable once pre-receive hooks pass.
+    HasHooks,
+    /// Branch protection blocks it (reviews, required checks).
+    Blocked,
+    /// The head is behind the base and the base requires it up to date.
+    Behind,
+    /// Merge conflicts.
+    Dirty,
+    Draft,
+}
+
+/// One check of the head commit, as the PR tab lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDetail {
+    pub name: String,
+    /// The workflow it belongs to (GitHub Actions), if any.
+    #[serde(default)]
+    pub workflow: Option<String>,
+    pub state: CheckState,
+    /// GitHub's conclusion or status, lowercase (`failure`, `in_progress`,
+    /// a commit status' description).
+    pub detail: String,
+    /// The check's page (logs), an `https` URL or `None`.
+    pub url: Option<String>,
+    /// Seconds it ran (finished checks) or has been running.
+    pub duration_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Pending,
+    Success,
+    Failure,
+    /// Neutral, skipped, stale: counts as neither.
+    Neutral,
+}
+
+/// A reviewer's latest review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDetail {
+    pub author: String,
+    pub state: ReviewState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Pending,
+}
+
+/// A review thread (comments on a line of the diff).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewThread {
+    /// GitHub's node id (to resolve it later).
+    pub id: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub resolved: bool,
+    /// The code it was written on has changed since.
+    pub outdated: bool,
+    pub comments: Vec<ReviewComment>,
+    /// More comments than were fetched.
+    #[serde(default)]
+    pub more: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub author: String,
+    pub body: String,
+    /// `2026-10-04T12:00:00Z`.
+    pub created_at: String,
+}
+
+/// Everything the PR tab shows, fetched when it opens or is refreshed and
+/// dropped when it closes (never stored).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDetail {
+    pub link: Option<PrLink>,
+    pub status: PrStatus,
+    pub body: String,
+    pub author: String,
+    pub merge_state: MergeState,
+    pub additions: u32,
+    pub deletions: u32,
+    pub changed_files: u32,
+    pub checks: Vec<CheckDetail>,
+    /// More checks than were fetched.
+    pub more_checks: u32,
+    pub reviews: Vec<ReviewDetail>,
+    pub threads: Vec<ReviewThread>,
+    /// More review threads than were fetched.
+    pub more_threads: u32,
+    /// Title and body can be edited (GitHub's `viewerCanUpdate`, and the
+    /// link is not read-only).
+    pub can_edit: bool,
+    /// Local commits not on the remote branch / remote commits not here
+    /// (`None`: the branch is not checked out here or has no remote
+    /// branch). From the last fetch; no network.
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    /// Files changed in the thread's folder and not committed.
+    pub uncommitted: u32,
+}
+
+impl PrDetail {
+    /// Why the pull request cannot be merged now, most important first
+    /// (empty: nothing Blongo knows of stands in the way).
+    pub fn blockers(&self) -> Vec<String> {
+        let s = &self.status;
+        let mut out = Vec::new();
+        match s.state {
+            PrState::Merged => return vec!["already merged".into()],
+            PrState::Closed => return vec!["closed".into()],
+            PrState::Draft => out.push("it is a draft".into()),
+            PrState::Open => {}
+        }
+        if s.mergeable == Mergeable::Conflicting || self.merge_state == MergeState::Dirty {
+            out.push(format!(
+                "conflicts with {}",
+                self.link
+                    .as_ref()
+                    .map_or("the base", |l| l.base_branch.as_str())
+            ));
+        }
+        if s.checks.failed > 0 {
+            out.push(match s.checks.failed {
+                1 => "1 check failing".into(),
+                n => format!("{n} checks failing"),
+            });
+        } else if s.checks.state == ChecksState::Failure {
+            out.push("checks failing".into());
+        }
+        if s.checks.pending > 0 {
+            out.push(match s.checks.pending {
+                1 => "1 check running".into(),
+                n => format!("{n} checks running"),
+            });
+        }
+        match s.review {
+            ReviewDecision::ChangesRequested => out.push("changes requested".into()),
+            ReviewDecision::ReviewRequired => out.push("review required".into()),
+            _ => {}
+        }
+        if s.unresolved_threads > 0 {
+            out.push(match s.unresolved_threads {
+                1 => "1 unresolved conversation".into(),
+                n => format!("{n} unresolved conversations"),
+            });
+        }
+        if self.merge_state == MergeState::Behind {
+            out.push("behind the base branch".into());
+        }
+        if self.merge_state == MergeState::Blocked && out.is_empty() {
+            out.push("blocked by branch protection".into());
+        }
+        if self.ahead.is_some_and(|n| n > 0) {
+            out.push("local commits not pushed".into());
+        }
+        if self.uncommitted > 0 {
+            out.push("uncommitted changes".into());
+        }
+        out
+    }
+}
+
 /// Which branch new worktrees start from and pull requests target.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -323,6 +505,35 @@ mod tests {
         ] {
             assert_eq!(parse_pr_ref(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn merge_blockers() {
+        let mut d = PrDetail::default();
+        assert!(d.blockers().is_empty());
+        d.status.checks.failed = 2;
+        d.status.checks.state = ChecksState::Failure;
+        d.status.review = ReviewDecision::ReviewRequired;
+        d.status.unresolved_threads = 1;
+        d.uncommitted = 3;
+        d.ahead = Some(1);
+        assert_eq!(
+            d.blockers(),
+            [
+                "2 checks failing",
+                "review required",
+                "1 unresolved conversation",
+                "local commits not pushed",
+                "uncommitted changes"
+            ]
+        );
+        d.status.state = PrState::Merged;
+        assert_eq!(d.blockers(), ["already merged"]);
+        let blocked = PrDetail {
+            merge_state: MergeState::Blocked,
+            ..PrDetail::default()
+        };
+        assert_eq!(blocked.blockers(), ["blocked by branch protection"]);
     }
 
     #[test]

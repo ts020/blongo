@@ -9,7 +9,10 @@
 
 use std::collections::HashMap;
 
-use blongo_protocol::{ChecksState, ChecksSummary, Mergeable, PrState, PrStatus, ReviewDecision};
+use blongo_protocol::{
+    CheckDetail, CheckState, ChecksState, ChecksSummary, MergeState, Mergeable, PrDetail, PrState,
+    PrStatus, ReviewComment, ReviewDecision, ReviewDetail, ReviewState, ReviewThread,
+};
 use serde_json::{Value, json};
 
 use crate::http::{self, Request};
@@ -187,7 +190,46 @@ impl GitHub {
         repo: &RepoRef,
         numbers: &[u64],
     ) -> Result<(HashMap<u64, PrStatus>, Option<RateLimit>), GhError> {
-        let query = status_query(repo, numbers);
+        let v = self.graphql(&status_query(repo, numbers)).await?;
+        parse_statuses(&v, numbers)
+    }
+}
+
+impl GitHub {
+    /// Everything the PR tab shows of pull request `number` (the link
+    /// and the local fields are left for the caller).
+    pub async fn detail(&self, repo: &RepoRef, number: u64) -> Result<PrDetail, GhError> {
+        let v = self.graphql(&detail_query(repo, number)).await?;
+        parse_detail(&v)
+    }
+
+    /// `PATCH /repos/{owner}/{name}/pulls/{number}` with a new title and/or
+    /// body.
+    pub async fn edit_pull(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), GhError> {
+        let mut patch = serde_json::Map::new();
+        if let Some(t) = title {
+            patch.insert("title".into(), t.into());
+        }
+        if let Some(b) = body {
+            patch.insert("body".into(), b.into());
+        }
+        let url = format!("{}/repos/{}/pulls/{number}", self.api, repo.full_name());
+        let resp = http::send(self.request(Request::json("PATCH", url, &Value::Object(patch))))
+            .await
+            .map_err(GhError::Other)?;
+        if !resp.ok() {
+            return Err(classify(resp.status, &resp.text()));
+        }
+        Ok(())
+    }
+
+    async fn graphql(&self, query: &str) -> Result<Value, GhError> {
         let resp = http::send(self.request(Request::post_json(
             self.graphql.clone(),
             &json!({ "query": query }),
@@ -197,9 +239,242 @@ impl GitHub {
         if !resp.ok() {
             return Err(classify(resp.status, &resp.text()));
         }
-        let v: Value = serde_json::from_slice(&resp.body)
-            .map_err(|e| GhError::Other(format!("GitHub: bad JSON: {e}")))?;
-        parse_statuses(&v, numbers)
+        serde_json::from_slice(&resp.body)
+            .map_err(|e| GhError::Other(format!("GitHub: bad JSON: {e}")))
+    }
+}
+
+/// Fetched for the PR tab: the status fields plus names, links and times
+/// of checks, latest reviews and review threads with their comments.
+const DETAIL_FIELDS: &str = "number title body url state isDraft author{login} headRefOid \
+mergeable mergeStateStatus reviewDecision additions deletions changedFiles viewerCanUpdate \
+commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount nodes{__typename \
+... on CheckRun{name status conclusion detailsUrl startedAt completedAt \
+checkSuite{workflowRun{workflow{name}}}} \
+... on StatusContext{context state description targetUrl createdAt}}}}}}} \
+latestReviews(first:30){nodes{author{login} state}} \
+reviewThreads(first:50){totalCount nodes{id isResolved isOutdated path line \
+comments(first:20){totalCount nodes{author{login} body createdAt}}}}";
+
+const MAX_BODY: usize = 64 * 1024;
+const MAX_COMMENT: usize = 8 * 1024;
+
+fn detail_query(repo: &RepoRef, number: u64) -> String {
+    format!(
+        "query{{repository(owner:\"{}\",name:\"{}\"){{pullRequest(number:{number}){{{DETAIL_FIELDS}}}}}}}",
+        repo.owner, repo.name
+    )
+}
+
+fn parse_detail(v: &Value) -> Result<PrDetail, GhError> {
+    let p = &v["data"]["repository"]["pullRequest"];
+    if !p.is_object() {
+        return Err(graphql_error(v));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let text = |v: &Value, max: usize| clip(v.as_str().unwrap_or(""), max);
+    let login = |v: &Value| clip(v["login"].as_str().unwrap_or("ghost"), 100);
+    let rollup = &p["commits"]["nodes"][0]["commit"]["statusCheckRollup"];
+    let contexts = rollup["contexts"]["nodes"].as_array();
+    let checks: Vec<CheckDetail> = contexts
+        .into_iter()
+        .flatten()
+        .map(|c| check_detail(c, now))
+        .collect();
+    let total_checks = rollup["contexts"]["totalCount"].as_u64().unwrap_or(0) as usize;
+    let reviews = p["latestReviews"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let state = match r["state"].as_str()? {
+                "APPROVED" => ReviewState::Approved,
+                "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                "COMMENTED" => ReviewState::Commented,
+                "DISMISSED" => ReviewState::Dismissed,
+                _ => ReviewState::Pending,
+            };
+            Some(ReviewDetail {
+                author: login(&r["author"]),
+                state,
+            })
+        })
+        .collect();
+    let thread_nodes = p["reviewThreads"]["nodes"].as_array();
+    let threads: Vec<ReviewThread> = thread_nodes
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let comments: Vec<ReviewComment> = t["comments"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| ReviewComment {
+                    author: login(&c["author"]),
+                    body: text(&c["body"], MAX_COMMENT),
+                    created_at: text(&c["createdAt"], 40),
+                })
+                .collect();
+            let total = t["comments"]["totalCount"].as_u64().unwrap_or(0) as usize;
+            ReviewThread {
+                id: text(&t["id"], 200),
+                path: text(&t["path"], 1024),
+                line: t["line"].as_u64().map(|l| l as u32),
+                resolved: t["isResolved"].as_bool().unwrap_or(false),
+                outdated: t["isOutdated"].as_bool().unwrap_or(false),
+                more: total.saturating_sub(comments.len()) as u32,
+                comments,
+            }
+        })
+        .collect();
+    let total_threads = p["reviewThreads"]["totalCount"].as_u64().unwrap_or(0) as usize;
+    let merge_state = match p["mergeStateStatus"].as_str() {
+        Some("CLEAN") => MergeState::Clean,
+        Some("UNSTABLE") => MergeState::Unstable,
+        Some("HAS_HOOKS") => MergeState::HasHooks,
+        Some("BLOCKED") => MergeState::Blocked,
+        Some("BEHIND") => MergeState::Behind,
+        Some("DIRTY") => MergeState::Dirty,
+        Some("DRAFT") => MergeState::Draft,
+        _ => MergeState::Unknown,
+    };
+    let num = |k: &str| p[k].as_u64().unwrap_or(0) as u32;
+    Ok(PrDetail {
+        link: None,
+        status: pr_status(p),
+        body: text(&p["body"], MAX_BODY),
+        author: login(&p["author"]),
+        merge_state,
+        additions: num("additions"),
+        deletions: num("deletions"),
+        changed_files: num("changedFiles"),
+        more_checks: total_checks.saturating_sub(checks.len()) as u32,
+        checks,
+        reviews,
+        more_threads: total_threads.saturating_sub(threads.len()) as u32,
+        threads,
+        can_edit: p["viewerCanUpdate"].as_bool().unwrap_or(false),
+        ahead: None,
+        behind: None,
+        uncommitted: 0,
+    })
+}
+
+fn check_detail(c: &Value, now: i64) -> CheckDetail {
+    let text = |k: &str| c[k].as_str().unwrap_or("");
+    let state = match check_outcome(c) {
+        Outcome::Pending => CheckState::Pending,
+        Outcome::Failed => CheckState::Failure,
+        Outcome::Passed => match (text("conclusion"), text("state")) {
+            ("SUCCESS", _) | (_, "SUCCESS") => CheckState::Success,
+            _ => CheckState::Neutral,
+        },
+    };
+    let is_run = c["__typename"].as_str() == Some("CheckRun");
+    let (name, detail, url) = if is_run {
+        let detail = match c["conclusion"].as_str() {
+            Some(conclusion) => conclusion,
+            None => text("status"),
+        };
+        (text("name"), detail, text("detailsUrl"))
+    } else {
+        let detail = match text("description") {
+            "" => text("state"),
+            d => d,
+        };
+        (text("context"), detail, text("targetUrl"))
+    };
+    let started = parse_time(if is_run {
+        text("startedAt")
+    } else {
+        text("createdAt")
+    });
+    let ended = parse_time(text("completedAt"));
+    let duration_secs = match (started, ended) {
+        (Some(s), Some(e)) if e >= s => Some((e - s) as u64),
+        (Some(s), None) if state == CheckState::Pending && now >= s => Some((now - s) as u64),
+        _ => None,
+    };
+    CheckDetail {
+        name: clip(name, 200),
+        workflow: c["checkSuite"]["workflowRun"]["workflow"]["name"]
+            .as_str()
+            .map(|w| clip(w, 200)),
+        state,
+        detail: clip(&detail.to_ascii_lowercase(), 200),
+        url: Some(url)
+            .filter(|u| u.starts_with("https://") && u.len() < 2048)
+            .map(str::to_owned),
+        duration_secs,
+    }
+}
+
+/// `2026-10-04T12:34:56Z` (or with a fraction / offset `+00:00`) as Unix
+/// seconds. Only UTC offsets of whole minutes are understood.
+pub fn parse_time(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (h, mi, se) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut rest = &s[19..];
+    if let Some(r) = rest.strip_prefix('.') {
+        rest = r.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "Z" => 0,
+        r if r.len() == 6 && (r.starts_with('+') || r.starts_with('-')) => {
+            let sign = if r.starts_with('-') { -1 } else { 1 };
+            sign * (r.get(1..3)?.parse::<i64>().ok()? * 3600
+                + r.get(4..6)?.parse::<i64>().ok()? * 60)
+        }
+        _ => return None,
+    };
+    Some(days * 86_400 + h * 3600 + mi * 60 + se - offset)
+}
+
+/// At most `max` bytes of `s` (cut at a character boundary).
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+fn graphql_error(v: &Value) -> GhError {
+    let errors = v["errors"].as_array();
+    let msg = errors
+        .and_then(|e| e.first())
+        .and_then(|e| e["message"].as_str())
+        .unwrap_or("no data");
+    let kind = errors
+        .and_then(|e| e.first())
+        .and_then(|e| e["type"].as_str())
+        .unwrap_or("");
+    match kind {
+        "NOT_FOUND" => GhError::NotFound,
+        "RATE_LIMITED" => GhError::RateLimited { reset_at: None },
+        "FORBIDDEN" => GhError::Auth(short(msg)),
+        _ => GhError::Other(format!("GitHub: {}", short(msg))),
     }
 }
 
@@ -254,21 +529,7 @@ fn parse_statuses(
     });
     let repo = &v["data"]["repository"];
     if repo.is_null() {
-        let errors = v["errors"].as_array();
-        let msg = errors
-            .and_then(|e| e.first())
-            .and_then(|e| e["message"].as_str())
-            .unwrap_or("no data");
-        let kind = errors
-            .and_then(|e| e.first())
-            .and_then(|e| e["type"].as_str())
-            .unwrap_or("");
-        return Err(match kind {
-            "NOT_FOUND" => GhError::NotFound,
-            "RATE_LIMITED" => GhError::RateLimited { reset_at: None },
-            "FORBIDDEN" => GhError::Auth(short(msg)),
-            _ => GhError::Other(format!("GitHub: {}", short(msg))),
-        });
+        return Err(graphql_error(v));
     }
     let mut out = HashMap::new();
     for n in numbers.iter().take(MAX_BATCH) {
@@ -483,6 +744,66 @@ mod tests {
         assert_eq!(s2.state, PrState::Draft);
         assert_eq!(s2.checks.state, ChecksState::None);
         assert!(!map.contains_key(&3));
+    }
+
+    #[test]
+    fn parses_times() {
+        assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_time("2026-10-04T12:00:00Z"), Some(1_791_115_200));
+        assert_eq!(parse_time("2026-10-04T12:00:00.123Z"), Some(1_791_115_200));
+        assert_eq!(parse_time("2026-10-04T21:00:00+09:00"), Some(1_791_115_200));
+        assert_eq!(parse_time("2026-13-04T12:00:00Z"), None);
+        assert_eq!(parse_time("yesterday"), None);
+        assert_eq!(clip("héllo", 2), "h…");
+    }
+
+    #[test]
+    fn parses_details() {
+        let v = json!({"data": {"repository": {"pullRequest": {
+            "number": 5, "title": "T", "body": "Body", "state": "OPEN", "isDraft": false,
+            "author": {"login": "octo"}, "headRefOid": "abc", "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED", "reviewDecision": "CHANGES_REQUESTED",
+            "additions": 10, "deletions": 2, "changedFiles": 3, "viewerCanUpdate": true,
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE",
+                "contexts": {"totalCount": 3, "nodes": [
+                    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "detailsUrl": "https://github.com/x/y/actions/runs/1",
+                     "startedAt": "2026-10-04T12:00:00Z", "completedAt": "2026-10-04T12:01:30Z",
+                     "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}},
+                    {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS",
+                     "description": "Deployed", "targetUrl": "javascript:alert(1)",
+                     "createdAt": "2026-10-04T12:00:00Z"}
+                ]}}}}]},
+            "latestReviews": {"nodes": [{"author": {"login": "rev"}, "state": "CHANGES_REQUESTED"}]},
+            "reviewThreads": {"totalCount": 1, "nodes": [{"id": "T1", "isResolved": false,
+                "isOutdated": false, "path": "src/a.rs", "line": 4,
+                "comments": {"totalCount": 2, "nodes": [{"author": null, "body": "Why?",
+                    "createdAt": "2026-10-04T12:05:00Z"}]}}]}
+        }}}});
+        let d = parse_detail(&v).unwrap();
+        assert_eq!(d.status.title, "T");
+        assert_eq!(d.status.unresolved_threads, 1);
+        assert_eq!(d.status.checks.failed, 1);
+        assert_eq!(d.merge_state, MergeState::Blocked);
+        assert_eq!((d.additions, d.deletions, d.changed_files), (10, 2, 3));
+        assert!(d.can_edit);
+        assert_eq!(d.more_checks, 1);
+        let test = &d.checks[0];
+        assert_eq!(test.state, CheckState::Failure);
+        assert_eq!(test.workflow.as_deref(), Some("CI"));
+        assert_eq!(test.duration_secs, Some(90));
+        assert_eq!(test.detail, "failure");
+        let deploy = &d.checks[1];
+        assert_eq!(deploy.state, CheckState::Success);
+        assert_eq!(deploy.detail, "deployed");
+        assert_eq!(deploy.url, None, "only https links");
+        assert_eq!(d.reviews[0].state, ReviewState::ChangesRequested);
+        let t = &d.threads[0];
+        assert_eq!((t.path.as_str(), t.line, t.more), ("src/a.rs", Some(4), 1));
+        assert_eq!(t.comments[0].author, "ghost");
+        let missing = json!({"data": {"repository": {"pullRequest": null}},
+            "errors": [{"type": "NOT_FOUND", "message": "x"}]});
+        assert_eq!(parse_detail(&missing).unwrap_err(), GhError::NotFound);
     }
 
     #[test]

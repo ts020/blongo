@@ -68,6 +68,9 @@ impl Orchestrator {
         if let Query::PrRefresh { thread_id } = query {
             return self.pr_refresh(id, thread_id);
         }
+        if matches!(query, Query::PrDetail { .. } | Query::PrEdit { .. }) {
+            return self.pr_query(id, query);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -156,7 +159,9 @@ impl Orchestrator {
                     message: message.clone(),
                 }
             }
-            Query::PrRefresh { .. } => return Err("not a workspace query".into()),
+            Query::PrRefresh { .. } | Query::PrDetail { .. } | Query::PrEdit { .. } => {
+                return Err("not a workspace query".into());
+            }
         };
         Ok((cwd, plan))
     }

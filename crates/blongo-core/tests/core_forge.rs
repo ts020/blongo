@@ -529,6 +529,159 @@ async fn threads_sharing_a_pull_request_and_unlinked_refreshes() {
     core.shutdown();
 }
 
+async fn detail(core: &mut TestCore, thread_id: ThreadId) -> blongo_protocol::PrDetail {
+    match core.query(Query::PrDetail { thread_id }).await {
+        Ok(QueryReply::PrDetail(d)) => *d,
+        other => panic!("detail: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pr_tab_detail_and_edit() {
+    let dir = temp_dir("forge-detail");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, true).await;
+    let branch = thread.worktree.as_ref().unwrap().branch.clone();
+    let worktree = PathBuf::from(&thread.worktree.as_ref().unwrap().path);
+    git(&worktree, &["push", "--quiet", "-u", "origin", &branch]);
+    gh.pull(json!({
+        "number": 9, "title": "Tab", "head": branch, "body": "Original body",
+        "merge_state": "BLOCKED", "review": "CHANGES_REQUESTED",
+        "reviews": [{"author": "alice", "state": "CHANGES_REQUESTED"}],
+        "checks": [
+            {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "workflow": "CI",
+             "url": "https://github.com/acme/widgets/actions/runs/1/job/2",
+             "started_at": "2026-10-04T00:00:00Z", "completed_at": "2026-10-04T00:02:00Z"},
+            {"name": "lint", "status": "IN_PROGRESS", "conclusion": null}
+        ],
+        "threads": [
+            {"path": "src/lib.rs", "line": 3, "comments": [{"author": "alice", "body": "Rename this"}]},
+            true
+        ],
+    }))
+    .await;
+    core.dispatch(Command::ThreadLinkPr {
+        thread_id: thread.id,
+        pr: "#9".into(),
+    });
+    core.linked(thread.id).await.unwrap();
+
+    let d = detail(&mut core, thread.id).await;
+    assert_eq!(d.link.as_ref().map(|l| l.number), Some(9));
+    assert_eq!(d.body, "Original body");
+    assert_eq!(d.author, "octocat");
+    assert_eq!(d.merge_state, blongo_protocol::MergeState::Blocked);
+    assert!(d.can_edit);
+    assert_eq!(d.checks.len(), 2);
+    assert_eq!(d.checks[0].state, blongo_protocol::CheckState::Failure);
+    assert_eq!(d.checks[0].workflow.as_deref(), Some("CI"));
+    assert_eq!(d.checks[0].duration_secs, Some(120));
+    assert_eq!(d.checks[1].state, blongo_protocol::CheckState::Pending);
+    assert_eq!(d.reviews[0].author, "alice");
+    assert_eq!(d.threads.len(), 2);
+    assert_eq!(d.threads[0].comments[0].body, "Rename this");
+    assert!(d.threads[1].resolved);
+    assert_eq!((d.ahead, d.behind, d.uncommitted), (Some(0), Some(0), 0));
+    assert_eq!(
+        d.blockers(),
+        [
+            "1 check failing",
+            "1 check running",
+            "changes requested",
+            "1 unresolved conversation"
+        ]
+    );
+
+    // A local commit and an uncommitted file show up.
+    std::fs::write(worktree.join("a.txt"), "a\n").unwrap();
+    git(&worktree, &["add", "a.txt"]);
+    git(
+        &worktree,
+        &["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "a"],
+    );
+    std::fs::write(worktree.join("b.txt"), "b\n").unwrap();
+    let d = detail(&mut core, thread.id).await;
+    assert_eq!((d.ahead, d.uncommitted), (Some(1), 1));
+    assert!(
+        d.blockers()
+            .contains(&"local commits not pushed".to_owned())
+    );
+
+    // Edits go to GitHub; bad ones are refused before.
+    let bad = core
+        .query(Query::PrEdit {
+            thread_id: thread.id,
+            title: Some("  ".into()),
+            body: None,
+        })
+        .await;
+    assert!(bad.unwrap_err().contains("title"));
+    let reply = core
+        .query(Query::PrEdit {
+            thread_id: thread.id,
+            title: Some("Better title\n".into()),
+            body: Some("New body".into()),
+        })
+        .await;
+    assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#9 updated".into())));
+    let patch = gh
+        .log()
+        .await
+        .into_iter()
+        .find(|r| r["method"] == "PATCH")
+        .unwrap();
+    assert_eq!(
+        patch["body"],
+        json!({"title": "Better title", "body": "New body"})
+    );
+    let d = detail(&mut core, thread.id).await;
+    assert_eq!(
+        (d.status.title.as_str(), d.body.as_str()),
+        ("Better title", "New body")
+    );
+
+    // Nothing linked: refused.
+    let other = core.thread(project, false).await;
+    let none = core
+        .query(Query::PrDetail {
+            thread_id: other.id,
+        })
+        .await;
+    assert!(none.unwrap_err().contains("no pull request"));
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn read_only_links_cannot_edit() {
+    let dir = temp_dir("forge-ro-edit");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    gh.control(json!({"op": "repo", "repo": "acme/widgets", "push": false}))
+        .await;
+    gh.pull(json!({"number": 4})).await;
+    let project = core.project(&dir).await;
+    let thread = core.thread(project, false).await;
+    core.dispatch(Command::ThreadLinkPr {
+        thread_id: thread.id,
+        pr: "#4".into(),
+    });
+    assert!(core.linked(thread.id).await.unwrap().read_only);
+    let d = detail(&mut core, thread.id).await;
+    assert!(!d.can_edit);
+    let reply = core
+        .query(Query::PrEdit {
+            thread_id: thread.id,
+            title: Some("x".into()),
+            body: None,
+        })
+        .await;
+    assert!(reply.unwrap_err().contains("read-only"));
+    assert!(gh.log().await.iter().all(|r| r["method"] != "PATCH"));
+    core.shutdown();
+}
+
 #[tokio::test]
 async fn forge_settings_are_validated_and_kept() {
     let dir = temp_dir("forge-settings");

@@ -13,7 +13,9 @@ Supported API (only what Blongo asks):
   GET  /repos/O/N
   GET  /repos/O/N/pulls/NUM
   GET  /repos/O/N/pulls?state=all&per_page=5&head=O%3ABRANCH
+  PATCH /repos/O/N/pulls/NUM   {title, body}
   POST /graphql   rateLimit + repository(owner,name){ pNUM: pullRequest(number:NUM){...} }
+                  repository(owner,name){ pullRequest(number:NUM){...detail...} }
 
 Control ops:
   {"op": "repo", "repo": "o/n", "default_branch": "main", "push": true}
@@ -23,7 +25,11 @@ Control ops:
       head_repo ("o/n"), head_sha, base, mergeable ("MERGEABLE"/
       "CONFLICTING"/"UNKNOWN"), review (null/"APPROVED"/...),
       checks: [{"name", "status", "conclusion"} | {"name", "state"}],
-      threads: [true/false resolved flags]
+      threads: [true/false resolved flags | {"resolved", "path", "line",
+               "outdated", "comments": [{"author", "body"}]}],
+      body, author, merge_state ("CLEAN"/"BLOCKED"/...), reviews:
+      [{"author", "state"}], can_update, checks may also carry "url",
+      "workflow", "started_at", "completed_at"
   {"op": "rate", "limit": 5000, "remaining": 4000}
   {"op": "fail", "path_prefix": "/graphql", "status": 502, "count": 1}
   {"op": "clear_log"}
@@ -66,7 +72,21 @@ def pull_defaults(full, number):
         "review": None,
         "checks": [],
         "threads": [],
+        "body": "",
+        "author": "octocat",
+        "merge_state": "CLEAN",
+        "reviews": [],
+        "can_update": True,
+        "additions": 1,
+        "deletions": 0,
+        "changed_files": 1,
     }
+
+
+def thread(t):
+    if isinstance(t, dict):
+        return {"resolved": False, "path": "README.md", "line": 1, "outdated": False, "comments": [], **t}
+    return {"resolved": t, "path": "README.md", "line": 1, "outdated": False, "comments": []}
 
 
 def rest_pull(full, p):
@@ -129,8 +149,49 @@ def graphql_pull(p):
         "mergeable": p["mergeable"],
         "reviewDecision": p["review"],
         "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]},
-        "reviewThreads": {"nodes": [{"isResolved": r} for r in p["threads"]]},
+        "reviewThreads": {"nodes": [{"isResolved": thread(t)["resolved"]} for t in p["threads"]]},
     }
+
+
+def graphql_detail(full, p):
+    out = graphql_pull(p)
+    rollup = out["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+    if rollup:
+        for node, c in zip(rollup["contexts"]["nodes"], p["checks"]):
+            if node["__typename"] == "CheckRun":
+                node["detailsUrl"] = c.get("url", "")
+                node["startedAt"] = c.get("started_at")
+                node["completedAt"] = c.get("completed_at")
+                node["checkSuite"] = {"workflowRun": {"workflow": {"name": c["workflow"]}}} if c.get("workflow") else None
+            else:
+                node["targetUrl"] = c.get("url", "")
+                node["description"] = c.get("description")
+                node["createdAt"] = c.get("started_at")
+        rollup["contexts"]["totalCount"] = len(p["checks"])
+    threads = [thread(t) for t in p["threads"]]
+    out.update({
+        "body": p["body"],
+        "url": f"https://github.com/{full}/pull/{p['number']}",
+        "author": {"login": p["author"]},
+        "mergeStateStatus": p["merge_state"],
+        "additions": p["additions"],
+        "deletions": p["deletions"],
+        "changedFiles": p["changed_files"],
+        "viewerCanUpdate": p["can_update"],
+        "latestReviews": {"nodes": [{"author": {"login": r["author"]}, "state": r["state"]} for r in p["reviews"]]},
+        "reviewThreads": {"totalCount": len(threads), "nodes": [{
+            "id": f"T{i}",
+            "isResolved": t["resolved"],
+            "isOutdated": t["outdated"],
+            "path": t["path"],
+            "line": t["line"],
+            "comments": {"totalCount": len(t["comments"]), "nodes": [
+                {"author": {"login": c.get("author", "rev")}, "body": c.get("body", ""), "createdAt": "2026-10-04T00:00:00Z"}
+                for c in t["comments"]
+            ]},
+        } for i, t in enumerate(threads)]},
+    })
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -225,6 +286,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.graphql(body.get("query", ""))
             self.reply(404, {"message": "Not Found"})
 
+    def do_PATCH(self):
+        body = self.body()
+        with LOCK:
+            if self.gate(body):
+                return
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls/(\d+)", urlsplit(self.path).path)
+            full = f"{m[1]}/{m[2]}" if m else ""
+            p = REPOS.get(full, {}).get("pulls", {}).get(int(m[3])) if m else None
+            if not p:
+                return self.reply(404, {"message": "Not Found"})
+            if not REPOS[full]["push"]:
+                return self.reply(403, {"message": "Resource not accessible by integration"})
+            for k in ("title", "body"):
+                if k in body:
+                    p[k] = body[k]
+            self.reply(200, rest_pull(full, p))
+
     def graphql(self, query):
         RATE["remaining"] = max(0, RATE["remaining"] - 1)
         m = re.search(r'repository\(owner:"([^"]+)",name:"([^"]+)"\)', query)
@@ -237,6 +315,14 @@ class Handler(BaseHTTPRequestHandler):
             })
         full = f"{m[1]}/{m[2]}"
         pulls = REPOS[full]["pulls"]
+        single = re.search(r"\{pullRequest\(number:(\d+)\)", query)
+        if single:
+            p = pulls.get(int(single[1]))
+            data["repository"] = {"pullRequest": graphql_detail(full, p) if p else None}
+            resp = {"data": data}
+            if not p:
+                resp["errors"] = [{"type": "NOT_FOUND", "message": "Could not resolve to a PullRequest"}]
+            return self.reply(200, resp)
         out = {}
         errors = []
         for alias, number in re.findall(r"(p\d+):pullRequest\(number:(\d+)\)", query):

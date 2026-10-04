@@ -63,6 +63,14 @@ impl Request {
         }
     }
 
+    /// A request with a JSON body and any method (`PATCH`, `PUT`).
+    pub fn json(method: &'static str, url: impl Into<String>, body: &serde_json::Value) -> Self {
+        Self {
+            method,
+            ..Self::post_json(url, body)
+        }
+    }
+
     pub fn header(mut self, name: &str, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self

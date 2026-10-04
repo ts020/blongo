@@ -230,6 +230,8 @@ enum JobDone {
     Released(Key),
     /// A pull request poll ended.
     Forge(Box<forge::ForgeDone>),
+    /// A PR tab query ended.
+    ForgeQuery(Box<forge::QueryDone>),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -811,6 +813,7 @@ impl Orchestrator {
             }
             JobDone::Released(key) => self.release_key(key),
             JobDone::Forge(done) => self.forge_done(*done),
+            JobDone::ForgeQuery(done) => self.forge_query_done(*done),
         }
     }
 

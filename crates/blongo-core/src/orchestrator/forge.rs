@@ -120,6 +120,18 @@ struct LookupTarget {
     cached_info: Option<RepoInfo>,
 }
 
+/// A PR tab query (detail or edit) ended.
+pub(super) struct QueryDone {
+    id: QueryId,
+    thread_id: ThreadId,
+    link: PrLink,
+    /// What GitHub said of the pull request (detail).
+    status: Option<PrStatus>,
+    /// The pull request changed (edit): poll it now.
+    changed: bool,
+    result: Result<QueryReply, String>,
+}
+
 pub(super) struct ForgeDone {
     polled: Vec<(ThreadId, PrLink, Result<PrStatus, String>)>,
     found: Vec<(ThreadId, Result<Option<Found>, String>)>,
@@ -448,7 +460,12 @@ impl Orchestrator {
                     });
                     answers.push((thread_id, Ok(format!("linked {label}"))));
                 }
-                Ok(_) => answers.push((thread_id, Ok("no pull request for this branch".into()))),
+                Ok(Some(_)) if thread.pr.is_some() => {
+                    // Linked by hand meanwhile: its poll answers.
+                    self.forge.hurry(thread_id, Duration::ZERO);
+                }
+                Ok(Some(_)) => answers.push((thread_id, Ok("automatic linking is off".into()))),
+                Ok(None) => answers.push((thread_id, Ok("no pull request for this branch".into()))),
                 Err(err) => answers.push((thread_id, Err(err))),
             }
         }
@@ -456,6 +473,92 @@ impl Orchestrator {
         for (thread_id, result) in answers {
             self.answer_pr_waiters(thread_id, result);
         }
+    }
+
+    /// `Query::PrDetail` / `Query::PrEdit`: ask GitHub in a job, answer
+    /// from there.
+    pub(super) fn pr_query(&mut self, id: QueryId, query: Query) {
+        let job = (|| {
+            if !self.config.forge {
+                return Err("GitHub integration is turned off".to_owned());
+            }
+            let thread = self.live_thread(query.thread_id())?;
+            let link = thread.pr.clone().ok_or("no pull request is linked")?;
+            let project = self
+                .projects
+                .get(&thread.project_id)
+                .ok_or("unknown project")?;
+            let cwd = PathBuf::from(thread.cwd(project));
+            let op = match query {
+                Query::PrDetail { .. } => PrOp::Detail { cwd },
+                Query::PrEdit { title, body, .. } => {
+                    if link.read_only {
+                        return Err(format!("{} is read-only here", link.label()));
+                    }
+                    let title = title.map(|t| t.trim().replace(['\n', '\r'], " "));
+                    if title
+                        .as_deref()
+                        .is_some_and(|t| t.is_empty() || t.chars().count() > 256)
+                    {
+                        return Err("a title has 1 to 256 characters".into());
+                    }
+                    if body.as_deref().is_some_and(|b| b.chars().count() > 65_536) {
+                        return Err("the description is longer than GitHub allows".into());
+                    }
+                    if title.is_none() && body.is_none() {
+                        return Err("nothing to change".into());
+                    }
+                    PrOp::Edit { title, body }
+                }
+                _ => return Err("not a pull request query".into()),
+            };
+            Ok((thread.id, link, op))
+        })();
+        let (thread_id, link, op) = match job {
+            Ok(job) => job,
+            Err(err) => {
+                return self.emit(CoreEvent::Reply {
+                    id,
+                    result: Err(err),
+                });
+            }
+        };
+        let ctx = self.forge_ctx();
+        self.spawn_job(Key::None, async move {
+            let (status, changed, result) = run_pr_op(&ctx, &link, op).await;
+            JobDone::ForgeQuery(Box::new(QueryDone {
+                id,
+                thread_id,
+                link,
+                status,
+                changed,
+                result,
+            }))
+        });
+    }
+
+    pub(super) fn forge_query_done(&mut self, done: QueryDone) {
+        let current = self
+            .threads
+            .get(&done.thread_id)
+            .filter(|t| !t.archived && t.pr.as_ref() == Some(&done.link));
+        if let Some(thread) = current {
+            if let Some(status) = done.status
+                && thread.pr_status.as_ref() != Some(&status)
+            {
+                self.commit_events(vec![EventKind::ThreadPrStatus {
+                    thread_id: done.thread_id,
+                    status: Some(status),
+                }]);
+            }
+            if done.changed {
+                self.forge.hurry(done.thread_id, Duration::ZERO);
+            }
+        }
+        self.emit(CoreEvent::Reply {
+            id: done.id,
+            result: done.result,
+        });
     }
 
     // ------------------------------------------------------------- commands
@@ -495,7 +598,7 @@ impl Orchestrator {
         batch.events.push(EventKind::ThreadPrLinked {
             thread_id,
             pr: Some(found.link),
-            manual: false,
+            manual: true,
         });
         batch.events.push(EventKind::ThreadPrStatus {
             thread_id,
@@ -748,6 +851,65 @@ async fn run_poll(ctx: ForgeCtx, polls: Vec<PollTarget>, lookups: Vec<LookupTarg
         done.found.push((target.thread_id, result));
     }
     done
+}
+
+enum PrOp {
+    Detail {
+        cwd: PathBuf,
+    },
+    Edit {
+        title: Option<String>,
+        body: Option<String>,
+    },
+}
+
+async fn run_pr_op(
+    ctx: &ForgeCtx,
+    link: &PrLink,
+    op: PrOp,
+) -> (Option<PrStatus>, bool, Result<QueryReply, String>) {
+    let Some(repo) = RepoRef::parse(&format!("https://{}/{}", link.host, link.repo)) else {
+        return (None, false, Err("not a GitHub repository".into()));
+    };
+    let token = match ctx.token(&repo.host).await {
+        Ok(t) => t,
+        Err(err) => return (None, false, Err(err)),
+    };
+    let gh = ctx.client(&repo, token);
+    match op {
+        PrOp::Detail { cwd } => match gh.detail(&repo, link.number).await {
+            Ok(mut detail) => {
+                detail.can_edit &= !link.read_only;
+                if let Some((ahead, behind)) = remote::ahead_behind(&cwd, &link.head_branch).await {
+                    detail.ahead = Some(ahead);
+                    detail.behind = Some(behind);
+                }
+                detail.uncommitted = remote::uncommitted(&cwd).await;
+                detail.link = Some(link.clone());
+                let status = detail.status.clone();
+                (
+                    Some(status),
+                    false,
+                    Ok(QueryReply::PrDetail(Box::new(detail))),
+                )
+            }
+            Err(GhError::NotFound) => (None, false, Err(format!("{} was not found", link.label()))),
+            Err(err) => (None, false, Err(ctx.fail(&repo.host, err))),
+        },
+        PrOp::Edit { title, body } => {
+            match gh
+                .edit_pull(&repo, link.number, title.as_deref(), body.as_deref())
+                .await
+            {
+                Ok(()) => (
+                    None,
+                    true,
+                    Ok(QueryReply::Done(format!("{} updated", link.label()))),
+                ),
+                Err(err) => (None, false, Err(ctx.fail(&repo.host, err))),
+            }
+        }
+    }
 }
 
 fn fail_all(done: &mut ForgeDone, targets: Vec<PollTarget>, err: &str) {
