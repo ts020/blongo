@@ -55,9 +55,23 @@ impl FixState {
 /// A fix turn on its way or running.
 pub(super) struct Fix {
     thread_id: ThreadId,
+    /// Blongo commits and pushes when the turn ends.
     automatic: bool,
     /// The failed checks' names, for the commit message.
     names: Vec<String>,
+    /// The query that asked (a fix asked for by hand), answered once the
+    /// message is in.
+    query: Option<QueryId>,
+    /// Another turn ran in the folder before this one ended: its work
+    /// is not the fix's to push.
+    tainted: bool,
+}
+
+/// What CI said, and why the fix must not be pushed for the user when it
+/// was meant to be (the folder holds other work).
+pub(super) struct Report {
+    checks: Vec<FailedCheck>,
+    hold: Option<String>,
 }
 
 /// A fix job ended.
@@ -68,7 +82,7 @@ pub(super) enum FixDone {
         sha: String,
         /// `None`: automatic; else the query that asked.
         query: Option<QueryId>,
-        result: Result<(String, Vec<String>), String>,
+        result: Result<Report, String>,
     },
     /// The fix turn's changes were committed and pushed (or not).
     Pushed {
@@ -182,16 +196,19 @@ impl Orchestrator {
         if state.sha == status.head_sha {
             return;
         }
-        if state.attempts >= max {
+        // This is failing run `attempts + 1` in a row: the limit counts
+        // runs, so the last one stops instead of sending another fix.
+        if state.attempts + 1 >= max {
             if !state.stopped {
                 state.stopped = true;
                 self.set_fix_state(thread_id, &state);
                 let message = format!(
-                    "Automatic CI fixes stopped: the checks of {} still fail after {} \
-                     attempt{}. Fix it by hand or ask the agent from the PR tab.",
+                    "Automatic CI fixes stopped: the checks of {} failed {} times in a row \
+                     ({} fix{} sent). Fix it by hand or ask the agent from the PR tab.",
                     link.label(),
+                    state.attempts + 1,
                     state.attempts,
-                    if state.attempts == 1 { "" } else { "s" }
+                    if state.attempts == 1 { "" } else { "es" }
                 );
                 self.thread_notice(thread_id, &message);
                 self.emit(CoreEvent::Notice { message });
@@ -200,6 +217,8 @@ impl Orchestrator {
         }
         state.sha = status.head_sha.clone();
         state.attempts += 1;
+        // The limit was raised since it stopped.
+        state.stopped = false;
         self.set_fix_state(thread_id, &state);
         self.spawn_fix_report(thread_id, link, cwd, status.head_sha.clone(), None);
     }
@@ -280,16 +299,17 @@ impl Orchestrator {
                     .filter(|t| !t.archived)
                     .and_then(|t| t.pr_status.as_ref())
                     .is_some_and(|s| s.head_sha == sha);
-                let (prompt, names) = match result {
+                let report = match result {
                     Ok(report) if current => report,
                     Ok(_) => {
                         // Pushed meanwhile: its own checks decide.
                         self.forge.fixing.remove(&thread_id);
-                        if let Some(id) = query {
-                            self.emit(CoreEvent::Reply {
+                        match query {
+                            Some(id) => self.emit(CoreEvent::Reply {
                                 id,
                                 result: Err("the branch moved on; check again".into()),
-                            });
+                            }),
+                            None => self.undo_attempt(thread_id),
                         }
                         return;
                     }
@@ -300,23 +320,63 @@ impl Orchestrator {
                                 id,
                                 result: Err(err),
                             }),
-                            None => self.thread_notice(
-                                thread_id,
-                                &format!(
-                                    "The failed checks could not be read, so no fix was sent: {err}"
-                                ),
-                            ),
+                            None => {
+                                self.undo_attempt(thread_id);
+                                self.thread_notice(
+                                    thread_id,
+                                    &format!(
+                                        "The failed checks could not be read, so no fix was \
+                                         sent: {err}"
+                                    ),
+                                );
+                            }
                         }
                         return;
                     }
                 };
+                // Only the fix turn's own work may be pushed for the user:
+                // not while the thread or a folder sharer has a turn of its
+                // own, nor when the folder held other work (found by the job).
+                let hold = report.hold.or_else(|| {
+                    let thread = self.threads.get(&thread_id)?;
+                    let project = self.projects.get(&thread.project_id)?;
+                    let cwd = thread.cwd(project);
+                    let busy = self.is_busy(thread_id)
+                        || self
+                            .folder_sharers(thread_id, cwd)
+                            .iter()
+                            .any(|t| self.is_busy(t.id));
+                    busy.then(|| "a turn is running in the thread's folder".to_owned())
+                });
+                let automatic = query.is_none() && hold.is_none();
+                if query.is_none()
+                    && let Some(why) = &hold
+                {
+                    self.thread_notice(
+                        thread_id,
+                        &format!(
+                            "The failed checks went to the agent, but its fix will not be pushed \
+                             for you: {why}. Push it from the PR tab once you have looked."
+                        ),
+                    );
+                }
+                let branch_name = self
+                    .threads
+                    .get(&thread_id)
+                    .and_then(|t| t.pr.as_ref())
+                    .map(|l| l.head_branch.clone())
+                    .unwrap_or_default();
+                let prompt =
+                    blongo_forge::pr::fix_prompt(&branch_name, &sha, &report.checks, automatic);
                 let run_id = RunId::new();
                 self.forge.fixes.insert(
                     run_id,
                     Fix {
                         thread_id,
-                        automatic: query.is_none(),
-                        names,
+                        automatic,
+                        names: report.checks.iter().map(|c| c.name.clone()).collect(),
+                        query,
+                        tainted: false,
                     },
                 );
                 let command = Command::MessageDispatch {
@@ -326,12 +386,10 @@ impl Orchestrator {
                     text: prompt,
                     delivery: Delivery::Queue,
                 };
-                let reply = match query {
-                    Some(id) => Reply::Query(id),
-                    None => Reply::Fix(run_id),
-                };
-                self.deferred
-                    .push_back(Deferred::Dispatch(Pending::new(command, reply)));
+                self.deferred.push_back(Deferred::Dispatch(Pending::new(
+                    command,
+                    Reply::Fix(run_id),
+                )));
             }
             FixDone::Send {
                 thread_id,
@@ -391,13 +449,19 @@ impl Orchestrator {
             if !self.config.forge {
                 return Err("GitHub integration is turned off".to_owned());
             }
-            self.live_thread(thread_id)?
+            let thread = self.live_thread(thread_id)?;
+            let link = thread
                 .pr
                 .clone()
-                .ok_or_else(|| "no pull request is linked".to_owned())
+                .ok_or_else(|| "no pull request is linked".to_owned())?;
+            let cwd = self
+                .projects
+                .get(&thread.project_id)
+                .map(|p| PathBuf::from(thread.cwd(p)));
+            Ok((link, cwd))
         })();
-        let link = match link {
-            Ok(link) => link,
+        let (link, cwd) = match link {
+            Ok(found) => found,
             Err(err) => {
                 return self.emit(CoreEvent::Reply {
                     id,
@@ -407,7 +471,7 @@ impl Orchestrator {
         };
         let ctx = self.forge_ctx();
         self.spawn_job(Key::None, async move {
-            let result = comments_report(&ctx, &link, &ids).await;
+            let result = comments_report(&ctx, &link, cwd.as_deref(), &ids).await;
             JobDone::ForgeFix(Box::new(FixDone::Send {
                 thread_id,
                 query: id,
@@ -435,6 +499,9 @@ impl Orchestrator {
                     "\"{}\" works in the same folder and is running; wait for it to finish",
                     busy.title
                 ));
+            }
+            if self.forge.fixing.contains(&thread.id) {
+                return Err("a CI fix is on its way; merge after it".into());
             }
             let link = thread.pr.clone().ok_or("no pull request is linked")?;
             let ours = thread.worktree.as_ref().map(|w| w.branch.as_str());
@@ -466,7 +533,52 @@ impl Orchestrator {
     pub(super) fn fix_refused(&mut self, run_id: RunId, reason: &str) {
         if let Some(fix) = self.forge.fixes.remove(&run_id) {
             self.forge.fixing.remove(&fix.thread_id);
-            eprintln!("blongo-core: CI fix not sent: {reason}");
+            match fix.query {
+                Some(id) => self.emit(CoreEvent::Reply {
+                    id,
+                    result: Err(reason.to_owned()),
+                }),
+                None => eprintln!("blongo-core: CI fix not sent: {reason}"),
+            }
+        }
+    }
+
+    /// The fix message is in: answer the user who asked for it.
+    pub(super) fn fix_sent(&mut self, run_id: RunId) {
+        if let Some(id) = self.forge.fixes.get(&run_id).and_then(|f| f.query) {
+            self.emit(CoreEvent::Reply {
+                id,
+                result: Ok(QueryReply::Done("sent to the agent".into())),
+            });
+        }
+    }
+
+    /// A run started: a fix still to end in the same folder no longer
+    /// holds only its own work.
+    pub(super) fn taint_fixes(&mut self, thread_id: ThreadId, run_id: RunId) {
+        if self.forge.fixes.is_empty() {
+            return;
+        }
+        let folder =
+            |t: Option<&Thread>| t.and_then(|t| t.worktree.as_ref()).map(|w| w.path.clone());
+        let here = folder(self.threads.get(&thread_id));
+        for (fix_run, fix) in self.forge.fixes.iter_mut() {
+            if *fix_run != run_id
+                && (fix.thread_id == thread_id
+                    || (here.is_some() && folder(self.threads.get(&fix.thread_id)) == here))
+            {
+                fix.tainted = true;
+            }
+        }
+    }
+
+    /// An automatic fix that did not happen gives its attempt back.
+    fn undo_attempt(&mut self, thread_id: ThreadId) {
+        let mut state = self.fix_state(thread_id);
+        if state.attempts > 0 {
+            state.attempts -= 1;
+            state.sha.clear();
+            self.set_fix_state(thread_id, &state);
         }
     }
 
@@ -497,6 +609,22 @@ impl Orchestrator {
         else {
             return;
         };
+        let why = if fix.tainted {
+            Some("another turn ran in the folder meanwhile")
+        } else if !project.forge.auto_fix_ci {
+            Some("automatic fixes were turned off")
+        } else if !forge::owns_branch(thread) || link.read_only {
+            Some("the thread no longer owns the branch")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.thread_notice(
+                fix.thread_id,
+                &format!("The CI fix was not pushed: {why}. Push it from the PR tab once you have looked."),
+            );
+            return;
+        }
         let cwd = PathBuf::from(thread.cwd(project));
         let thread_id = fix.thread_id;
         let message = format!("Fix CI: {}", fix.names.join(", "));
@@ -538,15 +666,15 @@ impl Orchestrator {
     }
 }
 
-/// What CI said of the failed checks, as the message for the agent, and
-/// the checks' names.
+/// What CI said of the failed checks, and whether the folder allows an
+/// automatic fix to be pushed.
 async fn fix_report(
     ctx: &ForgeCtx,
     link: &PrLink,
     cwd: &std::path::Path,
     sha: &str,
     automatic: bool,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<Report, String> {
     // The fix is made where the branch is checked out.
     if remote::current_branch(cwd).await.as_deref() != Some(link.head_branch.as_str()) {
         return Err(format!(
@@ -561,15 +689,27 @@ async fn fix_report(
         .failure_report(&repo, sha)
         .await
         .map_err(|e| ctx.fail(&repo.host, e))?;
-    let names = checks.iter().map(|c| c.name.clone()).collect();
-    let prompt = blongo_forge::pr::fix_prompt(&link.head_branch, sha, &checks, automatic);
-    Ok((prompt, names))
+    // An automatic fix is pushed for the user, so the folder must hold
+    // nothing but the failed commit.
+    let hold = if !automatic {
+        None
+    } else if branch::unmerged(cwd).await {
+        Some("a merge is in progress in the thread's folder".to_owned())
+    } else if !branch::uncommitted_files(cwd).await.is_empty() {
+        Some("the thread's folder has uncommitted changes".to_owned())
+    } else if branch::head(cwd).await.as_deref() != Some(sha) {
+        Some("the thread's folder is not at the failed commit".to_owned())
+    } else {
+        None
+    };
+    Ok(Report { checks, hold })
 }
 
 /// The unresolved review threads as the message for the agent.
 async fn comments_report(
     ctx: &ForgeCtx,
     link: &PrLink,
+    cwd: Option<&std::path::Path>,
     ids: &[String],
 ) -> Result<SendOutcome, String> {
     let repo = RepoRef::parse(&format!("https://{}/{}", link.host, link.repo))
@@ -587,9 +727,44 @@ async fn comments_report(
     if threads.is_empty() {
         return Err("no unresolved review comments".into());
     }
+    // The commented line as the folder has it, when the branch is
+    // checked out there and the comment is not outdated.
+    let checked_out = match cwd {
+        Some(cwd) => remote::current_branch(cwd).await.as_deref() == Some(&link.head_branch),
+        None => false,
+    };
+    let quotes: Vec<Option<String>> = threads
+        .iter()
+        .map(|t| {
+            let (cwd, line) = (cwd.filter(|_| checked_out)?, t.line?);
+            if t.outdated {
+                return None;
+            }
+            code_line(cwd, &t.path, line)
+        })
+        .collect();
     Ok(SendOutcome::Prompt(blongo_forge::pr::comments_prompt(
-        &threads,
+        &threads, &quotes,
     )))
+}
+
+/// Line `line` (from 1) of the file at `path` inside `cwd`: a relative
+/// path of plain components, a file of at most 1 MiB.
+fn code_line(cwd: &std::path::Path, path: &str, line: u32) -> Option<String> {
+    use std::path::Component;
+    let rel = std::path::Path::new(path);
+    if path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let full = cwd.join(rel);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return None;
+    }
+    let text = std::fs::read_to_string(full).ok()?;
+    let code = text.lines().nth(line.checked_sub(1)? as usize)?;
+    let code: String = code.chars().take(300).collect();
+    (!code.trim().is_empty()).then_some(code)
 }
 
 /// Fetch the base branch and merge it in; conflicts become the message
@@ -630,6 +805,9 @@ async fn push_fix(
         return Err(format!(
             "the folder no longer has {branch_name} checked out"
         ));
+    }
+    if branch::unmerged(cwd).await {
+        return Err("a merge is in progress or files are in conflict".into());
     }
     let mut committed = false;
     if !branch::uncommitted_files(cwd).await.is_empty() {

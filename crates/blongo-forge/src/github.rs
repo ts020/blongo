@@ -84,6 +84,16 @@ pub struct FailedCheck {
     /// `path:line: message` lines.
     pub annotations: Vec<String>,
     pub log_tail: Option<String>,
+    /// Where it can be read on GitHub or the CI's own site.
+    pub url: Option<String>,
+}
+
+/// An https link of at most 500 characters, else nothing.
+fn https_url(url: Option<&str>) -> Option<String> {
+    url.filter(|u| {
+        u.starts_with("https://") && u.len() <= 500 && !u.chars().any(char::is_whitespace)
+    })
+    .map(str::to_owned)
 }
 
 /// Failed checks looked at in detail.
@@ -358,6 +368,7 @@ impl GitHub {
                 summary: clip(&summary, 4_000),
                 annotations,
                 log_tail,
+                url: https_url(run["details_url"].as_str().or(run["html_url"].as_str())),
             });
         }
         if out.len() < MAX_FAILED
@@ -372,6 +383,7 @@ impl GitHub {
                     out.push(FailedCheck {
                         name: clip(s["context"].as_str().unwrap_or("status"), 200),
                         summary: clip(s["description"].as_str().unwrap_or(""), 1_000),
+                        url: https_url(s["target_url"].as_str()),
                         ..FailedCheck::default()
                     });
                 }

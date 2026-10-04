@@ -337,6 +337,12 @@ impl Orchestrator {
                 self.answer_draft(*run_id, *status);
                 self.finish_fix(*run_id, *status);
             }
+            EventKind::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Running,
+                ..
+            } => self.taint_fixes(*thread_id, *run_id),
             EventKind::ThreadPrStatus {
                 thread_id,
                 status: Some(status),
@@ -910,8 +916,8 @@ impl Orchestrator {
                 return Err(format!("\"{name}\" is not a branch name"));
             }
         }
-        if !(1..=10).contains(&settings.auto_fix_max) {
-            return Err("automatic CI fixes stop after 1 to 10 attempts".into());
+        if !(2..=10).contains(&settings.auto_fix_max) {
+            return Err("automatic CI fixes stop after 2 to 10 failing runs in a row".into());
         }
         batch.events.push(EventKind::ProjectForgeChanged {
             project_id,

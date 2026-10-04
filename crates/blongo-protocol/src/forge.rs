@@ -456,7 +456,8 @@ pub struct ForgeSettings {
     /// When a linked pull request's checks fail, send the failure to the
     /// thread's agent and let it push a fix.
     pub auto_fix_ci: bool,
-    /// Consecutive failed auto-fix attempts before Blongo stops and asks.
+    /// Failing check runs in a row after which Blongo stops sending fixes
+    /// and says so (the run that reaches it gets no fix).
     pub auto_fix_max: u32,
 }
 

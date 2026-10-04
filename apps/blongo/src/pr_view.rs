@@ -647,12 +647,14 @@ impl Render for PrView {
                 "Automatic fixes are off for this project (Settings › GitHub).".to_owned()
             } else if fix.stopped {
                 format!(
-                    "Automatic fixes stopped after {} attempts; fix it by hand or ask the agent.",
-                    fix.attempts
+                    "Automatic fixes stopped: the checks failed {} times in a row. Fix it by hand \
+                     or ask the agent.",
+                    fix.attempts + 1
                 )
             } else {
                 format!(
-                    "Failed checks go to the agent and its fix is pushed ({} of {} attempts used).",
+                    "Failed checks go to the agent and its fix is pushed ({} sent; stops when the \
+                     checks fail {} times in a row).",
                     fix.attempts, fix.max
                 )
             };

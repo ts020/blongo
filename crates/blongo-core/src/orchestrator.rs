@@ -873,6 +873,9 @@ impl Orchestrator {
 
     /// The command committed (or was a duplicate): tell whoever waits.
     fn succeed(&mut self, reply: Reply) {
+        if let Reply::Fix(run_id) = reply {
+            return self.fix_sent(run_id);
+        }
         if let Reply::Query(id) = reply {
             // A draft answers when its turn ends; a fix now.
             if !self.forge.drafts.values().any(|q| *q == id) {

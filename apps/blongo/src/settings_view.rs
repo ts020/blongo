@@ -930,10 +930,9 @@ impl Render for SettingsView {
                     .child(
                         row()
                             .child(label("Stop after"))
-                            .children([1u32, 2, 3, 5, 10].map(|n| {
+                            .children([2u32, 3, 5, 10].map(|n| {
                                 let text: &'static str = match n {
-                                    1 => "1 attempt",
-                                    2 => "2",
+                                    2 => "2 failures in a row",
                                     3 => "3",
                                     5 => "5",
                                     _ => "10",
@@ -956,8 +955,8 @@ impl Render for SettingsView {
                          is used, then the remote's HEAD. Branches Blongo names start with the \
                          prefix; an empty base field means GitHub's default. When the checks of \
                          a pull request fail, what CI said goes to the thread's agent and Blongo \
-                         commits and pushes its fix (never forced), until the checks pass or the \
-                         attempts run out.",
+                         commits and pushes its fix (never forced), until the checks pass or \
+                         fail that many times in a row.",
                     ));
             }
         }

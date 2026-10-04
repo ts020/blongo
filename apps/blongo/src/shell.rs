@@ -2269,7 +2269,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// A desktop notification, as the settings allow.
     /// Fetch the PR tab's detail again when it shows `thread_id`.
     fn reload_pr_view(&self, env: EnvId, thread_id: ThreadId, cx: &mut Context<Self>) {
         if let Some(pr) = &self.pr_view
@@ -2279,6 +2278,7 @@ impl Shell {
         }
     }
 
+    /// A desktop notification, as the settings allow.
     fn notify(&self, body: &str, title: &str, cx: &App) {
         let show = match cx.global::<Settings>().value.notifications {
             NotifyMode::Off => false,

@@ -255,9 +255,6 @@ pub async fn template(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Neither empty nor an option, no whitespace or control characters: a
-/// name safe to put after the arguments it follows (callers validate
-/// branch names more strictly).
 /// What bringing the base branch into the checked-out branch did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -319,6 +316,15 @@ pub async fn merge_base(cwd: &Path, remote: &str, base: &str) -> Result<MergeOut
     }
 }
 
+/// A merge is in progress or files are in conflict: nothing here may be
+/// committed for the user.
+pub async fn unmerged(cwd: &Path) -> bool {
+    quick(cwd, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+        .await
+        .is_ok()
+        || !conflicted(cwd).await.is_empty()
+}
+
 /// Files with unresolved conflicts.
 async fn conflicted(cwd: &Path) -> Vec<String> {
     quick(cwd, &["diff", "--name-only", "--diff-filter=U", "-z"])
@@ -333,6 +339,9 @@ async fn conflicted(cwd: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Neither empty nor an option, no whitespace or control characters: a
+/// name safe to put after the arguments it follows (callers validate
+/// branch names more strictly).
 fn plain(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
@@ -414,6 +423,7 @@ mod tests {
             merge_base(&work, "origin", "main").await,
             Ok(MergeOutcome::UpToDate)
         );
+        assert!(!unmerged(&work).await);
         // The base moves on elsewhere: a clean merge.
         sh(&work, &["checkout", "-q", "main"]);
         std::fs::write(work.join("b.txt"), "b\n").unwrap();
@@ -442,6 +452,7 @@ mod tests {
         assert_eq!(merge_base(&work, "origin", "main").await, want);
         // Asking again reports the merge in progress.
         assert_eq!(merge_base(&work, "origin", "main").await, want);
+        assert!(unmerged(&work).await);
         assert_eq!(
             merge_base(&work, "-x", "main").await,
             Err("not a branch name".into())

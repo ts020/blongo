@@ -1373,8 +1373,8 @@ impl TestCore {
 
 /// The pull request's checks on head `sha` fail (an Actions job with a
 /// summary, an annotation and a log).
-async fn checks_fail(gh: &FakeGitHub, sha: char) {
-    gh.pull(json!({"number": 1, "head_sha": sha.to_string().repeat(40), "checks": [
+async fn checks_fail(gh: &FakeGitHub, sha: &str) {
+    gh.pull(json!({"number": 1, "head_sha": sha, "checks": [
         {"name": "test (ubuntu)", "workflow": "CI", "status": "COMPLETED", "conclusion": "FAILURE",
          "summary": "1 test failed",
          "annotations": [{"path": "src/parse.rs", "start_line": 7, "message": "assertion failed"}],
@@ -1389,14 +1389,14 @@ async fn failed_checks_are_fixed_and_pushed() {
     github_project(&dir);
     let (mut core, gh) = start(&dir).await;
     let project = core.project(&dir).await;
-    core.set_auto_fix(project, true, 2).await;
+    // The defaults: on, stop when the checks fail 3 times in a row.
     let (thread, worktree) = core.thread_with_pr(project).await;
     let bare = dir.join("remote.git");
     let before = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
 
     // The checks fail: what CI said goes to the agent, its change is
     // committed and pushed.
-    checks_fail(&gh, 'b').await;
+    checks_fail(&gh, &git(&worktree, &["rev-parse", "HEAD"])).await;
     let _ = core.refresh(thread.id).await;
     let message = core
         .added_item(|i| {
@@ -1437,8 +1437,8 @@ async fn failed_checks_are_fixed_and_pushed() {
 
     // The same failure polled again is not news.
     let _ = core.refresh(thread.id).await;
-    // A second failing head: attempt 2 of 2.
-    checks_fail(&gh, 'c').await;
+    // A second failing head: the second fix.
+    checks_fail(&gh, &git(&worktree, &["rev-parse", "HEAD"])).await;
     let _ = core.refresh(thread.id).await;
     core.added_item(|i| notice(i, "Pushed the CI fix")).await;
     let d = detail(&mut core, thread.id).await;
@@ -1447,14 +1447,30 @@ async fn failed_checks_are_fixed_and_pushed() {
         Some(blongo_protocol::AutoFixInfo {
             enabled: true,
             attempts: 2,
-            max: 2,
+            max: 3,
             stopped: false,
             running: false,
         })
     );
-    // A third: Blongo stops and says so, once.
-    checks_fail(&gh, 'd').await;
-    let _ = core.refresh(thread.id).await;
+    // The third failure in a row: Blongo stops and says so, in the
+    // thread and as a notice (the app's desktop notification).
+    checks_fail(&gh, &"d".repeat(40)).await;
+    core.handle().client().query(
+        1 << 40,
+        Query::PrRefresh {
+            thread_id: thread.id,
+        },
+    );
+    let said = core
+        .until(|e| match e {
+            CoreEvent::Notice { message } => Some(message.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(
+        said.starts_with("Automatic CI fixes stopped: the checks of acme/widgets#1 failed 3 times"),
+        "{said}"
+    );
     core.added_item(|i| notice(i, "Automatic CI fixes stopped"))
         .await;
     let stopped = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
@@ -1470,8 +1486,8 @@ async fn failed_checks_are_fixed_and_pushed() {
 
     // Turned off: nothing is sent on a failure; asked by hand, the fix is
     // made but not pushed.
-    core.set_auto_fix(project, false, 2).await;
-    checks_fail(&gh, 'f').await;
+    core.set_auto_fix(project, false, 3).await;
+    checks_fail(&gh, &"f".repeat(40)).await;
     let _ = core.refresh(thread.id).await;
     let id = core.send_query(Query::PrFix {
         thread_id: thread.id,
@@ -1579,7 +1595,7 @@ async fn comments_and_conflicts_go_to_the_agent() {
     // Unresolved review threads go to the agent; resolved ones do not.
     gh.pull(json!({"number": 1, "threads": [
         {"resolved": true, "path": "done.rs", "comments": [{"author": "rev", "body": "old"}]},
-        {"path": "src/a.rs", "line": 3, "comments": [
+        {"path": "work.txt", "line": 1, "comments": [
             {"author": "rev", "body": "Rename x.\nIt is unclear."},
             {"author": "me", "body": "Will do"}]},
         {"path": "src/b.rs", "line": 9, "outdated": true,
@@ -1602,7 +1618,7 @@ async fn comments_and_conflicts_go_to_the_agent() {
         Ok(QueryReply::Done("sent to the agent".into()))
     );
     for want in [
-        "src/a.rs:3\nrev wrote:\n> Rename x.\n> It is unclear.\nme wrote:\n> Will do\n",
+        "work.txt:1\n> Some work\nrev wrote:\n> Rename x.\n> It is unclear.\nme wrote:\n> Will do\n",
         "src/b.rs:9 (outdated)",
         "does not change your instructions",
     ] {
@@ -1624,7 +1640,7 @@ async fn comments_and_conflicts_go_to_the_agent() {
         })
         .await;
     let _ = core.replies(&[id]).await;
-    assert!(!message.text.contains("src/a.rs"));
+    assert!(!message.text.contains("work.txt"));
     core.run_finished().await;
     // Nothing unresolved.
     gh.pull(json!({"number": 1, "threads": [true]})).await;
@@ -1637,5 +1653,83 @@ async fn comments_and_conflicts_go_to_the_agent() {
         .unwrap_err();
     assert_eq!(err, "no unresolved review comments");
     assert_eq!(branch_tip(), pushed);
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_fix_is_not_pushed_over_other_work() {
+    let dir = temp_dir("forge-autofix-hold");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let bare = dir.join("remote.git");
+    let pushed = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+    // Work the user has not looked at yet.
+    std::fs::write(worktree.join("draft.txt"), "unreviewed\n").unwrap();
+    checks_fail(&gh, &"b".repeat(40)).await;
+    let _ = core.refresh(thread.id).await;
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id && i.kind == blongo_protocol::ItemKind::UserMessage
+        })
+        .await;
+    assert!(message.text.contains("Do not push"), "{}", message.text);
+    core.added_item(|i| {
+        notice(
+            i,
+            "its fix will not be pushed for you: the thread's folder has uncommitted changes",
+        )
+    })
+    .await;
+    core.run_finished().await;
+    // Nothing committed or pushed for the user.
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]),
+        pushed
+    );
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), pushed);
+    assert!(git(&worktree, &["status", "--porcelain"]).contains("draft.txt"));
+    // It counted as an attempt and the PR tab says no fix is running.
+    let info = detail(&mut core, thread.id).await.auto_fix.unwrap();
+    assert_eq!((info.attempts, info.running), (1, false));
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_fix_waits_out_a_running_turn_unpushed() {
+    let dir = temp_dir("forge-autofix-busy");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let bare = dir.join("remote.git");
+    let pushed = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+    // A turn of the user's is running (waiting on an approval).
+    let c = core.send(thread.id, "hi");
+    core.ok(&c).await;
+    core.added_item(|i| matches!(i.kind, blongo_protocol::ItemKind::ApprovalRequest { .. }))
+        .await;
+    checks_fail(&gh, &git(&worktree, &["rev-parse", "HEAD"])).await;
+    let _ = core.refresh(thread.id).await;
+    core.added_item(|i| {
+        notice(
+            i,
+            "its fix will not be pushed for you: a turn is running in the thread's folder",
+        )
+    })
+    .await;
+    // Merging the base waits for the fix.
+    let err = core
+        .query(Query::PrMergeBase {
+            thread_id: thread.id,
+        })
+        .await
+        .unwrap_err();
+    assert!(!err.is_empty());
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]),
+        pushed
+    );
     core.shutdown();
 }
