@@ -76,17 +76,21 @@ impl FakeGitHub {
         let port_file = dir.join("github.port");
         let script =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/fixtures/fake_github.py");
-        let child = std::process::Command::new("python3")
+        let mut child = std::process::Command::new("python3")
             .arg(script)
             .arg(&port_file)
             .spawn()
             .expect("python3 for the fake GitHub");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // A cold python3 on a busy macOS runner can take well over 10 s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
         let port = loop {
             if let Ok(p) = std::fs::read_to_string(&port_file)
                 && !p.is_empty()
             {
                 break p;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("fake GitHub exited: {status}");
             }
             assert!(
                 std::time::Instant::now() < deadline,
