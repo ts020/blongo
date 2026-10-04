@@ -124,23 +124,6 @@ CREATE TABLE schedules (
 ALTER TABLE schedules ADD COLUMN proposed_by TEXT;
 "#,
     ),
-    (
-        5,
-        r#"
-ALTER TABLE threads ADD COLUMN pr TEXT;
-ALTER TABLE threads ADD COLUMN pr_status TEXT;
-ALTER TABLE threads ADD COLUMN pr_dismissed INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE projects ADD COLUMN forge TEXT;
-
--- What Blongo last learned from the forge (a repository's default
--- branch, …): a cache, not part of the event log.
-CREATE TABLE forge_cache (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    at    INTEGER NOT NULL
-);
-"#,
-    ),
 ];
 
 pub const LATEST_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].0;

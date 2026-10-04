@@ -22,8 +22,6 @@ const FILE_LIMIT: u32 = 50;
 pub enum PaletteEvent {
     Run(&'static str),
     OpenFile(String),
-    /// A [`Mode::Prompt`] was answered: its id and the text.
-    Submit(&'static str, String),
     Dismiss,
 }
 
@@ -35,12 +33,6 @@ pub enum Mode {
     Files {
         backend: Arc<dyn Backend>,
         thread_id: ThreadId,
-    },
-    /// One line of text (Enter submits it).
-    Prompt {
-        id: &'static str,
-        placeholder: &'static str,
-        hint: &'static str,
     },
 }
 
@@ -98,7 +90,6 @@ impl Palette {
         let placeholder = match mode {
             Mode::Commands { .. } => "Type a command…",
             Mode::Files { .. } => "Search files by name…",
-            Mode::Prompt { placeholder, .. } => placeholder,
         };
         let input = cx.new(|cx| TextInput::new(placeholder, false, cx));
         let subscriptions = vec![
@@ -161,7 +152,6 @@ impl Palette {
                     self.search(pattern, cx);
                 }
             }
-            Mode::Prompt { .. } => {}
         }
     }
 
@@ -194,13 +184,6 @@ impl Palette {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Mode::Prompt { id, .. } = self.mode {
-            let text = self.input.read(cx).text().trim().to_owned();
-            if !text.is_empty() {
-                cx.emit(PaletteEvent::Submit(id, text));
-            }
-            return;
-        }
         match self.items.get(self.selected) {
             Some(Item::Command { id, .. }) => cx.emit(PaletteEvent::Run(id)),
             Some(Item::File(f)) => cx.emit(PaletteEvent::OpenFile(f.path.clone())),
@@ -347,10 +330,6 @@ impl Render for Palette {
             })
             .collect::<Vec<_>>();
         let empty = self.items.is_empty();
-        let hint = match self.mode {
-            Mode::Prompt { hint, .. } => Some(hint),
-            _ => None,
-        };
         div()
             .id("palette")
             .track_focus(&self.focus_handle)
@@ -379,17 +358,7 @@ impl Render for Palette {
             .when_some(self.error.clone(), |d, e| {
                 d.child(div().px_3().text_xs().text_color(theme::danger()).child(e))
             })
-            .when_some(hint, |d, hint| {
-                d.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .text_color(theme::text_faint())
-                        .child(hint),
-                )
-            })
-            .when(empty && self.error.is_none() && hint.is_none(), |d| {
+            .when(empty && self.error.is_none(), |d| {
                 d.child(
                     div()
                         .px_3()

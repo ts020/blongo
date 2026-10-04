@@ -1,14 +1,15 @@
 //! Secrets on disk and in memory: owner-only files, random tokens, device
 //! keys and the proof of possession. Shared by the client and the server.
 
+use std::io::Write;
+use std::path::Path;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use blongo_protocol::wire::{Proof, ProofPurpose, proof_message, secret_sha256};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-
-pub use blongo_forge::fs::{private_dir, write_private};
 
 pub fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -130,6 +131,81 @@ pub fn verify_proof(
         .map_err(|_| ProofError::BadSignature)
 }
 
+/// Make `path` a directory readable only by its owner (0700 on Unix).
+///
+/// Missing directories are created 0700. An existing one is tightened to
+/// 0700 only when it belongs to this user and is not a shared directory
+/// (sticky bit, like `/tmp`); a shared or foreign directory is refused,
+/// never chmod-ed: Blongo must not change permissions of directories it
+/// does not own, and its secrets do not belong in them.
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if !path.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)?;
+        }
+        let meta = std::fs::metadata(path)?;
+        if !meta.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} is not a directory",
+                path.display()
+            )));
+        }
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me || meta.mode() & 0o1000 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is shared or belongs to another user; refusing to keep private files there",
+                    path.display()
+                ),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+/// Replace `path` atomically with `data`, readable only by its owner
+/// (0600 on Unix, set before any byte is written).
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    // A missing parent is created private; an existing one is left as it
+    // is (the file itself is 0600).
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.exists()
+    {
+        private_dir(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", b64(&random::<6>())));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,8 +217,7 @@ mod tests {
     #[test]
     fn existing_and_shared_directories_keep_their_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let mode =
-            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         let root = std::env::temp_dir().join(format!("blongo-secret-{}", b64(&random::<6>())));
         let open_dir = root.join("open");
         let shared = root.join("shared");

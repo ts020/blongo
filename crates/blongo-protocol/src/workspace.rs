@@ -75,12 +75,6 @@ pub enum Query {
         thread_id: ThreadId,
         message: String,
     },
-    /// Check the thread's pull request on GitHub now (and look for the
-    /// branch's pull request when none is linked). Answered with `Done`
-    /// once the check finished; the status arrives as an event.
-    PrRefresh {
-        thread_id: ThreadId,
-    },
 }
 
 impl Query {
@@ -94,8 +88,7 @@ impl Query {
             | Self::GitStatus { thread_id }
             | Self::GitBranches { thread_id }
             | Self::GitSwitch { thread_id, .. }
-            | Self::GitCommit { thread_id, .. }
-            | Self::PrRefresh { thread_id } => *thread_id,
+            | Self::GitCommit { thread_id, .. } => *thread_id,
         }
     }
 

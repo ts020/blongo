@@ -105,7 +105,6 @@ fn snapshots_and_deltas_round_trip() {
         name: "p".into(),
         path: "/tmp/p".into(),
         created_at: Timestamp(1),
-        forge: Default::default(),
     };
     let thread = Thread::new(ThreadId::new(), project.id, "t", Timestamp(2));
     let shell = ShellSnapshot {

@@ -441,13 +441,6 @@ async fn a_slow_reader_is_resnapshotted_with_bounded_memory() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
     let stream = socket.connect(server.addr.unwrap()).await.unwrap();
-    // A second handle on the socket, to widen its buffer once the client
-    // reads again: with a 4 KiB buffer the receiver never advertises a
-    // window worth an update, so catching up would hang on the sender's
-    // zero-window probes, whose backoff grows with how long it waited.
-    let std_stream = stream.into_std().unwrap();
-    let handle = std_stream.try_clone().unwrap();
-    let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
     let (ws, _) = tokio_tungstenite::client_async_with_config(
         target.as_str(),
         stream,
@@ -485,9 +478,6 @@ async fn a_slow_reader_is_resnapshotted_with_bounded_memory() {
         .load(std::sync::atomic::Ordering::Relaxed);
     assert!(resnapshots >= 1, "the slow client never overflowed");
 
-    socket2::SockRef::from(&handle)
-        .set_recv_buffer_size(1 << 20)
-        .unwrap();
     // Now read: Resnapshot, then a snapshot, then deltas; together they
     // hold the whole reply, with nothing lost or doubled after the
     // snapshot.

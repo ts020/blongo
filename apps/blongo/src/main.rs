@@ -49,7 +49,6 @@ mod keymap;
 mod markdown;
 mod notify;
 mod palette;
-mod pr;
 mod query;
 mod settings;
 mod settings_view;

@@ -25,4 +25,3 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-std", "signal", "rt-multi-thread"] }
-socket2 = "0.6"

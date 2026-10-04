@@ -507,19 +507,6 @@ impl Render for Sidebar {
                                     .whitespace_nowrap()
                                     .child(SharedString::from(thread.title.clone())),
                             )
-                            .when_some(
-                                crate::pr::sidebar_label(thread).zip(crate::pr::badge(thread)),
-                                |d, (label, badge)| {
-                                    d.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .whitespace_nowrap()
-                                            .text_xs()
-                                            .text_color(crate::pr::color(badge))
-                                            .child(SharedString::from(label)),
-                                    )
-                                },
-                            )
                             .child(
                                 div()
                                     .text_xs()
