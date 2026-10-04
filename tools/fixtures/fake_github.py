@@ -28,6 +28,11 @@ Supported API (only what Blongo asks):
 
 Control ops:
   {"op": "repo", "repo": "o/n", "default_branch": "main", "push": true}
+      also "allow_merge_commit", "allow_squash_merge", "allow_rebase_merge",
+      "delete_branch_on_merge". PUT .../pulls/N/merge merges (409 when
+      "sha" is not the head, 405 when not mergeable or the method is not
+      allowed); the GraphQL enablePullRequestAutoMerge mutation sets
+      "auto_merge"; DELETE .../git/refs/heads/B is logged.
   {"op": "pull", "repo": "o/n", "pull": {number, title, head, base, ...}}
       merges the given fields into the pull (created if missing). Fields:
       number, title, state ("open"/"closed"), draft, merged, head (branch),
@@ -62,7 +67,10 @@ FAILS = []
 
 def repo(name):
     if name not in REPOS:
-        REPOS[name] = {"default_branch": "main", "push": True, "pulls": {}}
+        REPOS[name] = {"default_branch": "main", "push": True, "pulls": {},
+                       "allow_merge_commit": True, "allow_squash_merge": True,
+                       "allow_rebase_merge": False, "delete_branch_on_merge": False,
+                       "deleted_refs": []}
     return REPOS[name]
 
 
@@ -179,6 +187,8 @@ def graphql_detail(full, p):
         rollup["contexts"]["totalCount"] = len(p["checks"])
     threads = [thread(t) for t in p["threads"]]
     out.update({
+        "id": f"PR_{p['number']}",
+        "autoMergeRequest": {"enabledAt": "2026-10-04T00:00:00Z"} if p.get("auto_merge") else None,
         "body": p["body"],
         "url": f"https://github.com/{full}/pull/{p['number']}",
         "author": {"login": p["author"]},
@@ -323,10 +333,10 @@ class Handler(BaseHTTPRequestHandler):
                     "full_name": full,
                     "default_branch": r["default_branch"],
                     "permissions": {"admin": False, "push": r["push"], "pull": True},
-                    "allow_merge_commit": True,
-                    "allow_squash_merge": True,
-                    "allow_rebase_merge": False,
-                    "delete_branch_on_merge": False,
+                    "allow_merge_commit": r["allow_merge_commit"],
+                    "allow_squash_merge": r["allow_squash_merge"],
+                    "allow_rebase_merge": r["allow_rebase_merge"],
+                    "delete_branch_on_merge": r["delete_branch_on_merge"],
                 })
             m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls/(\d+)", url.path)
             if m:
@@ -381,6 +391,44 @@ class Handler(BaseHTTPRequestHandler):
         r["pulls"][number] = p
         self.reply(201, rest_pull(full, p))
 
+    def do_PUT(self):
+        body = self.body()
+        with LOCK:
+            if self.gate(body):
+                return
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls/(\d+)/merge", urlsplit(self.path).path)
+            full = f"{m[1]}/{m[2]}" if m else ""
+            p = REPOS.get(full, {}).get("pulls", {}).get(int(m[3])) if m else None
+            if not p:
+                return self.reply(404, {"message": "Not Found"})
+            r = REPOS[full]
+            if not r["push"]:
+                return self.reply(403, {"message": "Resource not accessible by integration"})
+            method = (body or {}).get("merge_method", "merge")
+            allowed = {"merge": r["allow_merge_commit"], "squash": r["allow_squash_merge"],
+                       "rebase": r["allow_rebase_merge"]}
+            if p["merged"] or p["state"] != "open" or p["draft"] or p["mergeable"] == "CONFLICTING":
+                return self.reply(405, {"message": "Pull Request is not mergeable"})
+            if not allowed.get(method):
+                return self.reply(405, {"message": f"{method.capitalize()} merges are not allowed on this repository."})
+            if (body or {}).get("sha") and body["sha"] != p["head_sha"]:
+                return self.reply(409, {"message": "Head branch was modified. Review and try the merge again."})
+            p.update({"merged": True, "state": "closed", "merged_with": method})
+            self.reply(200, {"sha": "c" * 40, "merged": True, "message": "Pull Request successfully merged"})
+
+    def do_DELETE(self):
+        with LOCK:
+            if self.gate():
+                return
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/git/refs/heads/(.+)", urlsplit(self.path).path)
+            full = f"{m[1]}/{m[2]}" if m else ""
+            if full not in REPOS:
+                return self.reply(404, {"message": "Not Found"})
+            REPOS[full]["deleted_refs"].append(unquote(m[3]))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def do_PATCH(self):
         body = self.body()
         with LOCK:
@@ -400,6 +448,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def graphql(self, query):
         RATE["remaining"] = max(0, RATE["remaining"] - 1)
+        m = re.search(r'enablePullRequestAutoMerge\(input:\{pullRequestId:"PR_(\d+)",'
+                      r'mergeMethod:(\w+),expectedHeadOid:"([0-9a-f]+)"\}\)', query)
+        if query.startswith("mutation"):
+            p = None
+            for r in REPOS.values():
+                if m and int(m[1]) in r["pulls"]:
+                    p = r["pulls"][int(m[1])]
+            if not p:
+                return self.reply(200, {"data": None, "errors": [
+                    {"type": "NOT_FOUND", "message": "Could not resolve to a node"}]})
+            if p["head_sha"] != m[3]:
+                return self.reply(200, {"data": None, "errors": [
+                    {"type": "UNPROCESSABLE", "message": "Head sha didn't match expected head sha"}]})
+            p["auto_merge"] = m[2]
+            return self.reply(200, {"data": {"enablePullRequestAutoMerge": {"clientMutationId": None}}})
         m = re.search(r'repository\(owner:"([^"]+)",name:"([^"]+)"\)', query)
         data = {"rateLimit": dict(RATE)}
         if not m or f"{m[1]}/{m[2]}" not in REPOS:
@@ -437,7 +500,8 @@ class Handler(BaseHTTPRequestHandler):
         op = body.get("op")
         if op == "repo":
             r = repo(body["repo"])
-            for k in ("default_branch", "push"):
+            for k in ("default_branch", "push", "allow_merge_commit", "allow_squash_merge",
+                      "allow_rebase_merge", "delete_branch_on_merge"):
                 if k in body:
                     r[k] = body[k]
         elif op == "pull":

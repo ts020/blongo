@@ -538,7 +538,10 @@ impl Orchestrator {
                     id,
                     result: Err(reason.to_owned()),
                 }),
-                None => eprintln!("blongo-core: CI fix not sent: {reason}"),
+                None => {
+                    self.undo_attempt(fix.thread_id);
+                    eprintln!("blongo-core: CI fix not sent: {reason}");
+                }
             }
         }
     }
@@ -609,7 +612,12 @@ impl Orchestrator {
         else {
             return;
         };
-        let why = if fix.tainted {
+        let cwd = thread.cwd(project).to_owned();
+        let sharer_busy = self
+            .folder_sharers(fix.thread_id, &cwd)
+            .iter()
+            .any(|t| self.is_busy(t.id));
+        let why = if fix.tainted || sharer_busy {
             Some("another turn ran in the folder meanwhile")
         } else if !project.forge.auto_fix_ci {
             Some("automatic fixes were turned off")
@@ -756,8 +764,12 @@ fn code_line(cwd: &std::path::Path, path: &str, line: u32) -> Option<String> {
     if path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
         return None;
     }
-    let full = cwd.join(rel);
-    let meta = std::fs::symlink_metadata(&full).ok()?;
+    // No symlink anywhere on the way may lead out of the folder.
+    let full = cwd.join(rel).canonicalize().ok()?;
+    if !full.starts_with(cwd.canonicalize().ok()?) {
+        return None;
+    }
+    let meta = std::fs::metadata(&full).ok()?;
     if !meta.is_file() || meta.len() > 1024 * 1024 {
         return None;
     }

@@ -296,6 +296,47 @@ pub struct PrDetail {
     /// here: read-only, or not the thread's own branch).
     #[serde(default)]
     pub auto_fix: Option<AutoFixInfo>,
+    /// GitHub's node id of the pull request (for auto-merge).
+    #[serde(default)]
+    pub node_id: String,
+    /// Auto-merge is enabled on GitHub.
+    #[serde(default)]
+    pub auto_merge: bool,
+    /// The merge methods the repository allows (empty: not known).
+    #[serde(default)]
+    pub merge_methods: Vec<MergeMethod>,
+    /// The method chosen last time for this repository.
+    #[serde(default)]
+    pub merge_method: Option<MergeMethod>,
+    /// GitHub deletes the head branch itself after a merge.
+    #[serde(default)]
+    pub delete_branch_on_merge: bool,
+}
+
+/// How GitHub merges a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub const ALL: [Self; 3] = [Self::Merge, Self::Squash, Self::Rebase];
+
+    /// The name GitHub's REST API uses (`merge_method`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == text)
+    }
 }
 
 /// Where automatic CI fixes of a pull request stand.
@@ -459,6 +500,9 @@ pub struct ForgeSettings {
     /// Failing check runs in a row after which Blongo stops sending fixes
     /// and says so (the run that reaches it gets no fix).
     pub auto_fix_max: u32,
+    /// Archive the thread when its pull request is merged (else Blongo
+    /// suggests it).
+    pub archive_on_merge: bool,
 }
 
 pub const DEFAULT_BRANCH_PREFIX: &str = "blongo/";
@@ -470,6 +514,7 @@ impl Default for ForgeSettings {
             branch_prefix: DEFAULT_BRANCH_PREFIX.into(),
             auto_fix_ci: true,
             auto_fix_max: 3,
+            archive_on_merge: false,
         }
     }
 }

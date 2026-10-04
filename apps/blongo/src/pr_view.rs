@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use blongo_client::Backend;
 use blongo_protocol::workspace::{Query, QueryReply};
-use blongo_protocol::{CheckState, PrDetail, PrState, PrStatus, ReviewState, ThreadId};
+use blongo_protocol::{
+    CheckState, MergeMethod, PrDetail, PrState, PrStatus, ReviewState, ThreadId,
+};
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla, SharedString, Window, div,
     prelude::*, px,
@@ -37,6 +39,15 @@ pub struct PrView {
     pushing: bool,
     /// Something is on its way to the agent (a fix, comments, a merge).
     sending: bool,
+    /// The merge method picked here (else the last one, else the first
+    /// allowed).
+    merge_method: Option<MergeMethod>,
+    /// The user pressed Merge despite the blockers: ask once more.
+    confirm_merge: bool,
+    /// A merge or archive request is on its way.
+    merging: bool,
+    /// Delete the branch on GitHub when archiving.
+    delete_remote: bool,
     /// Title, body and whether the body was cut, as the form opened with
     /// them: only what the user changed is sent (a poll may reload the
     /// detail meanwhile).
@@ -79,6 +90,10 @@ impl PrView {
             saving: false,
             pushing: false,
             sending: false,
+            merge_method: None,
+            confirm_merge: false,
+            merging: false,
+            delete_remote: false,
             edit_base: None,
             error: None,
             editing: false,
@@ -242,6 +257,75 @@ impl PrView {
         );
     }
 
+    /// Merge on GitHub (or turn auto-merge on) at the head shown here.
+    fn merge(&mut self, method: MergeMethod, auto: bool, cx: &mut Context<Self>) {
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        if self.merging {
+            return;
+        }
+        if !auto && !self.confirm_merge && !detail.blockers().is_empty() {
+            self.confirm_merge = true;
+            cx.notify();
+            return;
+        }
+        let sha = detail.status.head_sha.clone();
+        self.merging = true;
+        self.confirm_merge = false;
+        self.message = None;
+        cx.notify();
+        crate::query::ask(
+            &self.backend,
+            Query::PrMerge {
+                thread_id: self.thread_id,
+                method,
+                sha,
+                auto,
+            },
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                this.merging = false;
+                match result {
+                    Ok(QueryReply::Done(text)) => this.message = Some((true, text.into())),
+                    Ok(_) => {}
+                    Err(err) => this.message = Some((false, err.into())),
+                }
+                this.reload(cx);
+                cx.notify();
+            },
+        );
+    }
+
+    /// Archive the thread of the merged pull request.
+    fn archive(&mut self, cx: &mut Context<Self>) {
+        if self.merging {
+            return;
+        }
+        self.merging = true;
+        self.message = None;
+        cx.notify();
+        crate::query::ask(
+            &self.backend,
+            Query::PrArchive {
+                thread_id: self.thread_id,
+                delete_remote: self.delete_remote,
+            },
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                this.merging = false;
+                match result {
+                    Ok(QueryReply::Done(text)) => this.message = Some((true, text.into())),
+                    Ok(_) => {}
+                    Err(err) => this.message = Some((false, err.into())),
+                }
+                cx.notify();
+            },
+        );
+    }
+
     /// Push the local commits (never forced).
     fn push(&mut self, cx: &mut Context<Self>) {
         if self.pushing {
@@ -268,6 +352,166 @@ impl PrView {
                 cx.notify();
             },
         );
+    }
+}
+
+impl PrView {
+    /// Merge (method, Merge, auto-merge) for an open pull request; Archive
+    /// for a merged one.
+    fn merge_controls(
+        &self,
+        detail: &PrDetail,
+        ready: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        if detail.link.as_ref().is_none_or(|l| l.read_only) {
+            return None;
+        }
+        let row = || div().mt_1().flex().items_center().gap_2().text_xs();
+        match detail.status.state {
+            PrState::Open => {
+                let methods: Vec<MergeMethod> = if detail.merge_methods.is_empty() {
+                    MergeMethod::ALL.to_vec()
+                } else {
+                    detail.merge_methods.clone()
+                };
+                let chosen = self
+                    .merge_method
+                    .or(detail.merge_method)
+                    .filter(|m| methods.contains(m))
+                    .unwrap_or(methods[0]);
+                let mut r = row().child(div().text_color(theme::text_muted()).child("Merge by"));
+                for m in methods {
+                    let label = match m {
+                        MergeMethod::Merge => "Merge commit",
+                        MergeMethod::Squash => "Squash",
+                        MergeMethod::Rebase => "Rebase",
+                    };
+                    r = r.child(
+                        div()
+                            .id(SharedString::from(format!("pr-method-{}", m.as_str())))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if m == chosen {
+                                theme::accent_bg()
+                            } else {
+                                theme::surface_hover()
+                            })
+                            .text_color(if m == chosen {
+                                theme::text()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.merge_method = Some(m);
+                                cx.notify();
+                            })),
+                    );
+                }
+                r = r.child(button(
+                    "pr-merge".into(),
+                    if self.merging {
+                        "Merging…"
+                    } else if self.confirm_merge {
+                        "Merge anyway"
+                    } else {
+                        "Merge"
+                    },
+                    if ready {
+                        theme::accent_bg()
+                    } else {
+                        theme::surface_hover()
+                    },
+                    theme::text(),
+                    cx.listener(move |this, _, _, cx| this.merge(chosen, false, cx)),
+                ));
+                if self.confirm_merge {
+                    r = r
+                        .child(
+                            div()
+                                .text_color(theme::warning())
+                                .child("Not ready (see above). Merge anyway?"),
+                        )
+                        .child(
+                            div()
+                                .id("pr-merge-cancel")
+                                .text_color(theme::accent())
+                                .cursor_pointer()
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_merge = false;
+                                    cx.notify();
+                                })),
+                        );
+                } else if detail.auto_merge {
+                    r = r.child(
+                        div()
+                            .text_color(theme::text_faint())
+                            .child("Auto-merge is on: GitHub merges it when it is ready."),
+                    );
+                } else if !ready {
+                    r = r.child(button(
+                        "pr-auto-merge".into(),
+                        "Merge when ready",
+                        theme::surface_hover(),
+                        theme::text(),
+                        cx.listener(move |this, _, _, cx| this.merge(chosen, true, cx)),
+                    ));
+                }
+                Some(r)
+            }
+            PrState::Merged => {
+                let delete = self.delete_remote;
+                let mut r = row().child(
+                    div()
+                        .text_color(theme::success())
+                        .child("Archive the thread when you are done:"),
+                );
+                if !detail.delete_branch_on_merge {
+                    r = r.child(
+                        div()
+                            .id("pr-delete-remote")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .when(delete, |d| d.bg(theme::accent()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(if delete { "✓" } else { "" }),
+                            )
+                            .child("Also delete the branch on GitHub")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.delete_remote = !this.delete_remote;
+                                cx.notify();
+                            })),
+                    );
+                }
+                Some(r.child(button(
+                    "pr-archive".into(),
+                    if self.merging {
+                        "Archiving…"
+                    } else {
+                        "Archive thread"
+                    },
+                    theme::accent_bg(),
+                    theme::text(),
+                    cx.listener(|this, _, _, cx| this.archive(cx)),
+                )))
+            }
+            PrState::Draft | PrState::Closed => None,
+        }
     }
 }
 
@@ -524,8 +768,13 @@ impl Render for PrView {
         }
 
         // Merge readiness.
-        let blockers = detail.blockers();
-        let ready = blockers.is_empty();
+        let finished = status.state.is_final();
+        let blockers = if finished {
+            Vec::new()
+        } else {
+            detail.blockers()
+        };
+        let ready = blockers.is_empty() && !finished;
         let mut merge = div()
             .mt_3()
             .p_3()
@@ -547,10 +796,11 @@ impl Render for PrView {
                     } else {
                         theme::text()
                     })
-                    .child(if ready {
-                        "Ready to merge"
-                    } else {
-                        "Not ready to merge"
+                    .child(match status.state {
+                        PrState::Merged => "Merged",
+                        PrState::Closed => "Closed",
+                        _ if ready => "Ready to merge",
+                        _ => "Not ready to merge",
                     }),
             );
         for reason in blockers {
@@ -621,6 +871,7 @@ impl Render for PrView {
                     ))
                 }),
         );
+        merge = merge.children(self.merge_controls(detail, ready, cx));
         root = root.child(merge);
         // What the last action did, where the buttons are.
         if let Some((ok, text)) = &self.message {

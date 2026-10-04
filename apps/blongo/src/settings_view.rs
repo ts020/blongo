@@ -949,6 +949,34 @@ impl Render for SettingsView {
                                 ))
                             })),
                     )
+                    .child(
+                        row()
+                            .child(label("After a merge"))
+                            .child(
+                                choice(
+                                    "forge-archive-ask".into(),
+                                    "Suggest archiving",
+                                    !f.archive_on_merge,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.archive_on_merge = false)
+                                    },
+                                )),
+                            )
+                            .child(
+                                choice(
+                                    "forge-archive-auto".into(),
+                                    "Archive the thread",
+                                    f.archive_on_merge,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.archive_on_merge = true)
+                                    },
+                                )),
+                            ),
+                    )
                     .child(div().text_xs().text_color(theme::text_faint()).child(
                         "New worktrees start from the base branch as GitHub has it, and pull \
                          requests target it. When GitHub cannot be asked, the last known default \
@@ -956,7 +984,9 @@ impl Render for SettingsView {
                          prefix; an empty base field means GitHub's default. When the checks of \
                          a pull request fail, what CI said goes to the thread's agent and Blongo \
                          commits and pushes its fix (never forced), until the checks pass or \
-                         fail that many times in a row.",
+                         fail that many times in a row. Archiving removes the worktree when \
+                         nothing in it would be lost, and the branch when it is exactly what was \
+                         merged.",
                     ));
             }
         }

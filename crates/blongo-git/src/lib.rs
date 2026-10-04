@@ -421,6 +421,32 @@ pub async fn owned_worktree_top(repo: &Path, path: &Path, root: &Path) -> anyhow
     Ok(top)
 }
 
+/// Delete the local branch `branch` of `repo`, only while it points at
+/// `sha` (a merged pull request's head: nothing on it is lost). `git
+/// branch -D` itself refuses a branch checked out in any worktree.
+/// `Ok(false)`: it was kept (moved on, or gone already).
+pub async fn delete_merged_branch(repo: &Path, branch: &str, sha: &str) -> anyhow::Result<bool> {
+    if branch.is_empty() || branch.starts_with('-') || sha.is_empty() {
+        bail!("not a branch name");
+    }
+    let tip = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    if tip != sha {
+        return Ok(false);
+    }
+    git(repo, &["branch", "-D", "--", branch]).await?;
+    Ok(true)
+}
+
 /// Remove a worktree created by [`add_worktree`] (its branch stays), after
 /// [`owned_worktree_top`] confirmed it is one of ours under `root`.
 pub async fn remove_worktree(repo: &Path, path: &Path, root: &Path) -> anyhow::Result<()> {

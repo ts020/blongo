@@ -133,6 +133,24 @@ pub enum Query {
     PrMergeBase {
         thread_id: ThreadId,
     },
+    /// Merge the linked pull request on GitHub with `method`, only if its
+    /// head is still `sha` (what the user saw). `auto`: enable auto-merge
+    /// instead (GitHub merges once the requirements pass).
+    PrMerge {
+        thread_id: ThreadId,
+        method: crate::forge::MergeMethod,
+        sha: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// Archive the thread of a merged pull request; with `delete_remote`,
+    /// first delete its branch on GitHub (only if it is still at the
+    /// merged commit).
+    PrArchive {
+        thread_id: ThreadId,
+        #[serde(default)]
+        delete_remote: bool,
+    },
 }
 
 impl Query {
@@ -156,7 +174,9 @@ impl Query {
             | Self::PrPush { thread_id }
             | Self::PrFix { thread_id }
             | Self::PrComments { thread_id, .. }
-            | Self::PrMergeBase { thread_id } => *thread_id,
+            | Self::PrMergeBase { thread_id }
+            | Self::PrMerge { thread_id, .. }
+            | Self::PrArchive { thread_id, .. } => *thread_id,
         }
     }
 

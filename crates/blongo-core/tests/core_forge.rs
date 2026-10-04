@@ -1733,3 +1733,197 @@ async fn a_fix_waits_out_a_running_turn_unpushed() {
     );
     core.shutdown();
 }
+
+/// Wait until `f` holds (a job finishing in the background).
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn merging_then_archiving_cleans_up() {
+    let dir = temp_dir("forge-merge");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    gh.pull(json!({"number": 1, "head_sha": head})).await;
+    let _ = core.refresh(thread.id).await;
+
+    // The PR tab offers what the repository allows.
+    let d = detail(&mut core, thread.id).await;
+    assert_eq!(
+        d.merge_methods,
+        vec![
+            blongo_protocol::MergeMethod::Merge,
+            blongo_protocol::MergeMethod::Squash
+        ]
+    );
+    assert_eq!((d.merge_method, d.auto_merge), (None, false));
+    assert_eq!(d.node_id, "PR_1");
+    let merge = |method, sha: &str, auto| Query::PrMerge {
+        thread_id: thread.id,
+        method,
+        sha: sha.to_owned(),
+        auto,
+    };
+    use blongo_protocol::MergeMethod::{Rebase, Squash};
+    let err = core.query(merge(Rebase, &head, false)).await.unwrap_err();
+    assert_eq!(err, "the repository does not allow rebase merges");
+    // A head the user did not see is refused by GitHub.
+    let err = core
+        .query(merge(Squash, &"0".repeat(40), false))
+        .await
+        .unwrap_err();
+    assert!(err.contains("changed since you looked"), "{err}");
+    // Auto-merge.
+    let reply = core.query(merge(Squash, &head, true)).await.unwrap();
+    assert!(
+        matches!(&reply, QueryReply::Done(t) if t.starts_with("Auto-merge is on for acme/widgets#1")),
+        "{reply:?}"
+    );
+    assert!(detail(&mut core, thread.id).await.auto_merge);
+    // Merge now: the method is remembered, the merge is noticed and the
+    // thread suggests archiving.
+    assert_eq!(
+        core.query(merge(Squash, &head, false)).await,
+        Ok(QueryReply::Done("acme/widgets#1 merged".into()))
+    );
+    let put = gh
+        .log()
+        .await
+        .into_iter()
+        .rfind(|r| r["method"] == "PUT")
+        .unwrap();
+    assert_eq!(put["path"], "/repos/acme/widgets/pulls/1/merge");
+    assert_eq!(put["body"], json!({"merge_method": "squash", "sha": head}));
+    core.added_item(|i| notice(i, "acme/widgets#1 was merged. Archive the thread"))
+        .await;
+    assert_eq!(
+        detail(&mut core, thread.id).await.merge_method,
+        Some(Squash)
+    );
+    let err = core.query(merge(Squash, &head, false)).await.unwrap_err();
+    assert_eq!(err, "it is merged already");
+
+    // Archive, deleting the branch on GitHub: the worktree and the local
+    // branch go too.
+    assert_eq!(
+        core.query(Query::PrArchive {
+            thread_id: thread.id,
+            delete_remote: true,
+        })
+        .await,
+        Ok(QueryReply::Done("Archived".into()))
+    );
+    assert!(gh.log().await.iter().any(|r| r["method"] == "DELETE"
+        && r["path"] == "/repos/acme/widgets/git/refs/heads/blongo/fix-ci"));
+    let main = dir.join("project");
+    eventually("the worktree removed", || !worktree.exists()).await;
+    eventually("the local branch deleted", || {
+        git(&main, &["branch", "--list", "blongo/fix-ci"]).is_empty()
+    })
+    .await;
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_merged_thread_archives_itself_when_asked() {
+    let dir = temp_dir("forge-merge-auto");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let c = core.dispatch(Command::ProjectSetForge {
+        project_id: project,
+        settings: blongo_protocol::ForgeSettings {
+            archive_on_merge: true,
+            ..Default::default()
+        },
+    });
+    core.ok(&c).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    gh.pull(json!({"number": 1, "head_sha": head})).await;
+    let _ = core.refresh(thread.id).await;
+    // Someone else pushes to the branch on GitHub, then it is merged
+    // there: the thread is archived, but the moved branch is kept on
+    // GitHub when asked to delete it.
+    gh.pull(json!({"number": 1, "merged": true, "state": "closed"}))
+        .await;
+    core.handle().client().query(
+        1 << 41,
+        Query::PrRefresh {
+            thread_id: thread.id,
+        },
+    );
+    let said = core
+        .until(|e| match e {
+            CoreEvent::Notice { message } => Some(message.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        said,
+        "acme/widgets#1 was merged, so \"Fix CI\" was archived."
+    );
+    core.until(|e| match e {
+        CoreEvent::Event(ev) => matches!(
+            ev.kind,
+            blongo_protocol::EventKind::ThreadArchived { thread_id } if thread_id == thread.id
+        )
+        .then_some(()),
+        _ => None,
+    })
+    .await;
+    eventually("the worktree removed", || !worktree.exists()).await;
+    // The local branch was exactly the merged commit: deleted.
+    let main = dir.join("project");
+    eventually("the local branch deleted", || {
+        git(&main, &["branch", "--list", "blongo/fix-ci"]).is_empty()
+    })
+    .await;
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_branch_with_new_commits_is_not_deleted() {
+    let dir = temp_dir("forge-merge-moved");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    // Merged at an older commit than the branch on GitHub now has.
+    gh.pull(json!({"number": 1, "head_sha": "e".repeat(40), "merged": true, "state": "closed"}))
+        .await;
+    let _ = core.refresh(thread.id).await;
+    let err = core
+        .query(Query::PrArchive {
+            thread_id: thread.id,
+            delete_remote: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("commits that were not merged"), "{err}");
+    assert!(!gh.log().await.iter().any(|r| r["method"] == "DELETE"));
+    // Archived without deleting: the local branch (not the merged
+    // commit) stays.
+    assert_eq!(
+        core.query(Query::PrArchive {
+            thread_id: thread.id,
+            delete_remote: false,
+        })
+        .await,
+        Ok(QueryReply::Done("Archived".into()))
+    );
+    eventually("the worktree removed", || !worktree.exists()).await;
+    let main = dir.join("project");
+    assert_eq!(git(&main, &["rev-parse", "blongo/fix-ci"]), head);
+    core.shutdown();
+}

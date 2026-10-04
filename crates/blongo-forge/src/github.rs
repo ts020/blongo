@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 
 use blongo_protocol::{
-    CheckDetail, CheckState, ChecksState, ChecksSummary, MergeState, Mergeable, PrDetail, PrState,
-    PrStatus, ReviewComment, ReviewDecision, ReviewDetail, ReviewState, ReviewThread,
+    CheckDetail, CheckState, ChecksState, ChecksSummary, MergeMethod, MergeState, Mergeable,
+    PrDetail, PrState, PrStatus, ReviewComment, ReviewDecision, ReviewDetail, ReviewState,
+    ReviewThread,
 };
 use serde_json::{Value, json};
 
@@ -268,6 +269,90 @@ impl GitHub {
         Ok(())
     }
 
+    /// `PUT /repos/{owner}/{name}/pulls/{number}/merge` with `method`,
+    /// only while the head is `sha` (GitHub refuses otherwise).
+    pub async fn merge_pull(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+        sha: &str,
+    ) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{}/pulls/{number}/merge",
+            self.api,
+            repo.full_name()
+        );
+        let body = json!({ "merge_method": method.as_str(), "sha": sha });
+        let resp = http::send(self.request(Request::json("PUT", url, &body)))
+            .await
+            .map_err(GhError::Other)?;
+        if resp.ok() {
+            return Ok(());
+        }
+        let message = || {
+            serde_json::from_slice::<Value>(&resp.body)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(short))
+                .unwrap_or_default()
+        };
+        Err(match resp.status {
+            405 => GhError::Other(format!("GitHub cannot merge it now: {}", message())),
+            409 => GhError::Other(
+                "the pull request changed since you looked (new commits); check it again".into(),
+            ),
+            status => classify(status, &unprocessable(&resp.text())),
+        })
+    }
+
+    /// Enable auto-merge on the pull request with node id `node_id`
+    /// (GitHub merges with `method` once its requirements pass), only
+    /// while the head is `sha`.
+    pub async fn enable_auto_merge(
+        &self,
+        node_id: &str,
+        method: MergeMethod,
+        sha: &str,
+    ) -> Result<(), GhError> {
+        if !node_id_ok(node_id) || sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(GhError::Other("GitHub: bad pull request id".into()));
+        }
+        let method = method.as_str().to_ascii_uppercase();
+        let query = format!(
+            "mutation{{enablePullRequestAutoMerge(input:{{pullRequestId:\"{node_id}\",\
+             mergeMethod:{method},expectedHeadOid:\"{sha}\"}}){{clientMutationId}}}}"
+        );
+        let v = self.graphql(&query).await?;
+        if v["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+            return Err(graphql_error(&v));
+        }
+        Ok(())
+    }
+
+    /// `DELETE /repos/{owner}/{name}/git/refs/heads/{branch}`; a branch
+    /// already gone is fine.
+    pub async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), GhError> {
+        let path: Vec<String> = branch.split('/').map(encode).collect();
+        let url = format!(
+            "{}/repos/{}/git/refs/heads/{}",
+            self.api,
+            repo.full_name(),
+            path.join("/")
+        );
+        let req = Request {
+            method: "DELETE",
+            url,
+            ..Request::default()
+        };
+        let resp = http::send(self.request(req))
+            .await
+            .map_err(GhError::Other)?;
+        if resp.ok() || resp.status == 422 && resp.text().contains("Reference does not exist") {
+            return Ok(());
+        }
+        Err(classify(resp.status, &resp.text()))
+    }
+
     /// `POST /repos/{owner}/{name}/pulls` from `head` (a branch of the
     /// repository itself) into `base`. `Ok(None)`: GitHub says one is open
     /// for `head` already.
@@ -432,7 +517,8 @@ impl GitHub {
 
 /// Fetched for the PR tab: the status fields plus names, links and times
 /// of checks, latest reviews and review threads with their comments.
-const DETAIL_FIELDS: &str = "number title body url state isDraft author{login} headRefOid \
+const DETAIL_FIELDS: &str = "id number title body url state isDraft author{login} headRefOid \
+autoMergeRequest{enabledAt} \
 mergeable mergeStateStatus reviewDecision additions deletions changedFiles viewerCanUpdate \
 commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount nodes{__typename \
 ... on CheckRun{name status conclusion detailsUrl startedAt completedAt \
@@ -549,7 +635,25 @@ fn parse_detail(v: &Value) -> Result<PrDetail, GhError> {
         behind: None,
         uncommitted: 0,
         auto_fix: None,
+        node_id: p["id"]
+            .as_str()
+            .filter(|id| node_id_ok(id))
+            .unwrap_or("")
+            .to_owned(),
+        auto_merge: p["autoMergeRequest"].is_object(),
+        merge_methods: Vec::new(),
+        merge_method: None,
+        delete_branch_on_merge: false,
     })
+}
+
+/// A GraphQL node id safe to put inside a query string.
+fn node_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'='))
 }
 
 fn check_detail(c: &Value, now: i64) -> CheckDetail {

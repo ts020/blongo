@@ -57,6 +57,12 @@ pub(super) struct ForgeRt {
     pub seen: HashMap<ThreadId, (String, ChecksState)>,
     /// Thread notices to commit once the current commit is done.
     pub notices: Vec<(ThreadId, String)>,
+    /// The pull request state last committed per thread (a merge is
+    /// acted on when it is news).
+    pub states: HashMap<ThreadId, blongo_protocol::PrState>,
+    /// What a query answers once its command committed (default: "sent
+    /// to the agent").
+    pub answers: HashMap<QueryId, String>,
     tokens: TokenCache,
 }
 
@@ -241,7 +247,7 @@ impl Orchestrator {
         }
     }
 
-    fn cached_repo_info(&self, host: &str, repo: &str) -> Option<RepoInfo> {
+    pub(super) fn cached_repo_info(&self, host: &str, repo: &str) -> Option<RepoInfo> {
         let (json, _) = self
             .store
             .forge_cache(&format!("repo:{host}/{repo}"))
@@ -306,6 +312,7 @@ impl Orchestrator {
                 self.forge
                     .seen
                     .insert(thread.id, (status.head_sha.clone(), status.checks.state));
+                self.forge.states.insert(thread.id, status.state);
             }
             match (&thread.pr, &thread.pr_status) {
                 (Some(_), Some(status)) if status.state.is_final() => {}
@@ -346,7 +353,10 @@ impl Orchestrator {
             EventKind::ThreadPrStatus {
                 thread_id,
                 status: Some(status),
-            } => self.consider_fix(*thread_id, status),
+            } => {
+                self.consider_fix(*thread_id, status);
+                self.consider_merged(*thread_id, status);
+            }
             EventKind::ThreadArchived { thread_id } => {
                 self.forge.forget(*thread_id);
                 self.answer_pr_waiters(*thread_id, Err("the thread was archived".into()));
@@ -607,6 +617,7 @@ impl Orchestrator {
                 Query::PrDetail { .. } => PrOp::Detail {
                     cwd,
                     auto_fix: self.auto_fix_info(thread),
+                    merge: self.merge_facts(&link),
                 },
                 Query::PrEdit { title, body, .. } => {
                     if link.read_only {
@@ -1174,6 +1185,9 @@ enum PrOp {
     Detail {
         cwd: PathBuf,
         auto_fix: Option<blongo_protocol::AutoFixInfo>,
+        /// The repository's merge settings as known, and the method
+        /// chosen last time.
+        merge: (Option<RepoInfo>, Option<blongo_protocol::MergeMethod>),
     },
     Edit {
         title: Option<String>,
@@ -1239,7 +1253,11 @@ async fn run_pr_op(
             done.result = push(&cwd, &branch).await.map(QueryReply::Done);
             done.changed = done.result.is_ok();
         }
-        PrOp::Detail { cwd, auto_fix } => {
+        PrOp::Detail {
+            cwd,
+            auto_fix,
+            merge: (info, last),
+        } => {
             let Some(link) = link else {
                 done.result = Err("no pull request is linked".into());
                 return done;
@@ -1263,6 +1281,19 @@ async fn run_pr_op(
                     detail.uncommitted = remote::uncommitted(&cwd).await;
                     detail.link = Some(link.clone());
                     detail.auto_fix = auto_fix;
+                    // Which merge methods to offer: asked once, then cached.
+                    let info = match info {
+                        Some(info) => Some(info),
+                        None => match gh.repo_info(&repo).await {
+                            Ok(info) => {
+                                done.info =
+                                    Some((link.host.clone(), link.repo.clone(), info.clone()));
+                                Some(info)
+                            }
+                            Err(_) => None,
+                        },
+                    };
+                    super::merge::fill_merge_facts(&mut detail, info.as_ref(), last);
                     done.status = Some(detail.status.clone());
                     Ok(QueryReply::PrDetail(Box::new(detail)))
                 }
@@ -1297,7 +1328,7 @@ async fn run_pr_op(
     done
 }
 
-async fn client_for(ctx: &ForgeCtx, link: &PrLink) -> Result<(GitHub, RepoRef), String> {
+pub(super) async fn client_for(ctx: &ForgeCtx, link: &PrLink) -> Result<(GitHub, RepoRef), String> {
     let repo = RepoRef::parse(&format!("https://{}/{}", link.host, link.repo))
         .ok_or("not a GitHub repository")?;
     let token = ctx.token(&repo.host).await?;

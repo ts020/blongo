@@ -32,6 +32,7 @@ use crate::{
 
 mod autofix;
 mod forge;
+mod merge;
 mod tools;
 
 /// Default title of a new thread; replaced by the first message.
@@ -242,6 +243,7 @@ enum JobDone {
     /// A PR tab query ended.
     ForgeQuery(Box<forge::QueryDone>),
     ForgeFix(Box<autofix::FixDone>),
+    ForgeMerge(Box<merge::MergeDone>),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -840,6 +842,7 @@ impl Orchestrator {
             JobDone::Forge(done) => self.forge_done(*done),
             JobDone::ForgeQuery(done) => self.forge_query_done(*done),
             JobDone::ForgeFix(done) => self.fix_done(*done),
+            JobDone::ForgeMerge(done) => self.merge_done(*done),
         }
     }
 
@@ -860,6 +863,7 @@ impl Orchestrator {
             Reply::Fix(run_id) => self.fix_refused(run_id, &reason),
             Reply::Query(id) => {
                 self.forge.drafts.retain(|_, q| *q != id);
+                self.forge.answers.remove(&id);
                 self.emit(CoreEvent::Reply {
                     id,
                     result: Err(reason),
@@ -879,9 +883,14 @@ impl Orchestrator {
         if let Reply::Query(id) = reply {
             // A draft answers when its turn ends; a fix now.
             if !self.forge.drafts.values().any(|q| *q == id) {
+                let text = self
+                    .forge
+                    .answers
+                    .remove(&id)
+                    .unwrap_or_else(|| "sent to the agent".into());
                 self.emit(CoreEvent::Reply {
                     id,
-                    result: Ok(QueryReply::Done("sent to the agent".into())),
+                    result: Ok(QueryReply::Done(text)),
                 });
             }
             return;
@@ -1206,6 +1215,24 @@ async fn clean_up(
                 thread.title, worktree.path
             ),
         });
+        return;
+    }
+    // The branch of a merged pull request goes too, when it is exactly
+    // what was merged.
+    if let (Some(link), Some(status)) = (&thread.pr, &thread.pr_status)
+        && status.state == blongo_protocol::PrState::Merged
+        && !link.read_only
+        && link.head_branch == worktree.branch
+        && thread.parent_thread_id.is_none()
+        && thread.forked_from.is_none()
+        && let Err(err) = blongo_git::delete_merged_branch(
+            Path::new(&project.path),
+            &worktree.branch,
+            &status.head_sha,
+        )
+        .await
+    {
+        eprintln!("blongo-core: kept branch {}: {err:#}", worktree.branch);
     }
 }
 

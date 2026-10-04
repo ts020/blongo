@@ -83,6 +83,22 @@ impl Orchestrator {
         if let Query::PrComments { thread_id, threads } = query {
             return self.pr_comments(id, thread_id, threads);
         }
+        if let Query::PrMerge {
+            thread_id,
+            method,
+            sha,
+            auto,
+        } = query
+        {
+            return self.pr_merge(id, thread_id, method, sha, auto);
+        }
+        if let Query::PrArchive {
+            thread_id,
+            delete_remote,
+        } = query
+        {
+            return self.pr_archive(id, thread_id, delete_remote);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -180,7 +196,9 @@ impl Orchestrator {
             | Query::PrPush { .. }
             | Query::PrFix { .. }
             | Query::PrComments { .. }
-            | Query::PrMergeBase { .. } => {
+            | Query::PrMergeBase { .. }
+            | Query::PrMerge { .. }
+            | Query::PrArchive { .. } => {
                 return Err("not a workspace query".into());
             }
         };
