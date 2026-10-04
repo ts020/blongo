@@ -137,7 +137,9 @@ async fn restore_of_an_empty_checkpoint_removes_everything_unignored() {
 async fn worktree_add_and_remove() {
     let repo = Repo::new("worktree", true).await;
     let path = repo.0.with_extension("wt");
-    add_worktree(&repo.0, &path, "blongo/test").await.unwrap();
+    add_worktree(&repo.0, &path, "blongo/test", None)
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(path.join("a.txt")).unwrap(),
         "one\n"
@@ -154,7 +156,7 @@ async fn worktree_add_and_remove() {
     );
     // A second worktree on the same branch is refused by git.
     assert!(
-        add_worktree(&repo.0, &repo.0.with_extension("wt2"), "blongo/test")
+        add_worktree(&repo.0, &repo.0.with_extension("wt2"), "blongo/test", None)
             .await
             .is_err()
     );
@@ -163,7 +165,7 @@ async fn worktree_add_and_remove() {
         .unwrap();
     assert!(!path.exists());
     let empty = Repo::new("worktree-empty", false).await;
-    let err = add_worktree(&empty.0, &empty.0.with_extension("wt"), "b")
+    let err = add_worktree(&empty.0, &empty.0.with_extension("wt"), "b", None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no commits"), "{err}");
@@ -249,7 +251,7 @@ async fn capture_leaves_the_users_index_file_alone() {
 async fn worktrees_with_ignored_files_are_kept() {
     let repo = Repo::new("wt-ignored", true).await;
     let path = repo.0.with_extension("wt");
-    add_worktree(&repo.0, &path, "blongo/ignored")
+    add_worktree(&repo.0, &path, "blongo/ignored", None)
         .await
         .unwrap();
     std::fs::create_dir_all(path.join("target")).unwrap();
@@ -302,7 +304,9 @@ async fn user_status_settings_cannot_hide_files_from_the_worktree_check() {
         .await
         .unwrap();
     let path = repo.0.with_extension("wt");
-    add_worktree(&repo.0, &path, "blongo/config").await.unwrap();
+    add_worktree(&repo.0, &path, "blongo/config", None)
+        .await
+        .unwrap();
     std::fs::write(path.join("notes.txt"), "mine\n").unwrap();
     // Hidden from a plain status by the user's setting...
     assert_eq!(
@@ -358,7 +362,7 @@ async fn ignored_submodule_changes_keep_the_worktree() {
         .await
         .unwrap();
     let path = repo.0.with_extension("wt");
-    add_worktree(&repo.0, &path, "blongo/submodule")
+    add_worktree(&repo.0, &path, "blongo/submodule", None)
         .await
         .unwrap();
     git(
@@ -393,7 +397,9 @@ async fn only_our_linked_worktrees_can_be_removed() {
     let other = Repo::new("wt-guard-other", true).await;
     let root = repo.0.with_extension("wts");
     let path = root.join("thread");
-    add_worktree(&repo.0, &path, "blongo/guard").await.unwrap();
+    add_worktree(&repo.0, &path, "blongo/guard", None)
+        .await
+        .unwrap();
     // The main checkout, even when it sits inside the root.
     let err = remove_worktree(&repo.0, &repo.0, repo.0.parent().unwrap())
         .await
@@ -415,7 +421,7 @@ async fn only_our_linked_worktrees_can_be_removed() {
     assert!(format!("{err:#}").contains("not inside"), "{err:#}");
     // Another repository's worktree under the root.
     let foreign = root.join("foreign");
-    add_worktree(&other.0, &foreign, "blongo/foreign")
+    add_worktree(&other.0, &foreign, "blongo/foreign", None)
         .await
         .unwrap();
     let err = remove_worktree(&repo.0, &foreign, &root).await.unwrap_err();

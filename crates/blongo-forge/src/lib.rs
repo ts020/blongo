@@ -7,6 +7,9 @@
 //!   thread's pull request: which repository a project pushes to, a token
 //!   for its host (`forge.json`, else the GitHub CLI's), and the GitHub
 //!   API calls themselves.
+//! - [`branch`], [`pr`]: creating a pull request: git work on the
+//!   thread's branch, the prompt asking the agent for a draft and reading
+//!   its answer.
 //! - [`fs`]: owner-only files and folders.
 
 // The PR detail test builds a deeply nested JSON literal.
@@ -15,10 +18,12 @@
 use std::path::PathBuf;
 
 pub mod auth;
+pub mod branch;
 pub mod forge;
 pub mod fs;
 pub mod github;
 pub mod http;
+pub mod pr;
 pub mod remote;
 
 /// Blongo's configuration folder: `BLONGO_CONFIG_DIR`, else the platform

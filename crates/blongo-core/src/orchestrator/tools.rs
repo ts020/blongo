@@ -68,8 +68,14 @@ impl Orchestrator {
         if let Query::PrRefresh { thread_id } = query {
             return self.pr_refresh(id, thread_id);
         }
-        if matches!(query, Query::PrDetail { .. } | Query::PrEdit { .. }) {
+        if matches!(
+            query,
+            Query::PrDetail { .. } | Query::PrEdit { .. } | Query::PrPrepare { .. }
+        ) {
             return self.pr_query(id, query);
+        }
+        if let Query::PrDraft { thread_id, prompt } = query {
+            return self.pr_draft(id, thread_id, prompt);
         }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
@@ -159,7 +165,13 @@ impl Orchestrator {
                     message: message.clone(),
                 }
             }
-            Query::PrRefresh { .. } | Query::PrDetail { .. } | Query::PrEdit { .. } => {
+            Query::PrRefresh { .. }
+            | Query::PrDetail { .. }
+            | Query::PrEdit { .. }
+            | Query::PrPrepare { .. }
+            | Query::PrDraft { .. }
+            | Query::PrCreate { .. }
+            | Query::PrPush { .. } => {
                 return Err("not a workspace query".into());
             }
         };
@@ -170,6 +182,9 @@ impl Orchestrator {
     /// branch switch, every thread in the same folder) is idle; it holds
     /// `key` until done.
     pub(super) fn mutate(&mut self, id: QueryId, query: Query, key: Key) {
+        if matches!(query, Query::PrCreate { .. } | Query::PrPush { .. }) {
+            return self.pr_mutate(id, query, key);
+        }
         let checked = (|| {
             let thread_id = query.thread_id();
             let (thread, cwd) = self.thread_cwd(thread_id)?;

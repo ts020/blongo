@@ -443,6 +443,20 @@ impl Store {
         row.transpose()
     }
 
+    /// Every item of a run, in order.
+    pub fn run_items(&self, run_id: RunId) -> anyhow::Result<Vec<TurnItem>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, thread_id, run_id, ordinal, created_at, data, body
+             FROM turn_items WHERE run_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map([run_id.to_string()], item_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
     /// Items of a run that are still streaming or awaiting an answer.
     pub fn open_items(&self, run_id: RunId) -> anyhow::Result<Vec<TurnItem>> {
         let mut stmt = self.conn.prepare_cached(
@@ -878,6 +892,13 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
             expect_one(
                 tx.prepare_cached("UPDATE threads SET pr_status = ?2 WHERE id = ?1")?
                     .execute(params![thread_id.to_string(), opt_json(status.as_ref())?])?,
+                "thread",
+            )?;
+        }
+        EventKind::ThreadBranchRenamed { thread_id, branch } => {
+            expect_one(
+                tx.prepare_cached("UPDATE threads SET worktree_branch = ?2 WHERE id = ?1")?
+                    .execute(params![thread_id.to_string(), branch])?,
                 "thread",
             )?;
         }

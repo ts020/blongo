@@ -50,6 +50,7 @@ mod markdown;
 mod notify;
 mod palette;
 mod pr;
+mod pr_create;
 mod pr_view;
 mod query;
 mod settings;

@@ -723,3 +723,390 @@ async fn forge_settings_are_validated_and_kept() {
     assert!(!p.forge.auto_fix_ci);
     core.shutdown();
 }
+
+/// A clone of the fake remote to push commits to it as someone else.
+fn other_clone(dir: &Path) -> PathBuf {
+    let other = dir.join("other");
+    git(
+        dir,
+        &[
+            "clone",
+            "--quiet",
+            &dir.join("remote.git").to_string_lossy(),
+            &other.to_string_lossy(),
+        ],
+    );
+    git(&other, &["config", "user.name", "Other"]);
+    git(&other, &["config", "user.email", "other@localhost"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    other
+}
+
+fn commit_file(repo: &Path, name: &str, message: &str) {
+    std::fs::write(repo.join(name), format!("{message}\n")).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", message]);
+}
+
+impl TestCore {
+    async fn titled_thread(&mut self, project_id: ProjectId, title: &str) -> Thread {
+        let thread_id = ThreadId::new();
+        self.dispatch(Command::ThreadCreate {
+            thread_id,
+            project_id,
+            title: title.into(),
+            provider: ProviderKind::Codex,
+            model: None,
+            worktree: true,
+            parent_thread_id: None,
+        });
+        self.until(|e| match e {
+            CoreEvent::Event(ev) => match &ev.kind {
+                EventKind::ThreadCreated { thread } if thread.id == thread_id => {
+                    Some((**thread).clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .await
+    }
+
+    async fn prepare(&mut self, thread_id: ThreadId) -> blongo_protocol::PrPrepare {
+        match self.query(Query::PrPrepare { thread_id }).await {
+            Ok(QueryReply::PrPrepare(p)) => *p,
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn creates_a_pull_request_from_the_worktree() {
+    let dir = temp_dir("forge-create");
+    github_project(&dir);
+    // GitHub's main moves on after the project last fetched.
+    let other = other_clone(&dir);
+    commit_file(&other, "upstream.txt", "Upstream change");
+    git(&other, &["push", "--quiet", "origin", "main"]);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Fix the parser").await;
+    let wt = thread.worktree.clone().unwrap();
+    let worktree = PathBuf::from(&wt.path);
+    assert!(wt.branch.starts_with("blongo/"), "{}", wt.branch);
+    assert!(
+        worktree.join("upstream.txt").exists(),
+        "the worktree starts from GitHub's main, not the project's HEAD"
+    );
+    assert_eq!(
+        git(&worktree, &["rev-parse", "HEAD"]),
+        git(&other, &["rev-parse", "HEAD"])
+    );
+    // No upstream: pushing later goes to its own name.
+    assert!(
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "@{upstream}"])
+            .current_dir(&worktree)
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    );
+
+    std::fs::write(worktree.join("parser.rs"), "fn parse() {}\n").unwrap();
+    let prep = core.prepare(thread.id).await;
+    assert_eq!(prep.repo, "acme/widgets");
+    assert_eq!(prep.base, "main");
+    assert_eq!(prep.branch, wt.branch);
+    assert!(!prep.pushed);
+    assert_eq!(prep.suggested_branch, "blongo/fix-the-parser");
+    assert_eq!(prep.uncommitted, vec!["parser.rs".to_owned()]);
+    assert!(prep.commits.is_empty());
+    assert_eq!(prep.title, "Fix the parser");
+    assert!(prep.can_push);
+    assert!(prep.draft_prompt.contains("parser.rs"));
+
+    let mut request = blongo_protocol::PrCreateRequest {
+        title: "Fix the parser".into(),
+        body: "Parses again.".into(),
+        base: "main".into(),
+        draft: true,
+        branch: prep.suggested_branch.clone(),
+        commit_message: None,
+    };
+    let err = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request: request.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("not committed"), "{err}");
+    for (bad, want) in [("main", "same"), ("-x", "not a branch name")] {
+        let mut r = request.clone();
+        r.branch = bad.into();
+        let err = core
+            .query(Query::PrCreate {
+                thread_id: thread.id,
+                request: r,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains(want), "{bad}: {err}");
+    }
+
+    request.commit_message = Some("Fix the parser".into());
+    let id = core.send_query(Query::PrCreate {
+        thread_id: thread.id,
+        request: request.clone(),
+    });
+    let mut renamed = None;
+    let mut linked = None;
+    let reply = core
+        .until(|e| match e {
+            CoreEvent::Reply { id: got, result } if *got == id => Some(result.clone()),
+            CoreEvent::Event(ev) => {
+                match &ev.kind {
+                    EventKind::ThreadBranchRenamed { thread_id, branch }
+                        if *thread_id == thread.id =>
+                    {
+                        renamed = Some(branch.clone());
+                    }
+                    EventKind::ThreadPrLinked { thread_id, pr, .. } if *thread_id == thread.id => {
+                        linked = pr.clone();
+                    }
+                    _ => {}
+                }
+                None
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#1 created".into())));
+    assert_eq!(renamed.as_deref(), Some("blongo/fix-the-parser"));
+    let link = linked.unwrap();
+    assert_eq!(
+        (link.number, link.head_branch.as_str()),
+        (1, "blongo/fix-the-parser")
+    );
+    assert!(!link.read_only);
+    // Committed and pushed under the new name.
+    let bare = dir.join("remote.git");
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-the-parser"]),
+        git(&worktree, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&worktree, &["log", "-1", "--format=%s"]),
+        "Fix the parser"
+    );
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    let post = gh
+        .log()
+        .await
+        .into_iter()
+        .find(|r| r["method"] == "POST" && r["path"] == "/repos/acme/widgets/pulls")
+        .expect("the create request");
+    assert_eq!(post["body"]["head"], "blongo/fix-the-parser");
+    assert_eq!(post["body"]["base"], "main");
+    assert_eq!(post["body"]["draft"], true);
+    assert_eq!(post["body"]["body"], "Parses again.");
+
+    // Linked: a second create is refused.
+    let err = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request: request.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("linked already"), "{err}");
+
+    // Someone else pushes to the branch: Blongo never forces.
+    git(&other, &["fetch", "--quiet", "origin"]);
+    git(&other, &["switch", "--quiet", "blongo/fix-the-parser"]);
+    commit_file(&other, "theirs.txt", "Their change");
+    git(
+        &other,
+        &["push", "--quiet", "origin", "blongo/fix-the-parser"],
+    );
+    let theirs = git(&other, &["rev-parse", "HEAD"]);
+    commit_file(&worktree, "ours.txt", "Our change");
+    let err = core
+        .query(Query::PrPush {
+            thread_id: thread.id,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("never force-pushes"), "{err}");
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-the-parser"]),
+        theirs
+    );
+    // Brought in, it pushes.
+    git(&worktree, &["pull", "--quiet", "--no-rebase", "--no-edit"]);
+    let reply = core
+        .query(Query::PrPush {
+            thread_id: thread.id,
+        })
+        .await;
+    assert_eq!(
+        reply,
+        Ok(QueryReply::Done("pushed blongo/fix-the-parser".into()))
+    );
+    core.shutdown();
+
+    // The new branch name survives a restart.
+    let (core, shell) = start_again(&dir, &gh);
+    let t = shell.threads.iter().find(|t| t.id == thread.id).unwrap();
+    assert_eq!(
+        t.worktree.as_ref().map(|w| w.branch.as_str()),
+        Some("blongo/fix-the-parser")
+    );
+    assert_eq!(t.pr.as_ref().map(|p| p.number), Some(1));
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn an_open_pull_request_is_linked_on_retry() {
+    let dir = temp_dir("forge-retry");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Retry").await;
+    let wt = thread.worktree.clone().unwrap();
+    let worktree = PathBuf::from(&wt.path);
+    commit_file(&worktree, "a.txt", "Add a");
+    // Pushed and opened by hand already; the name stays.
+    git(&worktree, &["push", "--quiet", "origin", &wt.branch]);
+    gh.pull(json!({"number": 9, "title": "By hand", "head": wt.branch}))
+        .await;
+    let prep = core.prepare(thread.id).await;
+    assert!(prep.pushed);
+    assert_eq!(prep.suggested_branch, wt.branch);
+    assert_eq!(prep.commits, vec!["Add a".to_owned()]);
+    let mut request = blongo_protocol::PrCreateRequest {
+        title: "Retry".into(),
+        body: String::new(),
+        base: "main".into(),
+        draft: false,
+        branch: "blongo/renamed".into(),
+        commit_message: None,
+    };
+    let err = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request: request.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("keeps its name"), "{err}");
+    request.branch = wt.branch.clone();
+    let reply = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request,
+        })
+        .await;
+    assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#9 created".into())));
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn worktrees_start_from_the_project_base_branch() {
+    let dir = temp_dir("forge-base");
+    github_project(&dir);
+    let other = other_clone(&dir);
+    git(&other, &["switch", "--quiet", "-c", "develop"]);
+    commit_file(&other, "develop.txt", "On develop");
+    git(&other, &["push", "--quiet", "origin", "develop"]);
+    let (mut core, _gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let c = core.dispatch(Command::ProjectSetForge {
+        project_id: project,
+        settings: blongo_protocol::ForgeSettings {
+            base_branch: blongo_protocol::BaseBranch::Custom {
+                name: "develop".into(),
+            },
+            branch_prefix: "feature/".into(),
+            ..Default::default()
+        },
+    });
+    core.ok(&c).await;
+    let thread = core.titled_thread(project, "On develop").await;
+    let wt = thread.worktree.clone().unwrap();
+    assert!(wt.branch.starts_with("feature/"), "{}", wt.branch);
+    assert!(PathBuf::from(&wt.path).join("develop.txt").exists());
+    let prep = core.prepare(thread.id).await;
+    assert_eq!(prep.base, "develop");
+    assert_eq!(prep.suggested_branch, "feature/on-develop");
+
+    // A base the remote lacks: the project's HEAD, and the thread says so.
+    let c = core.dispatch(Command::ProjectSetForge {
+        project_id: project,
+        settings: blongo_protocol::ForgeSettings {
+            base_branch: blongo_protocol::BaseBranch::Custom {
+                name: "nope".into(),
+            },
+            ..Default::default()
+        },
+    });
+    core.ok(&c).await;
+    let thread = core.titled_thread(project, "Missing base").await;
+    let notice = core
+        .snapshot(thread.id)
+        .await
+        .items
+        .iter()
+        .find_map(|i| match &i.kind {
+            blongo_protocol::ItemKind::SystemNotice { message } => Some(message.clone()),
+            _ => None,
+        });
+    assert!(
+        notice.as_deref().is_some_and(|m| m.contains("origin/nope")),
+        "{notice:?}"
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn the_agent_drafts_the_pull_request() {
+    let dir = temp_dir("forge-draft");
+    github_project(&dir);
+    let (mut core, _gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Draft").await;
+    let reply = core
+        .query(Query::PrDraft {
+            thread_id: thread.id,
+            prompt: "echo: ```json\n{\"title\": \"Drafted title\", \"body\": \"Why\", \
+                     \"commit_message\": \"Commit it\"}\n```"
+                .into(),
+        })
+        .await;
+    assert_eq!(
+        reply,
+        Ok(QueryReply::PrDraft(blongo_protocol::PrDraft {
+            title: "Drafted title".into(),
+            body: "Why".into(),
+            commit_message: Some("Commit it".into()),
+        }))
+    );
+    let err = core
+        .query(Query::PrDraft {
+            thread_id: thread.id,
+            prompt: "echo: nothing useful".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("no draft"), "{err}");
+    let err = core
+        .query(Query::PrDraft {
+            thread_id: ThreadId::new(),
+            prompt: "hi".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(!err.is_empty());
+    core.shutdown();
+}

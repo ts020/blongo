@@ -124,6 +124,9 @@ enum Reply {
     Client,
     /// The core itself (scheduled runs): a refusal becomes a notice.
     Internal,
+    /// A query that sent a message (a pull request draft): a refusal
+    /// answers it; success is answered later.
+    Query(QueryId),
     /// An agent's MCP tool call.
     Mcp {
         tx: oneshot::Sender<Result<Value, String>>,
@@ -191,6 +194,8 @@ enum PrepPlan {
         project_path: PathBuf,
         path: PathBuf,
         branch: String,
+        /// Start from the remote's base branch (`None`: the project's HEAD).
+        base: Option<forge::BasePlan>,
     },
     Rollback {
         cwd: PathBuf,
@@ -246,6 +251,11 @@ struct Prepared {
     sharers: u32,
     /// The pull request `thread.link_pr` found.
     pr: Option<Box<forge::Found>>,
+    /// Said in a new thread (its worktree did not start where asked).
+    notice: Option<String>,
+    /// The base branch a new worktree started from (cached for when
+    /// GitHub cannot be asked).
+    base: Option<String>,
 }
 
 /// Runtime state for a thread that has (or had) an agent session or run.
@@ -590,6 +600,15 @@ impl Orchestrator {
                     t.pr_status = status.clone();
                 }
             }
+            EventKind::ThreadBranchRenamed { thread_id, branch } => {
+                if let Some(w) = self
+                    .threads
+                    .get_mut(thread_id)
+                    .and_then(|t| t.worktree.as_mut())
+                {
+                    w.branch = branch.clone();
+                }
+            }
             EventKind::ProjectForgeChanged {
                 project_id,
                 settings,
@@ -651,7 +670,7 @@ impl Orchestrator {
     fn deferred_key(&self, item: &Deferred) -> Key {
         match item {
             Deferred::Dispatch(pending) => command_key(&pending.command.command),
-            Deferred::Query(_, Query::GitSwitch { .. }) => Key::Global,
+            Deferred::Query(_, Query::GitSwitch { .. } | Query::PrCreate { .. }) => Key::Global,
             Deferred::Query(_, query) => Key::Thread(query.thread_id()),
             Deferred::Import(_) => Key::Global,
         }
@@ -831,6 +850,13 @@ impl Orchestrator {
                     message: format!("A scheduled task could not run: {reason}"),
                 });
             }
+            Reply::Query(id) => {
+                self.forge.drafts.retain(|_, q| *q != id);
+                self.emit(CoreEvent::Reply {
+                    id,
+                    result: Err(reason),
+                });
+            }
             Reply::Mcp { tx, .. } => {
                 let _ = tx.send(Err(reason));
             }
@@ -975,7 +1001,8 @@ impl Orchestrator {
                 }
                 let project_path = PathBuf::from(&project.path);
                 let id = thread_id.0.simple().to_string();
-                let branch = format!("blongo/{}", &id[id.len() - 12..]);
+                let branch = format!("{}{}", project.forge.branch_prefix, &id[id.len() - 12..]);
+                let base = self.base_plan(project);
                 let path = self
                     .config
                     .data_dir
@@ -985,6 +1012,7 @@ impl Orchestrator {
                     project_path,
                     path,
                     branch,
+                    base,
                 }))
             }
             Command::ThreadRollback {
@@ -1326,6 +1354,18 @@ impl Orchestrator {
                         .map(|(_, m)| m.clone())
                 });
                 thread.worktree = prepared.worktree;
+                if let Some(base) = &prepared.base {
+                    self.cache_base(*project_id, base);
+                }
+                let notice = prepared.notice.map(|message| TurnItem {
+                    id: ItemId::new(),
+                    thread_id: *thread_id,
+                    run_id: None,
+                    ordinal: 0,
+                    created_at: now,
+                    kind: ItemKind::SystemNotice { message },
+                    text: "".into(),
+                });
                 if let Some(parent) = parent {
                     // A delegated task works where its parent works.
                     thread.parent_thread_id = Some(parent.id);
@@ -1336,6 +1376,11 @@ impl Orchestrator {
                 batch.events.push(EventKind::ThreadCreated {
                     thread: Box::new(thread),
                 });
+                if let Some(item) = notice {
+                    batch.events.push(EventKind::ItemAdded {
+                        item: Arc::new(item),
+                    });
+                }
             }
             Command::ThreadFork {
                 source_thread_id,
@@ -3274,11 +3319,16 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
             project_path,
             path,
             branch,
+            base,
         } => {
             let root = blongo_git::work_tree_root(&project_path)
                 .await
                 .ok_or_else(|| format!("{} is not in a git repository", project_path.display()))?;
-            blongo_git::add_worktree(&root, &path, &branch)
+            let start = match base {
+                Some(plan) => forge::worktree_base(&root, plan).await,
+                None => forge::WorktreeBase::default(),
+            };
+            blongo_git::add_worktree(&root, &path, &branch, start.start.as_deref())
                 .await
                 .map_err(|e| format!("{e:#}"))?;
             // A project inside a larger repository keeps its relative place
@@ -3294,6 +3344,8 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
                     path: path.join(rel).to_string_lossy().into_owned(),
                     branch,
                 }),
+                notice: start.notice,
+                base: start.base,
                 ..Prepared::default()
             })
         }
@@ -3323,7 +3375,7 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
                 restored: Some(commit),
                 pre_rollback: Some(pre),
                 sharers,
-                pr: None,
+                ..Prepared::default()
             })
         }
         PrepPlan::LinkPr {

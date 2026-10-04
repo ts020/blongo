@@ -342,10 +342,16 @@ pub async fn delete_thread_refs(cwd: &Path, thread: &str, keep: &HashSet<String>
     delete_refs(cwd, &refs).await;
 }
 
-/// Create a worktree for `branch` at `path` from the repository at `repo`'s
-/// current HEAD.
-pub async fn add_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
-    if head(repo).await.is_none() {
+/// Create a worktree for a new `branch` at `path` from `start` (a commit
+/// or ref; `None`: the repository at `repo`'s current HEAD). The branch
+/// does not track `start`: it is pushed under its own name later.
+pub async fn add_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    start: Option<&str>,
+) -> anyhow::Result<()> {
+    if start.is_none() && head(repo).await.is_none() {
         bail!("the project has no commits yet; a worktree needs one");
     }
     if let Some(parent) = path.parent() {
@@ -355,7 +361,14 @@ pub async fn add_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Res
     git(
         repo,
         &[
-            "worktree", "add", "--quiet", "-b", branch, &path_str, "HEAD",
+            "worktree",
+            "add",
+            "--quiet",
+            "--no-track",
+            "-b",
+            branch,
+            &path_str,
+            start.unwrap_or("HEAD"),
         ],
     )
     .await?;

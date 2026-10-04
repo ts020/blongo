@@ -14,6 +14,8 @@ Supported API (only what Blongo asks):
   GET  /repos/O/N/pulls/NUM
   GET  /repos/O/N/pulls?state=all&per_page=5&head=O%3ABRANCH
   PATCH /repos/O/N/pulls/NUM   {title, body}
+  POST /repos/O/N/pulls        {title, body, head, base, draft} (422 when an
+                               open pull has that head already)
   POST /graphql   rateLimit + repository(owner,name){ pNUM: pullRequest(number:NUM){...} }
                   repository(owner,name){ pullRequest(number:NUM){...detail...} }
 
@@ -284,7 +286,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/graphql":
                 return self.graphql(body.get("query", ""))
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls", urlsplit(self.path).path)
+            if m and f"{m[1]}/{m[2]}" in REPOS:
+                return self.create_pull(f"{m[1]}/{m[2]}", body)
             self.reply(404, {"message": "Not Found"})
+
+    def create_pull(self, full, body):
+        r = REPOS[full]
+        if not r["push"]:
+            return self.reply(403, {"message": "Resource not accessible by integration"})
+        missing = [k for k in ("title", "head", "base") if not body.get(k)]
+        if missing:
+            return self.reply(422, {"message": "Validation Failed",
+                                    "errors": [{"code": "missing_field", "field": f} for f in missing]})
+        if any(p["head"] == body["head"] and p["state"] == "open" for p in r["pulls"].values()):
+            return self.reply(422, {"message": "Validation Failed", "errors": [
+                {"message": f"A pull request already exists for {full.split('/')[0]}:{body['head']}."}]})
+        number = max(r["pulls"], default=0) + 1
+        p = pull_defaults(full, number)
+        p.update({"title": body["title"], "body": body.get("body") or "", "head": body["head"],
+                  "base": body["base"], "draft": bool(body.get("draft"))})
+        r["pulls"][number] = p
+        self.reply(201, rest_pull(full, p))
 
     def do_PATCH(self):
         body = self.body()

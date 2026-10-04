@@ -93,6 +93,27 @@ pub enum Query {
         title: Option<String>,
         body: Option<String>,
     },
+    /// What the Create PR form starts from (no changes made).
+    PrPrepare {
+        thread_id: ThreadId,
+    },
+    /// Send `prompt` to the thread's agent (queued behind a running turn)
+    /// and answer with the draft it returns as JSON when the turn ends.
+    PrDraft {
+        thread_id: ThreadId,
+        prompt: String,
+    },
+    /// Commit (when asked), rename the branch (when never pushed), push
+    /// it (never forced) and open the pull request, then link it. Each
+    /// step is skipped when already done, so a failed one can be retried.
+    PrCreate {
+        thread_id: ThreadId,
+        request: crate::forge::PrCreateRequest,
+    },
+    /// Push the thread's branch (never forced).
+    PrPush {
+        thread_id: ThreadId,
+    },
 }
 
 impl Query {
@@ -109,13 +130,23 @@ impl Query {
             | Self::GitCommit { thread_id, .. }
             | Self::PrRefresh { thread_id }
             | Self::PrDetail { thread_id }
-            | Self::PrEdit { thread_id, .. } => *thread_id,
+            | Self::PrEdit { thread_id, .. }
+            | Self::PrPrepare { thread_id }
+            | Self::PrDraft { thread_id, .. }
+            | Self::PrCreate { thread_id, .. }
+            | Self::PrPush { thread_id } => *thread_id,
         }
     }
 
     /// Changes the workspace (sequenced with the thread's other work).
     pub fn is_mutation(&self) -> bool {
-        matches!(self, Self::GitSwitch { .. } | Self::GitCommit { .. })
+        matches!(
+            self,
+            Self::GitSwitch { .. }
+                | Self::GitCommit { .. }
+                | Self::PrCreate { .. }
+                | Self::PrPush { .. }
+        )
     }
 }
 
@@ -141,6 +172,8 @@ pub enum QueryReply {
     /// A mutation finished; a human-readable summary.
     Done(String),
     PrDetail(Box<crate::forge::PrDetail>),
+    PrPrepare(Box<crate::forge::PrPrepare>),
+    PrDraft(crate::forge::PrDraft),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

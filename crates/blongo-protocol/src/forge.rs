@@ -355,6 +355,63 @@ impl PrDetail {
     }
 }
 
+/// What creating a pull request starts from: the facts of the thread's
+/// branch, and a prompt asking the agent to draft the title and body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrPrepare {
+    /// `owner/name` on GitHub.
+    pub repo: String,
+    /// The thread's branch now.
+    pub branch: String,
+    /// It is on the remote already (it is not renamed any more).
+    pub pushed: bool,
+    /// A name from the thread's title with the project's prefix (the
+    /// branch itself once pushed).
+    pub suggested_branch: String,
+    /// The branch the pull request targets (project setting, else the
+    /// repository's default branch).
+    pub base: String,
+    /// Files changed and not committed (the first few hundred).
+    pub uncommitted: Vec<String>,
+    /// Subjects of the commits the base lacks, oldest first.
+    pub commits: Vec<String>,
+    /// `git diff --stat` against the base (cut when long).
+    pub diff_stat: String,
+    /// The repository's pull request template, if it has one.
+    pub template: Option<String>,
+    /// A title from the thread or its first commit.
+    pub title: String,
+    /// The text to send to the agent to draft the pull request.
+    pub draft_prompt: String,
+    /// The token may push (else the pull request cannot be created).
+    pub can_push: bool,
+}
+
+/// What the user confirmed in the Create PR form.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrCreateRequest {
+    pub title: String,
+    pub body: String,
+    pub base: String,
+    pub draft: bool,
+    /// The branch name to push (renamed first when it differs and was
+    /// never pushed).
+    pub branch: String,
+    /// Commit the uncommitted changes first with this message (`None`:
+    /// refuse when there are any).
+    pub commit_message: Option<String>,
+}
+
+/// The agent's draft of a pull request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDraft {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub commit_message: Option<String>,
+}
+
 /// Which branch new worktrees start from and pull requests target.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -400,6 +457,24 @@ impl ForgeSettings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// A branch name part from a title: lowercase ASCII letters and digits,
+/// words joined by `-`, at most 48 characters (empty: nothing usable).
+pub fn branch_slug(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    out.truncate(48);
+    out.trim_matches('-').to_owned()
 }
 
 /// Parse what a user typed to link a pull request: a URL
@@ -509,6 +584,16 @@ mod tests {
         ] {
             assert_eq!(parse_pr_ref(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn slugs_branch_names() {
+        assert_eq!(branch_slug("Fix the IME cursor!"), "fix-the-ime-cursor");
+        assert_eq!(branch_slug("  日本語 only "), "only");
+        assert_eq!(branch_slug("日本語"), "");
+        assert_eq!(branch_slug("a--b__c"), "a-b-c");
+        assert_eq!(branch_slug(&"long ".repeat(30)).len(), 48);
+        assert!(!branch_slug(&"long ".repeat(30)).ends_with('-'));
     }
 
     #[test]

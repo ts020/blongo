@@ -33,6 +33,12 @@ pub struct PrView {
     reload_again: bool,
     /// An edit is on its way to GitHub.
     saving: bool,
+    /// A push is running.
+    pushing: bool,
+    /// Title, body and whether the body was cut, as the form opened with
+    /// them: only what the user changed is sent (a poll may reload the
+    /// detail meanwhile).
+    edit_base: Option<(String, String, bool)>,
     error: Option<SharedString>,
     editing: bool,
     title_input: Entity<TextInput>,
@@ -69,6 +75,8 @@ impl PrView {
             loading: false,
             reload_again: false,
             saving: false,
+            pushing: false,
+            edit_base: None,
             error: None,
             editing: false,
             title_input,
@@ -134,6 +142,7 @@ impl PrView {
         };
         let (title, body) = (detail.status.title.clone(), detail.body.clone());
         let body_editable = !detail.body_truncated;
+        self.edit_base = Some((title.clone(), body.clone(), detail.body_truncated));
         self.title_input.update(cx, |i, cx| i.set_text(&title, cx));
         self.body_input.update(cx, |i, cx| {
             i.set_text(if body_editable { &body } else { "" }, cx)
@@ -152,7 +161,7 @@ impl PrView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let Some(detail) = &self.detail else {
+        let Some((old_title, old_body, cut)) = self.edit_base.clone() else {
             return;
         };
         if self.saving {
@@ -160,9 +169,9 @@ impl PrView {
         }
         let title = self.title_input.read(cx).text().trim().to_owned();
         let body = self.body_input.read(cx).text().to_owned();
-        let title = (title != detail.status.title).then_some(title);
+        let title = (title != old_title).then_some(title);
         // A description too long to show whole is never sent back cut.
-        let body = (!detail.body_truncated && body != detail.body).then_some(body);
+        let body = (!cut && body != old_body).then_some(body);
         if title.is_none() && body.is_none() {
             return self.stop_edit(cx);
         }
@@ -189,6 +198,36 @@ impl PrView {
                     Ok(_) => {}
                     Err(err) => this.message = Some((false, err.into())),
                 }
+                cx.notify();
+            },
+        );
+    }
+}
+
+impl PrView {
+    /// Push the local commits (never forced).
+    fn push(&mut self, cx: &mut Context<Self>) {
+        if self.pushing {
+            return;
+        }
+        self.pushing = true;
+        self.message = None;
+        cx.notify();
+        crate::query::ask(
+            &self.backend,
+            Query::PrPush {
+                thread_id: self.thread_id,
+            },
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                this.pushing = false;
+                match result {
+                    Ok(QueryReply::Done(text)) => this.message = Some((true, text.into())),
+                    Ok(_) => {}
+                    Err(err) => this.message = Some((false, err.into())),
+                }
+                this.reload(cx);
                 cx.notify();
             },
         );
@@ -498,11 +537,28 @@ impl Render for PrView {
                 if detail.uncommitted == 1 { "" } else { "s" },
             ),
         };
+        let can_push =
+            detail.ahead.is_some_and(|a| a > 0) && !link.as_ref().is_some_and(|l| l.read_only);
         merge = merge.child(
             div()
-                .text_xs()
-                .text_color(theme::text_faint())
-                .child(SharedString::from(local)),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                        .child(SharedString::from(local)),
+                )
+                .when(can_push, |d| {
+                    d.child(button(
+                        "pr-push".into(),
+                        if self.pushing { "Pushing…" } else { "Push" },
+                        theme::surface_hover(),
+                        theme::text(),
+                        cx.listener(|this, _, _, cx| this.push(cx)),
+                    ))
+                }),
         );
         root = root.child(merge);
 

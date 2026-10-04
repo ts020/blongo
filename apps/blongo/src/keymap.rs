@@ -141,6 +141,12 @@ pub const COMMANDS: &[CommandDef] = &[
         Some("alt-m"),
         Some("threadOpen"),
     ),
+    c(
+        "pr.create",
+        "Create a pull request…",
+        Some("alt-p"),
+        Some("threadOpen"),
+    ),
     c("pr.link", "Link a pull request…", None, Some("threadOpen")),
     c(
         "pr.open",

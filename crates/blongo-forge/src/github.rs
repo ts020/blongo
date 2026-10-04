@@ -74,6 +74,15 @@ pub struct PullInfo {
     pub base_branch: String,
 }
 
+/// A pull request to open.
+pub struct NewPull<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub head: &'a str,
+    pub base: &'a str,
+    pub draft: bool,
+}
+
 /// What GitHub reported of the GraphQL rate limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateLimit {
@@ -227,6 +236,38 @@ impl GitHub {
             return Err(classify(resp.status, &resp.text()));
         }
         Ok(())
+    }
+
+    /// `POST /repos/{owner}/{name}/pulls` from `head` (a branch of the
+    /// repository itself) into `base`. `Ok(None)`: GitHub says one is open
+    /// for `head` already.
+    pub async fn create_pull(
+        &self,
+        repo: &RepoRef,
+        new: &NewPull<'_>,
+    ) -> Result<Option<PullInfo>, GhError> {
+        let url = format!("{}/repos/{}/pulls", self.api, repo.full_name());
+        let body = json!({
+            "title": new.title,
+            "body": new.body,
+            "head": new.head,
+            "base": new.base,
+            "draft": new.draft,
+        });
+        let resp = http::send(self.request(Request::json("POST", url, &body)))
+            .await
+            .map_err(GhError::Other)?;
+        if resp.status == 422 && resp.text().contains("already exists") {
+            return Ok(None);
+        }
+        if !resp.ok() {
+            return Err(classify(resp.status, &unprocessable(&resp.text())));
+        }
+        let v: Value = serde_json::from_slice(&resp.body)
+            .map_err(|e| GhError::Other(format!("GitHub: bad JSON: {e}")))?;
+        pull_info(&v)
+            .map(Some)
+            .ok_or_else(|| GhError::Other("GitHub: unexpected pull request".into()))
     }
 
     async fn graphql(&self, query: &str) -> Result<Value, GhError> {
@@ -647,6 +688,30 @@ fn classify(status: u16, body: &str) -> GhError {
         404 => GhError::NotFound,
         _ => GhError::Other(format!("GitHub: HTTP {status}: {message}")),
     }
+}
+
+/// A 422's validation errors folded into its message ("Validation
+/// Failed: No commits between main and x").
+fn unprocessable(body: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(body) else {
+        return body.to_owned();
+    };
+    let details: Vec<String> = v["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["message"].as_str().or_else(|| e["code"].as_str()))
+        .map(str::to_owned)
+        .collect();
+    if !details.is_empty() {
+        let message = format!(
+            "{}: {}",
+            v["message"].as_str().unwrap_or("Validation Failed"),
+            details.join("; ")
+        );
+        v["message"] = Value::String(message);
+    }
+    v.to_string()
 }
 
 /// At most 200 characters of an error message, on one line.

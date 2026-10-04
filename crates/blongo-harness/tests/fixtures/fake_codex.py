@@ -25,6 +25,9 @@ Phase 4: "mcp: TOOL JSON" calls one of Blongo's MCP tools through the bridge
 named in thread/start `config.mcp_servers.blongo` and streams its answer;
 "usage" reports token usage twice; "sleep N" answers after N seconds;
 FAKE_CODEX_DUMP_START appends every thread/start's params (JSON per line).
+
+GitHub: a prompt starting with "Draft a pull request" (Blongo's draft
+prompt) is answered with a fixed draft in a ```json block.
 """
 import json
 import os
@@ -370,6 +373,14 @@ def main():
         text = msg["params"]["input"][0]["text"]
         if text.startswith("mcp:") or text.startswith("mcp*"):
             mcp_turn(turn_id, text)
+        elif text.startswith("Draft a pull request"):
+            draft = {"title": "Handle empty input in the parser",
+                     "body": "## Why\nEmpty input crashed the parser.\n\n## Testing\nThe e2e run.",
+                     "commit_message": "Handle empty input"}
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1",
+                    "delta": "Here is a draft:\n```json\n" + json.dumps(draft) + "\n```"})
+            complete(turn_id, "completed")
         elif "echo:" in text:
             notify("item/agentMessage/delta",
                    {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": text})

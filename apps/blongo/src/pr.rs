@@ -59,6 +59,13 @@ pub fn sidebar_label(thread: &Thread) -> Option<String> {
     })
 }
 
+/// The thread works on a branch of its own (its worktree; not a subagent
+/// or a fork sharing another thread's), so a pull request can be created
+/// from it.
+pub fn owns_branch(thread: &blongo_protocol::Thread) -> bool {
+    thread.worktree.is_some() && thread.parent_thread_id.is_none() && thread.forked_from.is_none()
+}
+
 /// A pull request's web page, if its URL is an `https` page on its own
 /// host (else the page Blongo builds from host, repository and number).
 pub fn safe_url(pr: &PrLink) -> Option<String> {

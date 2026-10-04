@@ -776,6 +776,9 @@ pub enum EventKind {
         thread_id: ThreadId,
         status: Option<PrStatus>,
     },
+    /// The thread's worktree branch was renamed (before its first push).
+    #[serde(rename = "thread.branch_renamed")]
+    ThreadBranchRenamed { thread_id: ThreadId, branch: String },
     #[serde(rename = "project.forge_changed")]
     ProjectForgeChanged {
         project_id: ProjectId,
@@ -805,6 +808,7 @@ impl EventKind {
             | Self::RunUsage { thread_id, .. }
             | Self::ThreadPrLinked { thread_id, .. }
             | Self::ThreadPrStatus { thread_id, .. }
+            | Self::ThreadBranchRenamed { thread_id, .. }
             | Self::ItemFinished { thread_id, .. } => Some(*thread_id),
         }
     }
@@ -832,6 +836,7 @@ impl EventKind {
             Self::ScheduleDeleted { .. } => "schedule.deleted",
             Self::ThreadPrLinked { .. } => "thread.pr_linked",
             Self::ThreadPrStatus { .. } => "thread.pr_status",
+            Self::ThreadBranchRenamed { .. } => "thread.branch_renamed",
             Self::ProjectForgeChanged { .. } => "project.forge_changed",
         }
     }

@@ -34,6 +34,7 @@ use crate::inbox::InboxView;
 use crate::input::{InputEvent, TextInput};
 use crate::keymap::{Binding, Cmd};
 use crate::palette::{Palette, PaletteEvent};
+use crate::pr_create::PrCreateView;
 use crate::pr_view::PrView;
 use crate::settings::{NotifyMode, Settings, ThemeMode};
 use crate::settings_view::{SettingsEvent, SettingsView, ShellInfo};
@@ -150,6 +151,8 @@ pub struct Shell {
     files_for: Option<(EnvId, ThreadId)>,
     /// The PR tab (dropped, with its detail, when the tab closes).
     pr_view: Option<Entity<PrView>>,
+    /// The Create PR form (the PR tab of a thread with no pull request).
+    pr_create: Option<Entity<PrCreateView>>,
     pr_view_for: Option<(EnvId, ThreadId)>,
     /// When a thread's branch was last looked up on GitHub on opening it.
     pr_lookups: HashMap<(EnvId, ThreadId), std::time::Instant>,
@@ -163,6 +166,8 @@ pub struct Shell {
     /// Each environment's schedules.
     schedules: Vec<Vec<Schedule>>,
     pending_schedule: Option<(EnvId, CommandId)>,
+    /// GitHub settings sent from the settings screen.
+    pending_forge: Option<(EnvId, CommandId)>,
     /// Token use of the open thread's runs.
     usage: Vec<(RunId, Usage)>,
     /// Links waiting for the local core's first snapshot.
@@ -258,6 +263,7 @@ impl Shell {
             files: None,
             files_for: None,
             pr_view: None,
+            pr_create: None,
             pr_view_for: None,
             pr_lookups: HashMap::new(),
             info: None,
@@ -270,6 +276,7 @@ impl Shell {
             keybinding_problems: options.keybinding_problems,
             schedules: vec![Vec::new()],
             pending_schedule: None,
+            pending_forge: None,
             usage: Vec::new(),
             links: Vec::new(),
             window_active: true,
@@ -607,6 +614,13 @@ impl Shell {
                         view.update(cx, |v, cx| v.set_message(false, reason, cx));
                     }
                 }
+                if self.pending_forge == Some((env, command_id)) {
+                    self.pending_forge = None;
+                    if let Some(view) = &self.settings_view {
+                        let reason = reason.clone();
+                        view.update(cx, |v, cx| v.forge_refused(reason, cx));
+                    }
+                }
                 if let Some((_, _, text)) = self
                     .pending_message
                     .take_if(|(e, id, _)| *e == env && *id == command_id)
@@ -894,13 +908,29 @@ impl Shell {
                 });
                 if changed && self.is_selected(env, *thread_id, cx) {
                     if self.view == View::Pr {
-                        // Unlinked, or another pull request: start over.
+                        // Linked (the form becomes the pull request),
+                        // unlinked, or another one: start over.
                         self.pr_view = None;
+                        self.pr_create = None;
                         self.pr_view_for = None;
                         if pr.is_none() {
                             self.view = View::Chat;
                         }
                     }
+                    cx.notify();
+                }
+            }
+            EventKind::ThreadBranchRenamed { thread_id, branch } => {
+                let changed = self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(env, *thread_id, cx, |t| match t.worktree.as_mut() {
+                        Some(w) => {
+                            w.branch = branch.clone();
+                            true
+                        }
+                        None => false,
+                    })
+                });
+                if changed && self.is_selected(env, *thread_id, cx) {
                     cx.notify();
                 }
             }
@@ -1137,6 +1167,7 @@ impl Shell {
         }
         if self.view == View::Pr {
             self.pr_view = None;
+            self.pr_create = None;
             self.pr_view_for = None;
             if self.selected_thread(cx).is_none_or(|t| t.pr.is_none()) {
                 self.view = View::Chat;
@@ -1591,20 +1622,32 @@ impl Shell {
             return;
         }
         if view == View::Pr {
-            if self.selected_thread(cx).is_none_or(|t| t.pr.is_none()) {
-                self.notice = Some("No pull request is linked to this thread".into());
+            let thread = self.selected_thread(cx);
+            if thread
+                .as_ref()
+                .is_none_or(|t| t.pr.is_none() && !crate::pr::owns_branch(t))
+            {
+                self.notice = Some(
+                    "No pull request is linked to this thread, and it has no worktree of its own \
+                     to create one from"
+                        .into(),
+                );
                 cx.notify();
                 return;
             }
-            if self.view == View::Pr
-                && let Some(pr) = &self.pr_view
-            {
+            if self.view == View::Pr {
                 // Same tab again: fetch again.
-                pr.update(cx, |p, cx| p.reload(cx));
+                if let Some(pr) = &self.pr_view {
+                    pr.update(cx, |p, cx| p.reload(cx));
+                }
+                if let Some(form) = &self.pr_create {
+                    form.update(cx, |f, cx| f.reload(cx));
+                }
             }
         }
         if self.view == View::Pr && view != View::Pr {
             self.pr_view = None;
+            self.pr_create = None;
             self.pr_view_for = None;
         }
         if view == View::Diff && self.view == View::Diff {
@@ -1710,6 +1753,7 @@ impl Shell {
 
     fn ensure_pr(&mut self, cx: &mut Context<Self>) -> Entity<PrView> {
         let (env, thread_id) = self.selected(cx).expect("PR view without a thread");
+        self.pr_create = None;
         match (&self.pr_view, self.pr_view_for == Some((env, thread_id))) {
             (Some(pr), true) => pr.clone(),
             _ => {
@@ -1722,6 +1766,21 @@ impl Shell {
         }
     }
 
+    fn ensure_pr_create(&mut self, cx: &mut Context<Self>) -> Entity<PrCreateView> {
+        let (env, thread_id) = self.selected(cx).expect("PR view without a thread");
+        self.pr_view = None;
+        match (&self.pr_create, self.pr_view_for == Some((env, thread_id))) {
+            (Some(form), true) => form.clone(),
+            _ => {
+                let backend = self.backend(env).clone();
+                let form = cx.new(|cx| PrCreateView::new(backend, thread_id, cx));
+                self.pr_create = Some(form.clone());
+                self.pr_view_for = Some((env, thread_id));
+                form
+            }
+        }
+    }
+
     /// Opening a thread whose branch may have a pull request nobody linked
     /// yet (pushed by the agent, made on GitHub): look once a minute at
     /// most. The core asks GitHub only if the branch was pushed.
@@ -1729,10 +1788,11 @@ impl Shell {
         let Some(thread) = self.selected_thread(cx) else {
             return;
         };
-        let own_branch = thread.worktree.is_some()
-            && thread.parent_thread_id.is_none()
-            && thread.forked_from.is_none();
-        if thread.pr.is_some() || thread.pr_dismissed || thread.archived || !own_branch {
+        if thread.pr.is_some()
+            || thread.pr_dismissed
+            || thread.archived
+            || !crate::pr::owns_branch(&thread)
+        {
             return;
         }
         let now = std::time::Instant::now();
@@ -1784,7 +1844,16 @@ impl Shell {
                     .collect()
             })
             .unwrap_or_default();
+        let forge = self.selected_thread(cx).and_then(|t| {
+            let project = sidebar.envs[env].project(t.project_id)?;
+            Some((
+                project.id,
+                SharedString::from(project.name.clone()),
+                project.forge.clone(),
+            ))
+        });
         ShellInfo {
+            forge,
             schedules: self.schedules.get(env).cloned().unwrap_or_default(),
             environments,
             schedule_target,
@@ -1859,6 +1928,15 @@ impl Shell {
                 },
                 cx,
             ),
+            SettingsEvent::SetForge(project_id, settings) => {
+                let env = self.selected_env(cx);
+                let envelope = CommandEnvelope::new(Command::ProjectSetForge {
+                    project_id: *project_id,
+                    settings: settings.clone(),
+                });
+                self.pending_forge = Some((env, envelope.command_id));
+                self.backend(env).dispatch(envelope);
+            }
             SettingsEvent::RunSchedule(id) => {
                 self.dispatch_selected(Command::ScheduleRunNow { schedule_id: *id }, cx)
             }
@@ -2032,7 +2110,7 @@ impl Shell {
             "view.chat" => self.set_view(View::Chat, cx),
             "view.diff" => self.set_view(View::Diff, cx),
             "view.files" => self.set_view(View::Files, cx),
-            "view.pr" => self.set_view(View::Pr, cx),
+            "view.pr" | "pr.create" => self.set_view(View::Pr, cx),
             "view.inbox" => self.set_view(View::Inbox, cx),
             "view.settings" => self.set_view(View::Settings, cx),
             "model.next" => self.next_model(cx),
@@ -2758,7 +2836,7 @@ impl Shell {
                     .child(tab("tab-chat", "Chat", View::Chat, self.view))
                     .child(tab("tab-diff", "Changes", View::Diff, self.view))
                     .child(tab("tab-files", "Files", View::Files, self.view))
-                    .when(thread.pr.is_some(), |d| {
+                    .when(thread.pr.is_some() || self.view == View::Pr, |d| {
                         d.child(tab("tab-pr", "PR", View::Pr, self.view))
                     }),
             )
@@ -2772,6 +2850,16 @@ impl Shell {
                     .child(SharedString::from(location)),
             )
             .when_some(pr_chip, |d, chip| d.child(chip))
+            .when(
+                thread.pr.is_none() && crate::pr::owns_branch(&thread) && self.view != View::Pr,
+                |d| {
+                    d.child(header_action("create-pr", "Create PR").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.run_command("pr.create", window, cx)
+                        }),
+                    ))
+                },
+            )
             .when(thread.pr.is_none(), |d| {
                 d.child(header_action("link-pr", "Link PR").on_click(
                     cx.listener(|this, _, window, cx| this.run_command("pr.link", window, cx)),
@@ -2818,9 +2906,13 @@ impl Shell {
                 let files = self.ensure_files(window, cx);
                 div().flex_1().min_h_0().child(files)
             }
-            View::Pr => {
+            View::Pr if thread.pr.is_some() => {
                 let pr = self.ensure_pr(cx);
                 div().flex_1().min_h_0().child(pr)
+            }
+            View::Pr => {
+                let form = self.ensure_pr_create(cx);
+                div().flex_1().min_h_0().child(form)
             }
             _ => match &self.timeline {
                 Some(t) => div().flex_1().min_h_0().child(t.clone()),
@@ -3098,8 +3190,11 @@ impl Render for Shell {
         }
         // However the PR tab was left (a link, a vanished thread), its
         // detail goes with it.
-        if self.pr_view.is_some() && (self.view != View::Pr || self.selected(cx).is_none()) {
+        if (self.pr_view.is_some() || self.pr_create.is_some())
+            && (self.view != View::Pr || self.selected(cx).is_none())
+        {
             self.pr_view = None;
+            self.pr_create = None;
             self.pr_view_for = None;
         }
         let mut sidebar_style = StyleRefinement::default();

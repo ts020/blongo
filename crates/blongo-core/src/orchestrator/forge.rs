@@ -11,10 +11,13 @@
 
 use std::path::PathBuf;
 
-use blongo_forge::auth;
-use blongo_forge::github::{GhError, GitHub, MAX_BATCH, PullInfo, RateLimit, RepoInfo};
+use blongo_forge::github::{GhError, GitHub, MAX_BATCH, NewPull, PullInfo, RateLimit, RepoInfo};
 use blongo_forge::remote::{self, RepoRef};
-use blongo_protocol::{BaseBranch, ChecksState, ForgeSettings, PrLink, PrStatus, parse_pr_ref};
+use blongo_forge::{auth, branch};
+use blongo_protocol::{
+    BaseBranch, ChecksState, Delivery, ForgeSettings, PrCreateRequest, PrLink, PrPrepare, PrStatus,
+    branch_slug, parse_pr_ref,
+};
 
 use super::*;
 
@@ -43,6 +46,8 @@ pub(super) struct ForgeRt {
     low_rate: bool,
     /// `PrRefresh` queries waiting for their thread's next check.
     waiters: HashMap<ThreadId, Vec<QueryId>>,
+    /// `PrDraft` queries waiting for the run that answers them.
+    pub drafts: HashMap<RunId, QueryId>,
     tokens: TokenCache,
 }
 
@@ -120,16 +125,43 @@ struct LookupTarget {
     cached_info: Option<RepoInfo>,
 }
 
-/// A PR tab query (detail or edit) ended.
+/// A PR tab query or change ended.
 pub(super) struct QueryDone {
     id: QueryId,
     thread_id: ThreadId,
-    link: PrLink,
+    /// Held while it ran.
+    key: Option<Key>,
+    /// The linked pull request it was about (its status is kept only
+    /// while the thread still links it).
+    link: Option<PrLink>,
     /// What GitHub said of the pull request (detail).
     status: Option<PrStatus>,
-    /// The pull request changed (edit): poll it now.
+    /// The pull request changed (edit, push): poll it now.
     changed: bool,
+    /// The thread's branch got this name (create).
+    renamed: Option<String>,
+    /// The pull request created (or found open) for the branch.
+    created: Option<Box<Found>>,
+    /// The repository as GitHub described it (prepare).
+    info: Option<(String, String, RepoInfo)>,
     result: Result<QueryReply, String>,
+}
+
+impl QueryDone {
+    fn new(id: QueryId, thread_id: ThreadId, result: Result<QueryReply, String>) -> Self {
+        Self {
+            id,
+            thread_id,
+            key: None,
+            link: None,
+            status: None,
+            changed: false,
+            renamed: None,
+            created: None,
+            info: None,
+            result,
+        }
+    }
 }
 
 pub(super) struct ForgeDone {
@@ -210,11 +242,46 @@ impl Orchestrator {
     }
 
     fn cache_repo_info(&self, link: &PrLink, info: &RepoInfo) {
+        self.cache_info(&link.host, &link.repo, info);
+    }
+
+    fn cache_info(&self, host: &str, repo: &str, info: &RepoInfo) {
         if let Ok(json) = serde_json::to_string(info) {
-            let key = format!("repo:{}/{}", link.host, link.repo);
+            let key = format!("repo:{host}/{repo}");
             if let Err(err) = self.store.set_forge_cache(&key, &json) {
                 eprintln!("blongo-core: forge cache: {err:#}");
             }
+        }
+    }
+
+    /// Where a project's new worktrees start (`None`: integration off, its
+    /// HEAD as before).
+    pub(super) fn base_plan(&self, project: &Project) -> Option<BasePlan> {
+        if !self.config.forge {
+            return None;
+        }
+        Some(BasePlan {
+            ctx: self.forge_ctx(),
+            custom: match &project.forge.base_branch {
+                BaseBranch::Custom { name } => Some(name.clone()),
+                BaseBranch::GithubDefault => None,
+            },
+            cached: self
+                .store
+                .forge_cache(&format!("base:{}", project.id))
+                .ok()
+                .flatten()
+                .map(|(name, _)| name),
+        })
+    }
+
+    /// Remember the base branch a project's worktree started from.
+    pub(super) fn cache_base(&self, project_id: ProjectId, base: &str) {
+        if let Err(err) = self
+            .store
+            .set_forge_cache(&format!("base:{project_id}"), base)
+        {
+            eprintln!("blongo-core: forge cache: {err:#}");
         }
     }
 
@@ -251,6 +318,9 @@ impl Orchestrator {
                 } else if pr.is_none() {
                     self.answer_pr_waiters(*thread_id, Ok("unlinked".into()));
                 }
+            }
+            EventKind::RunStatusChanged { run_id, status, .. } if status.is_terminal() => {
+                self.answer_draft(*run_id, *status);
             }
             EventKind::ThreadArchived { thread_id } => {
                 self.forge.forget(*thread_id);
@@ -475,20 +545,39 @@ impl Orchestrator {
         }
     }
 
-    /// `Query::PrDetail` / `Query::PrEdit`: ask GitHub in a job, answer
-    /// from there.
+    /// `Query::PrDetail` / `Query::PrEdit` / `Query::PrPrepare`: ask
+    /// GitHub in a job, answer from there.
     pub(super) fn pr_query(&mut self, id: QueryId, query: Query) {
         let job = (|| {
             if !self.config.forge {
                 return Err("GitHub integration is turned off".to_owned());
             }
             let thread = self.live_thread(query.thread_id())?;
-            let link = thread.pr.clone().ok_or("no pull request is linked")?;
             let project = self
                 .projects
                 .get(&thread.project_id)
                 .ok_or("unknown project")?;
             let cwd = PathBuf::from(thread.cwd(project));
+            if let Query::PrPrepare { .. } = query {
+                let branch = own_branch(thread)?;
+                let base = match &project.forge.base_branch {
+                    BaseBranch::Custom { name } => Some(name.clone()),
+                    BaseBranch::GithubDefault => None,
+                };
+                let title = (thread.title != DEFAULT_TITLE).then(|| thread.title.clone());
+                return Ok((
+                    thread.id,
+                    None,
+                    PrOp::Prepare {
+                        cwd,
+                        branch,
+                        prefix: project.forge.branch_prefix.clone(),
+                        base,
+                        title,
+                    },
+                ));
+            }
+            let link = thread.pr.clone().ok_or("no pull request is linked")?;
             let op = match query {
                 Query::PrDetail { .. } => PrOp::Detail { cwd },
                 Query::PrEdit { title, body, .. } => {
@@ -512,48 +601,200 @@ impl Orchestrator {
                 }
                 _ => return Err("not a pull request query".into()),
             };
-            Ok((thread.id, link, op))
+            Ok((thread.id, Some(link), op))
         })();
-        let (thread_id, link, op) = match job {
-            Ok(job) => job,
-            Err(err) => {
-                return self.emit(CoreEvent::Reply {
-                    id,
-                    result: Err(err),
-                });
-            }
-        };
-        let ctx = self.forge_ctx();
-        self.spawn_job(Key::None, async move {
-            let (status, changed, result) = run_pr_op(&ctx, &link, op).await;
-            JobDone::ForgeQuery(Box::new(QueryDone {
+        match job {
+            Ok((thread_id, link, op)) => self.spawn_pr_op(id, thread_id, Key::None, link, op),
+            Err(err) => self.emit(CoreEvent::Reply {
                 id,
-                thread_id,
-                link,
-                status,
-                changed,
-                result,
-            }))
+                result: Err(err),
+            }),
+        }
+    }
+
+    /// `Query::PrCreate` / `Query::PrPush`: change the branch and GitHub
+    /// while holding `key` (the thread and, for a create, every thread).
+    pub(super) fn pr_mutate(&mut self, id: QueryId, query: Query, key: Key) {
+        let job = (|| {
+            if !self.config.forge {
+                return Err("GitHub integration is turned off".to_owned());
+            }
+            let (thread, cwd) = self.thread_cwd(query.thread_id())?;
+            self.ensure_idle(&thread)?;
+            let branch = own_branch(&thread)?;
+            if let Some(busy) = self
+                .folder_sharers(thread.id, &cwd)
+                .iter()
+                .find(|t| self.is_busy(t.id))
+            {
+                return Err(format!(
+                    "\"{}\" works in the same folder and is running; wait for it to finish",
+                    busy.title
+                ));
+            }
+            let cwd = PathBuf::from(cwd);
+            let op = match query {
+                Query::PrCreate { request, .. } => {
+                    if let Some(pr) = &thread.pr
+                        && !thread
+                            .pr_status
+                            .as_ref()
+                            .is_some_and(|s| s.state.is_final())
+                    {
+                        return Err(format!("{} is linked already", pr.label()));
+                    }
+                    PrOp::Create {
+                        cwd,
+                        branch,
+                        request: checked_request(request)?,
+                    }
+                }
+                Query::PrPush { .. } => {
+                    if thread.pr.as_ref().is_some_and(|p| p.head_branch != branch) {
+                        return Err("the linked pull request is for another branch".into());
+                    }
+                    PrOp::Push { cwd, branch }
+                }
+                _ => return Err("not a pull request change".into()),
+            };
+            Ok((thread.id, thread.pr.clone(), op))
+        })();
+        match job {
+            Ok((thread_id, link, op)) => self.spawn_pr_op(id, thread_id, key, link, op),
+            Err(err) => self.emit(CoreEvent::Reply {
+                id,
+                result: Err(err),
+            }),
+        }
+    }
+
+    fn spawn_pr_op(
+        &mut self,
+        id: QueryId,
+        thread_id: ThreadId,
+        key: Key,
+        link: Option<PrLink>,
+        op: PrOp,
+    ) {
+        let ctx = self.forge_ctx();
+        self.spawn_job(key, async move {
+            let mut done = run_pr_op(&ctx, link.as_ref(), op, id, thread_id).await;
+            done.key = Some(key);
+            done.link = link;
+            JobDone::ForgeQuery(Box::new(done))
         });
     }
 
+    /// `Query::PrDraft`: send the prompt as a message (queued behind a
+    /// running turn); answered when that turn ends.
+    pub(super) fn pr_draft(&mut self, id: QueryId, thread_id: ThreadId, prompt: String) {
+        if prompt.trim().is_empty() {
+            return self.emit(CoreEvent::Reply {
+                id,
+                result: Err("nothing to ask".into()),
+            });
+        }
+        let run_id = RunId::new();
+        self.forge.drafts.insert(run_id, id);
+        let command = Command::MessageDispatch {
+            thread_id,
+            message_id: ItemId::new(),
+            run_id,
+            text: prompt,
+            delivery: Delivery::Queue,
+        };
+        self.deferred
+            .push_back(Deferred::Dispatch(Pending::new(command, Reply::Query(id))));
+    }
+
+    /// A run ended: answer the draft query waiting for it.
+    fn answer_draft(&mut self, run_id: RunId, status: RunStatus) {
+        let Some(id) = self.forge.drafts.remove(&run_id) else {
+            return;
+        };
+        let result = if status == RunStatus::Completed {
+            let answer = self
+                .store
+                .run_items(run_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|i| matches!(i.kind, ItemKind::AssistantMessage { .. }))
+                .map(|i| i.text.to_string())
+                .unwrap_or_default();
+            blongo_forge::pr::parse_draft(&answer)
+                .map(QueryReply::PrDraft)
+                .ok_or_else(|| "the agent's answer held no draft (a JSON title and body)".into())
+        } else {
+            Err(format!(
+                "the agent did not answer (the turn ended {})",
+                format!("{status:?}").to_lowercase()
+            ))
+        };
+        self.emit(CoreEvent::Reply { id, result });
+    }
+
     pub(super) fn forge_query_done(&mut self, done: QueryDone) {
+        if let Some(key) = done.key {
+            self.release_key(key);
+        }
+        let mut events = Vec::new();
+        if let Some(branch) = &done.renamed {
+            // Everything working in the worktree is on the renamed branch.
+            let path = self
+                .threads
+                .get(&done.thread_id)
+                .and_then(|t| t.worktree.as_ref())
+                .map(|w| w.path.clone());
+            for t in self.threads.values() {
+                if path.is_some() && t.worktree.as_ref().map(|w| &w.path) == path.as_ref() {
+                    events.push(EventKind::ThreadBranchRenamed {
+                        thread_id: t.id,
+                        branch: branch.clone(),
+                    });
+                }
+            }
+        }
+        if let Some((host, repo, info)) = &done.info {
+            self.cache_info(host, repo, info);
+        }
+        let live = self
+            .threads
+            .get(&done.thread_id)
+            .is_some_and(|t| !t.archived);
+        if let Some(found) = done.created
+            && live
+        {
+            self.cache_repo_info(&found.link, &found.info);
+            events.push(EventKind::ThreadPrLinked {
+                thread_id: done.thread_id,
+                pr: Some(found.link),
+                manual: true,
+            });
+            events.push(EventKind::ThreadPrStatus {
+                thread_id: done.thread_id,
+                status: Some(found.status),
+            });
+        }
         let current = self
             .threads
             .get(&done.thread_id)
-            .filter(|t| !t.archived && t.pr.as_ref() == Some(&done.link));
+            .filter(|t| !t.archived && done.link.is_some() && t.pr == done.link);
         if let Some(thread) = current {
             if let Some(status) = done.status
                 && thread.pr_status.as_ref() != Some(&status)
             {
-                self.commit_events(vec![EventKind::ThreadPrStatus {
+                events.push(EventKind::ThreadPrStatus {
                     thread_id: done.thread_id,
                     status: Some(status),
-                }]);
+                });
             }
             if done.changed {
                 self.forge.hurry(done.thread_id, Duration::ZERO);
             }
+        }
+        if !events.is_empty() {
+            self.commit_events(events);
         }
         self.emit(CoreEvent::Reply {
             id: done.id,
@@ -666,6 +907,54 @@ fn owns_branch(thread: &Thread) -> bool {
         && !thread.pr_dismissed
         && thread.parent_thread_id.is_none()
         && thread.forked_from.is_none()
+}
+
+/// The branch a pull request is created from: the thread's own worktree
+/// branch.
+fn own_branch(thread: &Thread) -> Result<String, String> {
+    if thread.parent_thread_id.is_some() || thread.forked_from.is_some() {
+        return Err("create the pull request from the thread that started this branch".into());
+    }
+    thread
+        .worktree
+        .as_ref()
+        .map(|w| w.branch.clone())
+        .ok_or_else(|| "pull requests are created from threads with their own worktree".into())
+}
+
+/// The Create PR form, trimmed and checked.
+fn checked_request(mut r: PrCreateRequest) -> Result<PrCreateRequest, String> {
+    r.title = r.title.trim().replace(['\n', '\r'], " ");
+    if r.title.is_empty() || r.title.chars().count() > 256 {
+        return Err("a title has 1 to 256 characters".into());
+    }
+    if r.body.chars().count() > 65_536 {
+        return Err("the description is longer than GitHub allows".into());
+    }
+    r.base = r.base.trim().to_owned();
+    if !branch_name_ok(&r.base, false) {
+        return Err(format!("\"{}\" is not a branch name", r.base));
+    }
+    r.branch = r.branch.trim().to_owned();
+    if !branch_name_ok(&r.branch, false) {
+        return Err(format!("\"{}\" is not a branch name", r.branch));
+    }
+    if r.branch == r.base {
+        return Err("the branch and the base are the same".into());
+    }
+    r.commit_message = r
+        .commit_message
+        .map(|m| m.trim().to_owned())
+        .filter(|m| !m.is_empty());
+    Ok(r)
+}
+
+/// Whether `branch` is a name Blongo gave a worktree (the prefix and 12
+/// hex digits), so a better one may be suggested.
+fn generated_branch(branch: &str, prefix: &str) -> bool {
+    branch
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.len() == 12 && rest.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// A branch name (or, with `prefix`, the start of one) git accepts and
@@ -861,54 +1150,372 @@ enum PrOp {
         title: Option<String>,
         body: Option<String>,
     },
+    Prepare {
+        cwd: PathBuf,
+        branch: String,
+        prefix: String,
+        /// The project's base branch setting (`None`: GitHub's default).
+        base: Option<String>,
+        title: Option<String>,
+    },
+    Create {
+        cwd: PathBuf,
+        branch: String,
+        request: PrCreateRequest,
+    },
+    Push {
+        cwd: PathBuf,
+        branch: String,
+    },
 }
 
 async fn run_pr_op(
     ctx: &ForgeCtx,
-    link: &PrLink,
+    link: Option<&PrLink>,
     op: PrOp,
-) -> (Option<PrStatus>, bool, Result<QueryReply, String>) {
-    let Some(repo) = RepoRef::parse(&format!("https://{}/{}", link.host, link.repo)) else {
-        return (None, false, Err("not a GitHub repository".into()));
-    };
-    let token = match ctx.token(&repo.host).await {
-        Ok(t) => t,
-        Err(err) => return (None, false, Err(err)),
-    };
-    let gh = ctx.client(&repo, token);
+    id: QueryId,
+    thread_id: ThreadId,
+) -> QueryDone {
+    let mut done = QueryDone::new(id, thread_id, Err(String::new()));
     match op {
-        PrOp::Detail { cwd } => match gh.detail(&repo, link.number).await {
-            Ok(mut detail) => {
-                detail.can_edit &= !link.read_only;
-                if let Some((ahead, behind)) = remote::ahead_behind(&cwd, &link.head_branch).await {
-                    detail.ahead = Some(ahead);
-                    detail.behind = Some(behind);
+        PrOp::Prepare {
+            cwd,
+            branch,
+            prefix,
+            base,
+            title,
+        } => {
+            done.result = match prepare(ctx, &cwd, &branch, &prefix, base, title).await {
+                Ok((prep, info)) => {
+                    done.info = Some(info);
+                    Ok(QueryReply::PrPrepare(Box::new(prep)))
                 }
-                detail.uncommitted = remote::uncommitted(&cwd).await;
-                detail.link = Some(link.clone());
-                let status = detail.status.clone();
-                (
-                    Some(status),
-                    false,
-                    Ok(QueryReply::PrDetail(Box::new(detail))),
-                )
-            }
-            Err(GhError::NotFound) => (None, false, Err(format!("{} was not found", link.label()))),
-            Err(err) => (None, false, Err(ctx.fail(&repo.host, err))),
-        },
+                Err(err) => Err(err),
+            };
+        }
+        PrOp::Create {
+            cwd,
+            branch,
+            request,
+        } => {
+            let (renamed, result) = create(ctx, &cwd, &branch, &request).await;
+            done.renamed = renamed;
+            done.result = result.map(|found| {
+                let label = found.link.label();
+                done.created = Some(Box::new(found));
+                QueryReply::Done(format!("{label} created"))
+            });
+        }
+        PrOp::Push { cwd, branch } => {
+            done.result = push(&cwd, &branch).await.map(QueryReply::Done);
+            done.changed = done.result.is_ok();
+        }
+        PrOp::Detail { cwd } => {
+            let Some(link) = link else {
+                done.result = Err("no pull request is linked".into());
+                return done;
+            };
+            let (gh, repo) = match client_for(ctx, link).await {
+                Ok(c) => c,
+                Err(err) => {
+                    done.result = Err(err);
+                    return done;
+                }
+            };
+            done.result = match gh.detail(&repo, link.number).await {
+                Ok(mut detail) => {
+                    detail.can_edit &= !link.read_only;
+                    if let Some((ahead, behind)) =
+                        remote::ahead_behind(&cwd, &link.head_branch).await
+                    {
+                        detail.ahead = Some(ahead);
+                        detail.behind = Some(behind);
+                    }
+                    detail.uncommitted = remote::uncommitted(&cwd).await;
+                    detail.link = Some(link.clone());
+                    done.status = Some(detail.status.clone());
+                    Ok(QueryReply::PrDetail(Box::new(detail)))
+                }
+                Err(GhError::NotFound) => Err(format!("{} was not found", link.label())),
+                Err(err) => Err(ctx.fail(&repo.host, err)),
+            };
+        }
         PrOp::Edit { title, body } => {
-            match gh
+            let Some(link) = link else {
+                done.result = Err("no pull request is linked".into());
+                return done;
+            };
+            let (gh, repo) = match client_for(ctx, link).await {
+                Ok(c) => c,
+                Err(err) => {
+                    done.result = Err(err);
+                    return done;
+                }
+            };
+            done.result = match gh
                 .edit_pull(&repo, link.number, title.as_deref(), body.as_deref())
                 .await
             {
-                Ok(()) => (
-                    None,
-                    true,
-                    Ok(QueryReply::Done(format!("{} updated", link.label()))),
-                ),
-                Err(err) => (None, false, Err(ctx.fail(&repo.host, err))),
+                Ok(()) => {
+                    done.changed = true;
+                    Ok(QueryReply::Done(format!("{} updated", link.label())))
+                }
+                Err(err) => Err(ctx.fail(&repo.host, err)),
+            };
+        }
+    }
+    done
+}
+
+async fn client_for(ctx: &ForgeCtx, link: &PrLink) -> Result<(GitHub, RepoRef), String> {
+    let repo = RepoRef::parse(&format!("https://{}/{}", link.host, link.repo))
+        .ok_or("not a GitHub repository")?;
+    let token = ctx.token(&repo.host).await?;
+    Ok((ctx.client(&repo, token), repo))
+}
+
+/// The folder's GitHub repository, its remote's name and a client for it.
+async fn folder_repo(ctx: &ForgeCtx, cwd: &Path) -> Result<(GitHub, RepoRef, String), String> {
+    let name = remote::remote_name(cwd)
+        .await
+        .ok_or("this folder has no git remote to push to")?;
+    let repo = remote::remote_url(cwd)
+        .await
+        .and_then(|u| RepoRef::parse(&u))
+        .ok_or("this folder's remote is not a GitHub repository")?;
+    let token = ctx.token(&repo.host).await?;
+    Ok((ctx.client(&repo, token), repo, name))
+}
+
+/// What the Create PR form starts from.
+async fn prepare(
+    ctx: &ForgeCtx,
+    cwd: &Path,
+    branch: &str,
+    prefix: &str,
+    base: Option<String>,
+    title: Option<String>,
+) -> Result<(PrPrepare, (String, String, RepoInfo)), String> {
+    let (gh, repo, remote_name) = folder_repo(ctx, cwd).await?;
+    let info = gh
+        .repo_info(&repo)
+        .await
+        .map_err(|e| ctx.fail(&repo.host, e))?;
+    let base = base.unwrap_or_else(|| info.default_branch.clone());
+    // Compare with GitHub's base as it is now; the last fetch otherwise.
+    let _ = branch::fetch(cwd, &remote_name, &base).await;
+    let base_ref = if branch::has_remote_branch(cwd, &remote_name, &base).await {
+        format!("refs/remotes/{remote_name}/{base}")
+    } else {
+        base.clone()
+    };
+    let pushed = remote::branch_pushed(cwd, branch).await;
+    let commits = branch::commits_since(cwd, &base_ref).await;
+    let uncommitted = branch::uncommitted_files(cwd).await;
+    let diff_stat = branch::diff_stat(cwd, &base_ref).await;
+    let template = branch::template(cwd).await;
+    let title = title
+        .or_else(|| commits.first().cloned())
+        .unwrap_or_default();
+    let suggested_branch = if !pushed && generated_branch(branch, prefix) {
+        let slug = branch_slug(&title);
+        let name = format!("{prefix}{slug}");
+        if slug.is_empty() || !branch_name_ok(&name, false) {
+            branch.to_owned()
+        } else {
+            name
+        }
+    } else {
+        branch.to_owned()
+    };
+    let draft_prompt = blongo_forge::pr::draft_prompt(&blongo_forge::pr::DraftFacts {
+        branch: &suggested_branch,
+        base: &base,
+        commits: &commits,
+        uncommitted: &uncommitted,
+        diff_stat: &diff_stat,
+        template: template.as_deref(),
+    });
+    let prep = PrPrepare {
+        repo: repo.full_name(),
+        branch: branch.to_owned(),
+        pushed,
+        suggested_branch,
+        base,
+        uncommitted,
+        commits,
+        diff_stat,
+        template,
+        title,
+        draft_prompt,
+        can_push: info.can_push,
+    };
+    Ok((prep, (repo.host.clone(), repo.full_name(), info)))
+}
+
+/// Commit, rename, push and open the pull request; each step is skipped
+/// when it is done already, so a failed create can be retried. The new
+/// branch name is reported even when a later step fails.
+async fn create(
+    ctx: &ForgeCtx,
+    cwd: &Path,
+    branch: &str,
+    request: &PrCreateRequest,
+) -> (Option<String>, Result<Found, String>) {
+    let mut renamed = None;
+    let result = async {
+        let (gh, repo, remote_name) = folder_repo(ctx, cwd).await?;
+        if remote::current_branch(cwd).await.as_deref() != Some(branch) {
+            return Err(format!("the worktree does not have {branch} checked out"));
+        }
+        let files = branch::uncommitted_files(cwd).await;
+        if !files.is_empty() {
+            let message = request.commit_message.as_deref().ok_or_else(|| {
+                format!(
+                    "{} files are not committed; commit them or enter a commit message",
+                    files.len()
+                )
+            })?;
+            blongo_git::workspace::commit_all(cwd, message)
+                .await
+                .map_err(|e| format!("Committing failed: {e:#}"))?;
+        }
+        let mut name = branch.to_owned();
+        if request.branch != branch {
+            if remote::branch_pushed(cwd, branch).await {
+                return Err(format!("{branch} was pushed already, so it keeps its name"));
+            }
+            branch::rename(cwd, branch, &request.branch)
+                .await
+                .map_err(|e| format!("Renaming the branch failed: {e}"))?;
+            renamed = Some(request.branch.clone());
+            name = request.branch.clone();
+        }
+        branch::push(cwd, &remote_name, &name)
+            .await
+            .map_err(|e| format!("Pushing failed: {e}"))?;
+        let info = gh
+            .repo_info(&repo)
+            .await
+            .map_err(|e| ctx.fail(&repo.host, e))?;
+        let new = NewPull {
+            title: &request.title,
+            body: &request.body,
+            head: &name,
+            base: &request.base,
+            draft: request.draft,
+        };
+        let pull = match gh.create_pull(&repo, &new).await {
+            Ok(Some(pull)) => pull,
+            // Opened before (a retry, or by hand): link that one.
+            Ok(None) => gh
+                .find_pull(&repo, &name)
+                .await
+                .map_err(|e| ctx.fail(&repo.host, e))?
+                .ok_or("GitHub says a pull request exists for the branch but did not list it")?,
+            Err(err) => {
+                return Err(format!(
+                    "GitHub did not create the pull request: {}",
+                    ctx.fail(&repo.host, err)
+                ));
+            }
+        };
+        Ok(found(&gh, &repo, info, pull).await)
+    }
+    .await;
+    (renamed, result)
+}
+
+/// Push the checked-out `branch` (never forced).
+async fn push(cwd: &Path, branch: &str) -> Result<String, String> {
+    if remote::current_branch(cwd).await.as_deref() != Some(branch) {
+        return Err(format!("the worktree does not have {branch} checked out"));
+    }
+    let remote_name = remote::remote_name(cwd)
+        .await
+        .ok_or("this folder has no git remote to push to")?;
+    branch::push(cwd, &remote_name, branch)
+        .await
+        .map_err(|e| format!("Pushing failed: {e}"))?;
+    Ok(format!("pushed {branch}"))
+}
+
+/// Where a new worktree starts, resolved on the loop.
+pub(super) struct BasePlan {
+    ctx: ForgeCtx,
+    /// The project's base branch setting.
+    custom: Option<String>,
+    /// The base the project's last worktree started from.
+    cached: Option<String>,
+}
+
+/// Where a new worktree starts: `start` (`None`: the project's HEAD).
+#[derive(Default)]
+pub(super) struct WorktreeBase {
+    pub start: Option<String>,
+    /// The base branch it started from.
+    pub base: Option<String>,
+    /// Why it starts from the project's HEAD although a base was known.
+    pub notice: Option<String>,
+}
+
+/// Longest the default branch is asked of GitHub before the cached one
+/// is used.
+const BASE_LOOKUP: Duration = Duration::from_secs(8);
+
+/// The remote's base branch, freshly fetched: the project's setting, else
+/// GitHub's default branch, else the last one used, else the remote's
+/// HEAD. A folder with no remote starts from its HEAD as before.
+pub(super) async fn worktree_base(root: &Path, plan: BasePlan) -> WorktreeBase {
+    let Some(remote_name) = remote::remote_name(root).await else {
+        return WorktreeBase::default();
+    };
+    let name = match plan.custom {
+        Some(name) => Some(name),
+        None => {
+            let github = async {
+                let repo = RepoRef::parse(&remote::remote_url(root).await?)?;
+                let token = plan.ctx.token(&repo.host).await.ok()?;
+                let gh = plan.ctx.client(&repo, token);
+                gh.repo_info(&repo)
+                    .await
+                    .ok()
+                    .map(|i| i.default_branch)
+                    .filter(|b| !b.is_empty())
+            };
+            match tokio::time::timeout(BASE_LOOKUP, github).await {
+                Ok(Some(name)) => Some(name),
+                _ => match plan.cached {
+                    Some(name) => Some(name),
+                    None => branch::remote_head(root, &remote_name).await,
+                },
             }
         }
+    };
+    let Some(name) = name.filter(|n| branch_name_ok(n, false)) else {
+        return WorktreeBase::default();
+    };
+    let fetched = branch::fetch(root, &remote_name, &name).await;
+    if branch::has_remote_branch(root, &remote_name, &name).await {
+        return WorktreeBase {
+            start: Some(format!("refs/remotes/{remote_name}/{name}")),
+            notice: fetched.err().map(|err| {
+                format!(
+                    "{remote_name}/{name} could not be fetched, so this worktree starts from \
+                     where it was last fetched: {err}"
+                )
+            }),
+            base: Some(name),
+        };
+    }
+    WorktreeBase {
+        start: None,
+        base: None,
+        notice: Some(format!(
+            "This worktree starts from the project's current commit: {remote_name}/{name} is not \
+             available ({}).",
+            fetched.err().unwrap_or_else(|| "no such branch".into())
+        )),
     }
 }
 
