@@ -4,6 +4,8 @@ name: Release
 # platform and publishes them as a GitHub Release. A tag with a hyphen
 # (v0.1.0-rc.1) becomes a pre-release. Creating the release (and its new
 # tag) on github.com works too: the files are attached to that release.
+# macOS downloads are a Blongo.app in a .dmg (packaging/macos/bundle.sh),
+# Apple Silicon only.
 # A pull request that touches this file builds the same archives without
 # publishing, so changes here are checked before they reach a real tag.
 
@@ -11,7 +13,7 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "packaging/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,8 +30,7 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-apple-darwin
             os: macos-15
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
+            mac_arch: arm64
           - target: x86_64-pc-windows-msvc
             os: windows-2025
     runs-on: ${{ matrix.os }}
@@ -51,6 +52,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p blongo -p blongo-server
       - name: Package
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
@@ -74,22 +76,86 @@ jobs:
           fi
           rm -r "$name"
           ls -l
+      # macOS: Blongo.app (blongo-serve inside), ad-hoc signed. On tags the
+      # dmg is made by macos-dmg below, the only job that sees the signing
+      # secrets; on pull requests it is made here, unsigned.
+      - name: Package (macOS app)
+        if: runner.os == 'macOS'
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          mkdir -p app dist
+          packaging/macos/bundle.sh app "$version" target/release app
+          tar -czf "app/Blongo-app-${{ matrix.mac_arch }}.tar.gz" -C app Blongo.app
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            packaging/macos/bundle.sh dmg app/Blongo.app \
+              "dist/Blongo-pr-${GITHUB_SHA::7}-macos-${{ matrix.mac_arch }}.dmg"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: app-${{ matrix.mac_arch }}
+          path: app/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS' || github.ref_type != 'tag'
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Signs and notarizes the macOS app when the `release` environment holds
+  # the Apple secrets, then wraps it in a dmg. The environment requires the
+  # owner's approval, so nothing else in a run can reach those secrets
+  # (docs/macos-signing.md).
+  macos-dmg:
+    name: macOS dmg (${{ matrix.arch }})
+    if: github.ref_type == 'tag'
+    needs: build
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-${{ matrix.arch }}
+          path: app
+      - name: Sign, notarize and package
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          tar -xzf app/Blongo-app-${{ matrix.arch }}.tar.gz -C app
+          mkdir -p dist
+          packaging/macos/bundle.sh dmg app/Blongo.app \
+            "dist/Blongo-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.dmg"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: dist-macos-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   publish:
     name: publish GitHub Release
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, macos-dmg]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: dist-*
           path: dist
           merge-multiple: true
       - name: Checksums
