@@ -1,0 +1,1437 @@
+{
+ "subject": "t3code desktop (Electron) resource baseline",
+ "date": "2026-10-03",
+ "method_kind": "electron",
+ "proxy": false,
+ "versions": {
+  "t3code_commit": "8ed276c246b624631e7d39241ebfd22d8314cb68",
+  "t3code_version": "0.0.45 (@t3tools/desktop, t3 server)",
+  "electron": "44.4.2",
+  "chromium": "152.0.7977.130",
+  "electron_node": "24.21.0",
+  "build_node": "24.21.0",
+  "pnpm": "11.10.0",
+  "claude_agent_sdk": "0.3.276"
+ },
+ "build": "pnpm install (filtered to root, desktop, server(t3), web, scripts); `vp run --filter @t3tools/desktop --filter t3 build` (production vite build of apps/web, server bundle apps/server/dist, Electron main bundle apps/desktop/dist-electron). Launched the way `start:desktop` does: `electron dist-electron/main.cjs --no-sandbox` from apps/desktop (unpackaged, not the AppImage).",
+ "environment": {
+  "cpu_cores": 4,
+  "ram_gb": 15,
+  "display": "Xvfb :97 1920x1080x24, no window manager; app window resized to 1280x800 with xdotool",
+  "rendering": "software: GPU process loaded Mesa GLX/gallium (llvmpipe) - no hardware GPU",
+  "isolation": "env -i with HOME=T3CODE_HOME-parent=/home/claude/t3-profile-home, T3CODE_HOME=/home/claude/t3-profile-home/.t3, XDG_* under it, T3CODE_PORT=3799 (port scan fails without IPv6), no credentials in env",
+  "concurrent_load": "two cargo builds on the box; loadavg ~0.4-1.7 during measurements"
+ },
+ "sampling": {
+  "interval_ms": 500,
+  "source": "/proc/<pid>/status VmRSS, /proc/<pid>/smaps_rollup Pss, /proc/<pid>/stat utime+stime",
+  "tree": "all descendants of the Electron main PID (main, 2 zygotes, gpu-process, renderer, network utility, server = electron-as-node running apps/server/dist/bin.mjs, provider CLI subprocesses)",
+  "cpu_pct_unit": "percent of one core (100 = one full core); 500 ms x 100 Hz ticks gives 2% granularity per process"
+ },
+ "workload": {
+  "idle": "fresh profile, onboarding completed, project 'demo' (tiny git repo) added, empty New thread view; 10 s settle then 20 s measure",
+  "stream": "one turn typed into the composer via xdotool ('Write a Rust ownership tutorial'). Claude provider binaryPath -> fake CLI (/home/claude/t3-profile-home/fake-claude.py) that answers SDK control_request frames (initialize etc.) and replays resource-stream.jsonl (7 thinking + 437 text deltas, 52 KB markdown) at 40 ms as stream_event frames + one `assistant` snapshot per completed content block + `result`, i.e. the real CLI's --include-partial-messages shape. It also answers `claude -p --json-schema` metadata calls (thread title) after 1.2 s. stream phase = send -> fake emitted result (~18 s); settled = following 15 s.",
+  "settings": {
+   "providers.claudeAgent.binaryPath": "fake-claude.py",
+   "providers.codex.enabled": false
+  }
+ },
+ "results": {
+  "idle": {
+   "samples": 41,
+   "duration_s": 20.0,
+   "total": {
+    "rss_mb": {
+     "avg": 1057.9,
+     "peak": 1062.9,
+     "min": 1056.4
+    },
+    "pss_mb": {
+     "avg": 614.5,
+     "peak": 619.6,
+     "min": 613.1
+    },
+    "cpu_pct": {
+     "avg": 3.7,
+     "peak": 21.8,
+     "min": 0.0
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 206.7,
+      "peak": 207.8,
+      "min": 206.1
+     },
+     "pss_mb": {
+      "avg": 121.8,
+      "peak": 123.0,
+      "min": 121.2
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 178.4,
+      "peak": 178.4,
+      "min": 178.4
+     },
+     "pss_mb": {
+      "avg": 120.6,
+      "peak": 120.7,
+      "min": 120.6
+     },
+     "cpu_pct": {
+      "avg": 1.3,
+      "peak": 4.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 206.1,
+      "peak": 207.8,
+      "min": 205.5
+     },
+     "pss_mb": {
+      "avg": 137.7,
+      "peak": 139.5,
+      "min": 137.1
+     },
+     "cpu_pct": {
+      "avg": 0.6,
+      "peak": 4.0,
+      "min": 0.0
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 251.3,
+      "peak": 253.4,
+      "min": 249.6
+     },
+     "pss_mb": {
+      "avg": 175.0,
+      "peak": 177.2,
+      "min": 173.4
+     },
+     "cpu_pct": {
+      "avg": 1.5,
+      "peak": 17.8,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.7,
+      "peak": 91.8,
+      "min": 91.7
+     },
+     "pss_mb": {
+      "avg": 30.8,
+      "peak": 30.8,
+      "min": 30.7
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.6,
+      "peak": 123.6,
+      "min": 123.6
+     },
+     "pss_mb": {
+      "avg": 28.5,
+      "peak": 28.6,
+      "min": 28.5
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  },
+  "stream": {
+   "samples": 37,
+   "duration_s": 17.99,
+   "total": {
+    "rss_mb": {
+     "avg": 1126.3,
+     "peak": 1143.3,
+     "min": 1109.8
+    },
+    "pss_mb": {
+     "avg": 669.2,
+     "peak": 679.1,
+     "min": 651.8
+    },
+    "cpu_pct": {
+     "avg": 18.5,
+     "peak": 156.1,
+     "min": 7.8
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 206.9,
+      "peak": 207.2,
+      "min": 206.8
+     },
+     "pss_mb": {
+      "avg": 121.9,
+      "peak": 122.2,
+      "min": 121.7
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 4.1,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 190.2,
+      "peak": 194.9,
+      "min": 186.7
+     },
+     "pss_mb": {
+      "avg": 127.8,
+      "peak": 130.4,
+      "min": 125.3
+     },
+     "cpu_pct": {
+      "avg": 6.8,
+      "peak": 30.4,
+      "min": 3.9
+     }
+    },
+    "provider_cli": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 11.1,
+      "peak": 20.8,
+      "min": 9.4
+     },
+     "pss_mb": {
+      "avg": 7.1,
+      "peak": 12.2,
+      "min": 5.9
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 239.8,
+      "peak": 245.7,
+      "min": 225.9
+     },
+     "pss_mb": {
+      "avg": 166.7,
+      "peak": 170.5,
+      "min": 153.7
+     },
+     "cpu_pct": {
+      "avg": 7.9,
+      "peak": 71.0,
+      "min": 2.0
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 262.8,
+      "peak": 265.5,
+      "min": 259.5
+     },
+     "pss_mb": {
+      "avg": 186.5,
+      "peak": 189.2,
+      "min": 183.2
+     },
+     "cpu_pct": {
+      "avg": 3.0,
+      "peak": 48.7,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.8,
+      "peak": 92.0,
+      "min": 91.8
+     },
+     "pss_mb": {
+      "avg": 30.8,
+      "peak": 30.9,
+      "min": 30.7
+     },
+     "cpu_pct": {
+      "avg": 0.2,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.6,
+      "peak": 123.6,
+      "min": 123.6
+     },
+     "pss_mb": {
+      "avg": 28.5,
+      "peak": 28.5,
+      "min": 28.5
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  },
+  "settled": {
+   "samples": 30,
+   "duration_s": 14.46,
+   "total": {
+    "rss_mb": {
+     "avg": 1158.4,
+     "peak": 1211.0,
+     "min": 1106.7
+    },
+    "pss_mb": {
+     "avg": 700.7,
+     "peak": 742.1,
+     "min": 656.0
+    },
+    "cpu_pct": {
+     "avg": 25.7,
+     "peak": 190.0,
+     "min": 0.0
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 208.8,
+      "peak": 209.7,
+      "min": 206.9
+     },
+     "pss_mb": {
+      "avg": 122.8,
+      "peak": 123.7,
+      "min": 121.9
+     },
+     "cpu_pct": {
+      "avg": 0.4,
+      "peak": 4.3,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 185.1,
+      "peak": 195.8,
+      "min": 173.4
+     },
+     "pss_mb": {
+      "avg": 123.4,
+      "peak": 134.4,
+      "min": 115.5
+     },
+     "cpu_pct": {
+      "avg": 2.9,
+      "peak": 20.2,
+      "min": 0.0
+     }
+    },
+    "other": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     },
+     "pss_mb": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     },
+     "cpu_pct": null
+    },
+    "provider_cli": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 10.8,
+      "peak": 10.8,
+      "min": 10.8
+     },
+     "pss_mb": {
+      "avg": 6.7,
+      "peak": 6.9,
+      "min": 6.4
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 277.7,
+      "peak": 314.1,
+      "min": 245.2
+     },
+     "pss_mb": {
+      "avg": 204.3,
+      "peak": 235.1,
+      "min": 173.0
+     },
+     "cpu_pct": {
+      "avg": 16.5,
+      "peak": 171.8,
+      "min": 0.0
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 260.6,
+      "peak": 267.3,
+      "min": 251.7
+     },
+     "pss_mb": {
+      "avg": 184.2,
+      "peak": 191.0,
+      "min": 175.4
+     },
+     "cpu_pct": {
+      "avg": 5.9,
+      "peak": 54.2,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.8,
+      "peak": 92.0,
+      "min": 91.8
+     },
+     "pss_mb": {
+      "avg": 30.7,
+      "peak": 30.8,
+      "min": 30.6
+     },
+     "cpu_pct": {
+      "avg": 0.1,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.6,
+      "peak": 123.6,
+      "min": 123.6
+     },
+     "pss_mb": {
+      "avg": 28.5,
+      "peak": 28.5,
+      "min": 28.4
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  }
+ },
+ "supplementary_run1_codex_enabled_default": {
+  "note": "first run with default settings (codex provider enabled). t3code's default text-generation provider is codex, so on the turn it spawned `codex exec` (node wrapper + native binary, ~185 MB RSS per pair, 3 times; unauthenticated here so they failed) plus a git fetch of openai/plugins. Classified as 'other'. Excluded from the main numbers.",
+  "idle": {
+   "samples": 41,
+   "duration_s": 20.0,
+   "total": {
+    "rss_mb": {
+     "avg": 1075.3,
+     "peak": 1076.4,
+     "min": 1074.4
+    },
+    "pss_mb": {
+     "avg": 627.6,
+     "peak": 628.3,
+     "min": 626.9
+    },
+    "cpu_pct": {
+     "avg": 3.0,
+     "peak": 8.0,
+     "min": 0.0
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 214.7,
+      "peak": 215.0,
+      "min": 214.4
+     },
+     "pss_mb": {
+      "avg": 126.0,
+      "peak": 126.2,
+      "min": 125.7
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 176.4,
+      "peak": 176.9,
+      "min": 176.1
+     },
+     "pss_mb": {
+      "avg": 119.7,
+      "peak": 119.9,
+      "min": 119.6
+     },
+     "cpu_pct": {
+      "avg": 1.3,
+      "peak": 4.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 216.1,
+      "peak": 216.2,
+      "min": 215.9
+     },
+     "pss_mb": {
+      "avg": 147.3,
+      "peak": 147.5,
+      "min": 147.2
+     },
+     "cpu_pct": {
+      "avg": 0.4,
+      "peak": 4.0,
+      "min": 0.0
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 252.5,
+      "peak": 253.1,
+      "min": 251.9
+     },
+     "pss_mb": {
+      "avg": 175.1,
+      "peak": 175.8,
+      "min": 174.5
+     },
+     "cpu_pct": {
+      "avg": 0.9,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.9,
+      "peak": 91.9,
+      "min": 91.8
+     },
+     "pss_mb": {
+      "avg": 30.6,
+      "peak": 30.6,
+      "min": 30.5
+     },
+     "cpu_pct": {
+      "avg": 0.1,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.8,
+      "peak": 123.8,
+      "min": 123.8
+     },
+     "pss_mb": {
+      "avg": 28.9,
+      "peak": 28.9,
+      "min": 28.9
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  },
+  "stream": {
+   "samples": 37,
+   "duration_s": 17.98,
+   "total": {
+    "rss_mb": {
+     "avg": 1287.3,
+     "peak": 1369.5,
+     "min": 1107.6
+    },
+    "pss_mb": {
+     "avg": 820.5,
+     "peak": 887.7,
+     "min": 647.1
+    },
+    "cpu_pct": {
+     "avg": 25.6,
+     "peak": 195.5,
+     "min": 10.0
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 215.2,
+      "peak": 215.4,
+      "min": 214.9
+     },
+     "pss_mb": {
+      "avg": 126.2,
+      "peak": 126.4,
+      "min": 125.9
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 2.1,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 189.5,
+      "peak": 193.9,
+      "min": 185.9
+     },
+     "pss_mb": {
+      "avg": 127.4,
+      "peak": 130.0,
+      "min": 124.4
+     },
+     "cpu_pct": {
+      "avg": 6.7,
+      "peak": 16.6,
+      "min": 3.9
+     }
+    },
+    "other": {
+     "processes": 9,
+     "rss_mb": {
+      "avg": 182.7,
+      "peak": 218.5,
+      "min": 103.3
+     },
+     "pss_mb": {
+      "avg": 179.0,
+      "peak": 203.7,
+      "min": 100.2
+     },
+     "cpu_pct": {
+      "avg": 2.6,
+      "peak": 25.9,
+      "min": 0.0
+     }
+    },
+    "provider_cli": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 10.5,
+      "peak": 10.5,
+      "min": 10.5
+     },
+     "pss_mb": {
+      "avg": 6.7,
+      "peak": 6.7,
+      "min": 6.7
+     },
+     "cpu_pct": {
+      "avg": 0.3,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 233.1,
+      "peak": 250.9,
+      "min": 220.7
+     },
+     "pss_mb": {
+      "avg": 159.4,
+      "peak": 175.3,
+      "min": 147.6
+     },
+     "cpu_pct": {
+      "avg": 8.9,
+      "peak": 68.6,
+      "min": 3.9
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 260.7,
+      "peak": 265.9,
+      "min": 251.8
+     },
+     "pss_mb": {
+      "avg": 182.1,
+      "peak": 188.2,
+      "min": 149.2
+     },
+     "cpu_pct": {
+      "avg": 7.0,
+      "peak": 85.3,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.9,
+      "peak": 92.0,
+      "min": 91.8
+     },
+     "pss_mb": {
+      "avg": 30.5,
+      "peak": 30.6,
+      "min": 30.5
+     },
+     "cpu_pct": {
+      "avg": 0.1,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.8,
+      "peak": 123.8,
+      "min": 123.8
+     },
+     "pss_mb": {
+      "avg": 28.8,
+      "peak": 28.8,
+      "min": 28.5
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  },
+  "settled": {
+   "samples": 30,
+   "duration_s": 14.5,
+   "total": {
+    "rss_mb": {
+     "avg": 1301.4,
+     "peak": 1404.8,
+     "min": 1127.7
+    },
+    "pss_mb": {
+     "avg": 834.8,
+     "peak": 924.0,
+     "min": 671.4
+    },
+    "cpu_pct": {
+     "avg": 20.3,
+     "peak": 221.2,
+     "min": 0.0
+    }
+   },
+   "per_type": {
+    "electron_main": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 217.2,
+      "peak": 217.9,
+      "min": 215.2
+     },
+     "pss_mb": {
+      "avg": 127.2,
+      "peak": 127.9,
+      "min": 126.1
+     },
+     "cpu_pct": {
+      "avg": 0.4,
+      "peak": 4.0,
+      "min": 0.0
+     }
+    },
+    "gpu": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 185.5,
+      "peak": 197.5,
+      "min": 172.7
+     },
+     "pss_mb": {
+      "avg": 123.6,
+      "peak": 134.0,
+      "min": 114.9
+     },
+     "cpu_pct": {
+      "avg": 2.8,
+      "peak": 28.1,
+      "min": 0.0
+     }
+    },
+    "other": {
+     "processes": 4,
+     "rss_mb": {
+      "avg": 185.5,
+      "peak": 185.9,
+      "min": 184.8
+     },
+     "pss_mb": {
+      "avg": 182.4,
+      "peak": 182.8,
+      "min": 181.6
+     },
+     "cpu_pct": {
+      "avg": 0.9,
+      "peak": 6.2,
+      "min": 0.0
+     }
+    },
+    "provider_cli": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 10.7,
+      "peak": 10.7,
+      "min": 10.7
+     },
+     "pss_mb": {
+      "avg": 6.8,
+      "peak": 6.9,
+      "min": 6.8
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    },
+    "renderer": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 280.3,
+      "peak": 316.4,
+      "min": 243.2
+     },
+     "pss_mb": {
+      "avg": 205.7,
+      "peak": 235.3,
+      "min": 170.0
+     },
+     "cpu_pct": {
+      "avg": 15.1,
+      "peak": 193.3,
+      "min": 0.0
+     }
+    },
+    "server_node": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 262.2,
+      "peak": 262.6,
+      "min": 260.3
+     },
+     "pss_mb": {
+      "avg": 184.5,
+      "peak": 185.0,
+      "min": 182.5
+     },
+     "cpu_pct": {
+      "avg": 1.3,
+      "peak": 6.0,
+      "min": 0.0
+     }
+    },
+    "utility_network": {
+     "processes": 1,
+     "rss_mb": {
+      "avg": 91.9,
+      "peak": 92.0,
+      "min": 91.8
+     },
+     "pss_mb": {
+      "avg": 30.5,
+      "peak": 30.6,
+      "min": 30.4
+     },
+     "cpu_pct": {
+      "avg": 0.1,
+      "peak": 2.0,
+      "min": 0.0
+     }
+    },
+    "zygote": {
+     "processes": 2,
+     "rss_mb": {
+      "avg": 123.8,
+      "peak": 123.8,
+      "min": 123.8
+     },
+     "pss_mb": {
+      "avg": 28.8,
+      "peak": 28.8,
+      "min": 28.7
+     },
+     "cpu_pct": {
+      "avg": 0.0,
+      "peak": 0.0,
+      "min": 0.0
+     }
+    }
+   }
+  }
+ },
+ "observations": [
+  "t3code's ClaudeAdapterV2 only consumes stream_event thinking deltas; assistant text is taken from the per-block `assistant` snapshot. So the 52 KB answer is NOT rendered incrementally: during the 18 s stream the UI shows 'Working for Ns' + the reasoning line, and the whole markdown renders at once when the text block completes (verified by a mid-stream screenshot). The render spike (renderer ~170% of a core, total ~190%, +~90 MB RSS) therefore falls at the start of the settled phase.",
+  "steady ~10-14% total CPU during streaming comes mostly from renderer+GPU (Working-timer repaint under software GL); server CPU ~0-2% between frames.",
+  "about 8 s after the turn another short server+renderer CPU burst (~100%) occurs (post-turn work such as checkpointing)."
+ ],
+ "caveats": [
+  "software rendering (Mesa llvmpipe via ANGLE/GLX) under Xvfb inflates GPU-process CPU vs. a real GPU",
+  "running as root with --no-sandbox; unpackaged electron run (not the AppImage, not asar)",
+  "single run per phase; 500 ms sampling misses sub-sample spikes and CPU of processes that live < 500 ms",
+  "RSS double counts shared pages across Chromium processes (zygote/renderer/gpu); PSS sum is the better total",
+  "fake provider CLI, no network/API latency; real Claude Code CLI process (~hundreds of MB node/bun) is NOT included - fake is a ~10 MB python process"
+ ],
+ "timeline_stream_run": {
+  "columns": [
+   "t_since_send_s",
+   "rss_mb",
+   "pss_mb",
+   "cpu_pct"
+  ],
+  "turn_done_at_s": 18.58,
+  "rows": [
+   [
+    -3.58,
+    1058.9,
+    615.3,
+    0.0
+   ],
+   [
+    -3.08,
+    1058.0,
+    614.5,
+    4.0
+   ],
+   [
+    -2.59,
+    1058.1,
+    614.6,
+    4.0
+   ],
+   [
+    -2.09,
+    1057.9,
+    614.4,
+    8.0
+   ],
+   [
+    -1.59,
+    1058.0,
+    614.5,
+    0.0
+   ],
+   [
+    -1.09,
+    1058.1,
+    614.3,
+    6.0
+   ],
+   [
+    -0.58,
+    1058.2,
+    614.6,
+    4.0
+   ],
+   [
+    -0.08,
+    1068.8,
+    623.6,
+    91.0
+   ],
+   [
+    0.42,
+    1109.8,
+    651.8,
+    171.7
+   ],
+   [
+    0.91,
+    1139.6,
+    674.5,
+    156.1
+   ],
+   [
+    1.42,
+    1143.3,
+    679.1,
+    27.9
+   ],
+   [
+    1.92,
+    1135.5,
+    674.4,
+    31.7
+   ],
+   [
+    2.42,
+    1136.2,
+    675.1,
+    12.1
+   ],
+   [
+    2.92,
+    1136.2,
+    675.1,
+    14.0
+   ],
+   [
+    3.42,
+    1136.3,
+    675.2,
+    10.0
+   ],
+   [
+    3.92,
+    1135.0,
+    673.9,
+    20.0
+   ],
+   [
+    4.42,
+    1134.1,
+    673.0,
+    12.0
+   ],
+   [
+    4.92,
+    1134.4,
+    673.3,
+    12.0
+   ],
+   [
+    5.42,
+    1133.4,
+    672.8,
+    8.0
+   ],
+   [
+    5.92,
+    1129.8,
+    671.0,
+    16.0
+   ],
+   [
+    6.41,
+    1129.5,
+    670.7,
+    10.0
+   ],
+   [
+    6.93,
+    1122.1,
+    667.1,
+    15.7
+   ],
+   [
+    7.42,
+    1122.2,
+    667.2,
+    10.2
+   ],
+   [
+    7.92,
+    1122.1,
+    667.1,
+    12.0
+   ],
+   [
+    8.42,
+    1121.5,
+    666.5,
+    10.0
+   ],
+   [
+    8.92,
+    1121.5,
+    666.5,
+    14.0
+   ],
+   [
+    9.42,
+    1122.3,
+    667.3,
+    14.0
+   ],
+   [
+    9.92,
+    1121.8,
+    666.8,
+    9.9
+   ],
+   [
+    10.42,
+    1122.7,
+    667.7,
+    36.2
+   ],
+   [
+    10.92,
+    1123.0,
+    668.0,
+    26.0
+   ],
+   [
+    11.41,
+    1123.0,
+    668.0,
+    10.0
+   ],
+   [
+    11.92,
+    1121.7,
+    666.7,
+    11.9
+   ],
+   [
+    12.41,
+    1122.0,
+    667.0,
+    12.1
+   ],
+   [
+    12.92,
+    1122.5,
+    667.5,
+    12.0
+   ],
+   [
+    13.41,
+    1122.9,
+    667.9,
+    14.0
+   ],
+   [
+    13.91,
+    1123.0,
+    668.0,
+    10.0
+   ],
+   [
+    14.41,
+    1122.8,
+    667.8,
+    12.0
+   ],
+   [
+    14.92,
+    1123.6,
+    668.6,
+    14.0
+   ],
+   [
+    15.41,
+    1124.0,
+    669.0,
+    12.0
+   ],
+   [
+    15.93,
+    1124.2,
+    669.2,
+    7.8
+   ],
+   [
+    16.42,
+    1124.5,
+    669.5,
+    20.5
+   ],
+   [
+    16.91,
+    1123.0,
+    668.0,
+    12.0
+   ],
+   [
+    17.42,
+    1125.4,
+    670.4,
+    14.0
+   ],
+   [
+    17.92,
+    1124.7,
+    669.7,
+    12.0
+   ],
+   [
+    18.42,
+    1112.4,
+    657.4,
+    12.0
+   ],
+   [
+    18.97,
+    1133.8,
+    678.7,
+    110.9
+   ],
+   [
+    19.43,
+    1184.5,
+    718.3,
+    186.6
+   ],
+   [
+    19.92,
+    1209.6,
+    740.7,
+    190.0
+   ],
+   [
+    20.42,
+    1211.0,
+    742.1,
+    99.0
+   ],
+   [
+    20.93,
+    1205.6,
+    736.7,
+    7.9
+   ],
+   [
+    21.42,
+    1209.4,
+    740.6,
+    4.1
+   ],
+   [
+    21.92,
+    1208.8,
+    739.9,
+    2.0
+   ],
+   [
+    22.42,
+    1208.6,
+    739.7,
+    0.0
+   ],
+   [
+    22.92,
+    1208.0,
+    739.1,
+    2.0
+   ],
+   [
+    23.43,
+    1208.3,
+    739.4,
+    3.9
+   ],
+   [
+    23.92,
+    1208.0,
+    739.4,
+    6.1
+   ],
+   [
+    24.42,
+    1203.7,
+    738.2,
+    2.0
+   ],
+   [
+    24.92,
+    1196.7,
+    731.2,
+    4.0
+   ],
+   [
+    25.42,
+    1185.1,
+    734.9,
+    4.0
+   ],
+   [
+    25.93,
+    1185.1,
+    734.9,
+    0.0
+   ],
+   [
+    26.42,
+    1168.9,
+    718.7,
+    4.1
+   ],
+   [
+    26.92,
+    1169.5,
+    719.3,
+    0.0
+   ],
+   [
+    27.41,
+    1116.1,
+    665.8,
+    108.5
+   ],
+   [
+    27.92,
+    1114.9,
+    664.5,
+    49.8
+   ],
+   [
+    28.42,
+    1111.7,
+    661.0,
+    42.1
+   ],
+   [
+    28.91,
+    1106.7,
+    656.0,
+    2.0
+   ],
+   [
+    29.41,
+    1110.4,
+    659.8,
+    4.0
+   ],
+   [
+    29.92,
+    1110.5,
+    659.8,
+    0.0
+   ],
+   [
+    30.42,
+    1110.7,
+    660.0,
+    6.0
+   ],
+   [
+    30.91,
+    1111.0,
+    660.3,
+    4.0
+   ],
+   [
+    31.42,
+    1111.9,
+    661.2,
+    0.0
+   ],
+   [
+    31.91,
+    1112.0,
+    661.3,
+    6.0
+   ],
+   [
+    32.42,
+    1111.1,
+    660.5,
+    0.0
+   ],
+   [
+    32.92,
+    1108.8,
+    657.5,
+    4.0
+   ],
+   [
+    33.42,
+    1112.1,
+    660.9,
+    4.0
+   ],
+   [
+    33.92,
+    1112.1,
+    660.9,
+    2.0
+   ],
+   [
+    34.41,
+    1111.3,
+    660.1,
+    4.0
+   ]
+  ]
+ }
+}

@@ -1,0 +1,39 @@
+{
+  "binary": "./target/release/blongo",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.589561700820923,
+      "blongo": {
+        "peakRssMiB": 181.203125,
+        "endRssMiB": 181.203125,
+        "cpuPercent": 0.4171202109954181,
+        "threads": 33,
+        "peakPssMiB": 158.0830078125
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 17.72700262069702,
+      "blongo": {
+        "peakRssMiB": 203.06640625,
+        "endRssMiB": 197.0546875,
+        "cpuPercent": 129.63274441653144,
+        "threads": 33,
+        "peakPssMiB": 179.8818359375
+      },
+      "harnessPeakRssMiB": 10.703125
+    },
+    "settled": {
+      "durationSeconds": 14.649494647979736,
+      "blongo": {
+        "peakRssMiB": 199.15234375,
+        "endRssMiB": 199.15234375,
+        "cpuPercent": 0.477832182488655,
+        "threads": 33,
+        "peakPssMiB": 175.9677734375
+      },
+      "harnessPeakRssMiB": 10.703125
+    }
+  }
+}

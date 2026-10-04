@@ -1,0 +1,38 @@
+[package]
+name = "blongo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "blongo"
+path = "src/main.rs"
+
+[dependencies]
+blongo-protocol.workspace = true
+blongo-core.workspace = true
+blongo-client = { workspace = true, features = ["local"] }
+tokio.workspace = true
+anyhow.workspace = true
+unicode-segmentation.workspace = true
+gpui.workspace = true
+gpui_platform = { workspace = true, features = ["x11", "wayland", "font-kit"] }
+mimalloc.workspace = true
+pulldown-cmark.workspace = true
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-c.workspace = true
+portable-pty.workspace = true
+alacritty_terminal.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true

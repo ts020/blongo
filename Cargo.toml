@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blongo-protocol",
+    "crates/blongo-harness",
+    "crates/blongo-store",
+    "crates/blongo-core",
+    "crates/blongo-git",
+    "crates/blongo-client",
+    "crates/blongo-server",
+    "apps/blongo",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+blongo-protocol = { path = "crates/blongo-protocol" }
+blongo-harness = { path = "crates/blongo-harness" }
+blongo-store = { path = "crates/blongo-store" }
+blongo-core = { path = "crates/blongo-core" }
+blongo-git = { path = "crates/blongo-git" }
+blongo-client = { path = "crates/blongo-client" }
+blongo-server = { path = "crates/blongo-server" }
+
+# GPUI: Zed's Apache-2.0 UI crates only, pinned to one rev.
+# Never depend on Zed's GPL-3.0 crates (editor, terminal, markdown, ui, ...).
+# See docs/phase0/gpui-choice.md for why this rev and not the zui fork.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "badfb8d31f2a03d0e3d996897bb93779003f4607", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "badfb8d31f2a03d0e3d996897bb93779003f4607" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "sync", "time"] }
+mimalloc = { version = "0.1", default-features = false }
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+dirs = "6"
+unicode-segmentation = "1"
+sha2 = "0.10"
+# Phase 2 UI: Markdown, code highlighting, terminal (all permissive).
+pulldown-cmark = { version = "0.13", default-features = false }
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# Phase 3: wire protocol, auth, transports (all permissive).
+rmp-serde = "1"
+serde_bytes = "0.11"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+subtle = "2"
+getrandom = "0.3"
+base64 = "0.22"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+libc = "0.2"
+
+[profile.release]
+# Fat LTO + one codegen unit: ~6 MB smaller binary and ~4 MiB less resident
+# code than thin LTO (docs/phase1/report.md), at the cost of slower release
+# builds.
+lto = "fat"
+strip = "symbols"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+# gpui is unusably slow unoptimized
+opt-level = 2

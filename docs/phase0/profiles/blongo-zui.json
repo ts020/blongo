@@ -1,0 +1,39 @@
+{
+  "binary": "/home/claude/blongo-zui/target/release/blongo",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.579474925994873,
+      "blongo": {
+        "peakRssMiB": 148.98828125,
+        "endRssMiB": 148.98828125,
+        "cpuPercent": 0.0,
+        "threads": 29,
+        "peakPssMiB": 126.0517578125
+      },
+      "harnessPeakRssMiB": 9.33203125
+    },
+    "stream": {
+      "durationSeconds": 17.632529735565186,
+      "blongo": {
+        "peakRssMiB": 149.125,
+        "endRssMiB": 141.83984375,
+        "cpuPercent": 0.8507003943821333,
+        "threads": 29,
+        "peakPssMiB": 126.1884765625
+      },
+      "harnessPeakRssMiB": 9.58203125
+    },
+    "settled": {
+      "durationSeconds": 14.626009225845337,
+      "blongo": {
+        "peakRssMiB": 141.83984375,
+        "endRssMiB": 141.83984375,
+        "cpuPercent": 0.0,
+        "threads": 29,
+        "peakPssMiB": 118.9033203125
+      },
+      "harnessPeakRssMiB": 9.58203125
+    }
+  }
+}

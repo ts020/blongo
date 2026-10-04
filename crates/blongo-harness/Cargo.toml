@@ -1,0 +1,21 @@
+[package]
+name = "blongo-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blongo-protocol.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+zip = { workspace = true, features = ["deflate-flate2-zlib-rs"] }

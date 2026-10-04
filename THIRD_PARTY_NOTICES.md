@@ -1,0 +1,132 @@
+# Third-party notices
+
+## zeron
+
+`tools/fixtures/resource-stream.jsonl` is copied from
+[zeronsh/zeron](https://github.com/zeronsh/zeron) (`scripts/fixtures/resource-stream.jsonl`,
+commit `9e1a11158b0626237c814f4bd36f5948483ed797`) so Blongo and zeron can be
+profiled with the identical workload. Parts of `crates/blongo-harness` are
+adapted from zeron's `crates/harness` where noted in the source.
+`crates/blongo-harness/src/antigravity_install.rs` uses the Antigravity
+1.2.1 archive names and SHA-512 digests zeron pins
+(`crates/harness/src/acp/mod.rs`) and follows its extraction rules.
+
+```
+MIT License
+
+Copyright (c) 2026 Wing
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## t3code
+
+Blongo's design follows [pingdotgg/t3code](https://github.com/pingdotgg/t3code)
+(MIT, Copyright (c) 2026 T3 Tools Inc.). Where code is adapted it is noted in
+the source.
+
+`crates/blongo-harness/tests/fixtures/t3code/*.ndjson` are t3code's recorded
+`codex app-server` sessions
+(`apps/server/src/orchestration-v2/testkit/fixtures/<scenario>/codex_transcript.ndjson`,
+commit `8ed276c246b624631e7d39241ebfd22d8314cb68`), used unchanged except that
+model names and one git branch name in the recorded metadata were replaced by
+neutral placeholders.
+
+`crates/blongo-harness/tests/fixtures/t3code/claude/*.ndjson` are t3code's
+recorded Claude Code sessions (`<scenario>/claude_transcript.ndjson`) and
+`crates/blongo-harness/tests/fixtures/t3code/acp/*.ndjson` its recorded ACP
+sessions (`<scenario>/grok_transcript.ndjson`, the Grok ACP agent; Blongo has
+no Antigravity recording), same commit. Model names, the agent's name and
+session metadata were replaced by neutral placeholders; the frames are
+otherwise unchanged. `tools/fixtures/make_t3_db.py` and
+`crates/blongo-core/tests/t3_import.rs` reproduce the columns of t3code's
+`005_Projections` and `055_OrchestrationV2` migrations.
+
+```
+MIT License
+
+Copyright (c) 2026 T3 Tools Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## GPUI
+
+Blongo links [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
+(Apache-2.0, Copyright Zed Industries, Inc.) at the revision pinned in
+`Cargo.toml`. `apps/blongo/src/input.rs` is adapted from GPUI's
+`crates/gpui/examples/input.rs` (Apache-2.0), extended to multiple lines,
+soft wrapping and scrolling. The Apache License 2.0 text (copied from GPUI's
+repository) is in `licenses/Apache-2.0.txt`. Only Apache-2.0 GPUI crates are
+used; none of Zed's GPL-licensed crates are depended on or copied.
+
+## Markdown, highlighting and terminal crates
+
+Linked, not copied: pulldown-cmark (MIT), tree-sitter, tree-sitter-highlight
+and the tree-sitter grammars for Rust, Python, JavaScript, TypeScript, Bash,
+JSON, Go and C (MIT), portable-pty (MIT) and alacritty_terminal
+(Apache-2.0). `deny.toml` keeps every dependency on a permissive license.
+
+## Remote environments (Phase 3)
+
+Linked, not copied: tokio-tungstenite and tungstenite (MIT), futures-util
+(MIT OR Apache-2.0), rmp-serde (MIT), serde_bytes (MIT OR Apache-2.0),
+ed25519-dalek and curve25519-dalek (BSD-3-Clause), subtle (BSD-3-Clause),
+sha2 (MIT OR Apache-2.0), getrandom (MIT OR Apache-2.0), base64
+(MIT OR Apache-2.0) and libc (MIT OR Apache-2.0).
+
+Crates these pull in that Blongo did not use before Phase 3 (from
+`Cargo.lock`; licenses as declared by each crate):
+
+| Crate | License |
+|---|---|
+| base64ct, const-oid, der, pkcs8, spki | Apache-2.0 OR MIT |
+| curve25519-dalek, ed25519-dalek | BSD-3-Clause |
+| curve25519-dalek-derive | MIT OR Apache-2.0 |
+| data-encoding | MIT |
+| ed25519, signature | Apache-2.0 OR MIT |
+| fiat-crypto | MIT OR Apache-2.0 OR BSD-1-Clause |
+| httparse | MIT OR Apache-2.0 |
+| rmp, rmp-serde | MIT |
+| sha1 | MIT OR Apache-2.0 |
+| socket2 | MIT OR Apache-2.0 |
+| tokio-tungstenite | MIT |
+| tungstenite | MIT OR Apache-2.0 |
+| utf-8 | MIT OR Apache-2.0 |
+
+Binary distributions must
+carry each linked crate's license text; this repository does not yet
+generate that bundle (for example with `cargo about`), see
+`docs/phase3/report.md`.

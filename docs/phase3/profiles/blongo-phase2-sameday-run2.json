@@ -1,0 +1,39 @@
+{
+  "binary": "<profile-dir>/blongo-phase2",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.59731912612915,
+      "blongo": {
+        "peakRssMiB": 177.5078125,
+        "endRssMiB": 177.5078125,
+        "cpuPercent": 0.4167830565423016,
+        "threads": 32,
+        "peakPssMiB": 154.7666015625
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 17.68899893760681,
+      "blongo": {
+        "peakRssMiB": 197.04296875,
+        "endRssMiB": 193.6015625,
+        "cpuPercent": 126.40624875872791,
+        "threads": 32,
+        "peakPssMiB": 174.2119140625
+      },
+      "harnessPeakRssMiB": 10.69140625
+    },
+    "settled": {
+      "durationSeconds": 14.678493976593018,
+      "blongo": {
+        "peakRssMiB": 193.62890625,
+        "endRssMiB": 193.62890625,
+        "cpuPercent": 0.3406344007752631,
+        "threads": 32,
+        "peakPssMiB": 170.7978515625
+      },
+      "harnessPeakRssMiB": 10.69140625
+    }
+  }
+}

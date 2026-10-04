@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  check:
+    name: fmt / clippy / test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Git for Windows defaults to core.autocrlf=true, which would check
+      # the fixtures out with CRLF and rewrite files in the tests' scratch
+      # repositories on checkout.
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Linux GPUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libzstd-dev libasound2-dev clang
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --no-fail-fast
+
+  license:
+    name: no GPL dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+  mem-smoke:
+    # Fails when blongo's peak RSS on the zeron-equivalent streaming workload
+    # (fixture streamed by the fake Codex through harness -> core -> SQLite
+    # -> timeline) exceeds the budget. zeron measures 206 MiB idle / 235 MiB
+    # streaming on the same software-Vulkan setup; see docs/phase0/results.md.
+    name: memory budget (Linux, software Vulkan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libzstd-dev libasound2-dev clang mesa-vulkan-drivers xvfb fonts-dejavu-core
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p blongo
+      - name: Profile
+        env:
+          # A regression ceiling, not the product target. Under software
+          # Vulkan (lavapipe) ~60 MiB of RSS is libLLVM and ~18 MiB the
+          # gallium driver, so Phase 0 already peaked at 187 MiB RSS and
+          # Phase 1 at ~190 (docs/phase1/report.md). After Phase 4 the
+          # streaming peak is ~200 MiB RSS locally and 197-202 on the runner
+          # (docs/final/report.md), so 210 keeps ~5% headroom over it. The
+          # 100/120 MiB targets are judged on real GPUs.
+          BLONGO_MAX_RSS_MIB: "210"
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          DISPLAY=:99 python3 tools/profile.py target/release/blongo profile-out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mem-smoke
+          # Only the results: profile-out/data holds the app's data folder,
+          # whose MCP socket folder is deliberately unlistable (mode 0300),
+          # and the upload fails with EACCES when it walks into it.
+          path: |
+            profile-out/*.json
+            profile-out/*.log

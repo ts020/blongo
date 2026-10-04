@@ -1,0 +1,36 @@
+{
+  "binary": "target/release/blongo",
+  "fixture": "tools/fixtures/resource-stream.jsonl",
+  "prompt": "bigdiff",
+  "view": "diff",
+  "project": "target/p4/diff-big/project",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.586820602416992,
+      "blongo": {
+        "peakRssMiB": 181.05859375,
+        "endRssMiB": 181.05859375,
+        "cpuPercent": 0.417239475514076,
+        "threads": 33,
+        "peakPssMiB": 158.119140625
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 0.0,
+      "blongo": null,
+      "harnessPeakRssMiB": 0
+    },
+    "settled": {
+      "durationSeconds": 14.64471960067749,
+      "blongo": {
+        "peakRssMiB": 215.484375,
+        "endRssMiB": 195.609375,
+        "cpuPercent": 1.980235934231094,
+        "threads": 33,
+        "peakPssMiB": 192.4521484375
+      },
+      "harnessPeakRssMiB": 10.6484375
+    }
+  }
+}

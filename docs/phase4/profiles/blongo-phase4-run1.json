@@ -1,0 +1,43 @@
+{
+  "binary": "/home/claude/blongo/target/release/blongo",
+  "fixture": "/home/claude/blongo/tools/fixtures/resource-stream.jsonl",
+  "prompt": "replay",
+  "view": null,
+  "closeAfter": null,
+  "project": "/home/claude/p4/prof1/project",
+  "phases": {
+    "idle": {
+      "durationSeconds": 9.589294672012329,
+      "blongo": {
+        "peakRssMiB": 178.65625,
+        "endRssMiB": 178.65625,
+        "cpuPercent": 0.41713182635575397,
+        "threads": 33,
+        "peakPssMiB": 155.8076171875
+      },
+      "harnessPeakRssMiB": 0
+    },
+    "stream": {
+      "durationSeconds": 17.698505640029907,
+      "blongo": {
+        "peakRssMiB": 199.03125,
+        "endRssMiB": 192.46875,
+        "cpuPercent": 122.15720603608806,
+        "threads": 33,
+        "peakPssMiB": 176.08984375
+      },
+      "harnessPeakRssMiB": 11.03125
+    },
+    "settled": {
+      "durationSeconds": 14.654891967773438,
+      "blongo": {
+        "peakRssMiB": 192.50390625,
+        "endRssMiB": 192.50390625,
+        "cpuPercent": 0.6141293992334618,
+        "threads": 33,
+        "peakPssMiB": 169.5625
+      },
+      "harnessPeakRssMiB": 11.03125
+    }
+  }
+}
