@@ -33,6 +33,9 @@ Control ops:
       "sha" is not the head, 405 when not mergeable or the method is not
       allowed); the GraphQL enablePullRequestAutoMerge mutation sets
       "auto_merge"; DELETE .../git/refs/heads/B is logged.
+  {"op": "ref", "repo": "o/n", "branch": "b", "sha": "..."}
+      what GET .../git/ref/heads/b answers (default: the head of the
+      pull request from b).
   {"op": "pull", "repo": "o/n", "pull": {number, title, head, base, ...}}
       merges the given fields into the pull (created if missing). Fields:
       number, title, state ("open"/"closed"), draft, merged, head (branch),
@@ -338,6 +341,17 @@ class Handler(BaseHTTPRequestHandler):
                     "allow_rebase_merge": r["allow_rebase_merge"],
                     "delete_branch_on_merge": r["delete_branch_on_merge"],
                 })
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/git/ref/heads/(.+)", url.path)
+            if m:
+                r = REPOS.get(f"{m[1]}/{m[2]}", {})
+                branch = unquote(m[3])
+                sha = None
+                if branch not in r.get("deleted_refs", []):
+                    sha = r.get("refs", {}).get(branch) or next(
+                        (p["head_sha"] for p in r.get("pulls", {}).values() if p["head"] == branch), None)
+                if not sha:
+                    return self.reply(404, {"message": "Not Found"})
+                return self.reply(200, {"ref": f"refs/heads/{branch}", "object": {"sha": sha, "type": "commit"}})
             m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls/(\d+)", url.path)
             if m:
                 full = f"{m[1]}/{m[2]}"
@@ -512,6 +526,8 @@ class Handler(BaseHTTPRequestHandler):
             p = pulls.get(number) or pull_defaults(full, number)
             p.update(fields)
             pulls[number] = p
+        elif op == "ref":
+            repo(body["repo"]).setdefault("refs", {})[body["branch"]] = body["sha"]
         elif op == "rate":
             RATE.update({k: body[k] for k in ("limit", "remaining") if k in body})
         elif op == "fail":

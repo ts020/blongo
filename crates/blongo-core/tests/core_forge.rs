@@ -254,6 +254,42 @@ impl TestCore {
         (reply, last)
     }
 
+    /// Refresh twice (an archive is dispatched after the first answer),
+    /// returning what was said and done meanwhile.
+    async fn refresh_heard(&mut self, thread_id: ThreadId) -> Vec<String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 42);
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.handle()
+                .client()
+                .query(id, Query::PrRefresh { thread_id });
+            self.until(|e| match e {
+                CoreEvent::Reply { id: got, .. } if *got == id => Some(()),
+                CoreEvent::Notice { message } => {
+                    heard.push(message.clone());
+                    None
+                }
+                CoreEvent::Event(ev) => {
+                    match &ev.kind {
+                        EventKind::ThreadArchived { .. } => heard.push("(archived)".into()),
+                        EventKind::ItemAdded { item } => {
+                            if let blongo_protocol::ItemKind::SystemNotice { message } = &item.kind
+                            {
+                                heard.push(message.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                }
+                _ => None,
+            })
+            .await;
+        }
+        heard
+    }
+
     async fn linked(&mut self, thread_id: ThreadId) -> Option<PrLink> {
         self.until(|e| match e {
             CoreEvent::Event(ev) => match &ev.kind {
@@ -1851,9 +1887,7 @@ async fn a_merged_thread_archives_itself_when_asked() {
     let head = git(&worktree, &["rev-parse", "HEAD"]);
     gh.pull(json!({"number": 1, "head_sha": head})).await;
     let _ = core.refresh(thread.id).await;
-    // Someone else pushes to the branch on GitHub, then it is merged
-    // there: the thread is archived, but the moved branch is kept on
-    // GitHub when asked to delete it.
+    // It is merged on GitHub: the thread archives itself.
     gh.pull(json!({"number": 1, "merged": true, "state": "closed"}))
         .await;
     core.handle().client().query(
@@ -1892,6 +1926,73 @@ async fn a_merged_thread_archives_itself_when_asked() {
 }
 
 #[tokio::test]
+async fn linking_a_merged_pull_request_is_not_news() {
+    let dir = temp_dir("forge-merge-relink");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let c = core.dispatch(Command::ProjectSetForge {
+        project_id: project,
+        settings: blongo_protocol::ForgeSettings {
+            archive_on_merge: true,
+            ..Default::default()
+        },
+    });
+    core.ok(&c).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let _ = core.refresh(thread.id).await;
+    // Seen open as #1, then linked to #2, merged long ago: nothing to
+    // say, nothing archived.
+    gh.pull(json!({"number": 2, "head": "blongo/fix-ci", "merged": true, "state": "closed"}))
+        .await;
+    let c = core.dispatch(Command::ThreadLinkPr {
+        thread_id: thread.id,
+        pr: "#2".into(),
+    });
+    core.ok(&c).await;
+    assert_eq!(core.status(thread.id).await.state, PrState::Merged);
+    let heard = core.refresh_heard(thread.id).await;
+    assert!(heard.is_empty(), "{heard:?}");
+    assert!(worktree.exists());
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_busy_thread_is_not_archived_on_merge() {
+    let dir = temp_dir("forge-merge-busy");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let c = core.dispatch(Command::ProjectSetForge {
+        project_id: project,
+        settings: blongo_protocol::ForgeSettings {
+            archive_on_merge: true,
+            ..Default::default()
+        },
+    });
+    core.ok(&c).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let _ = core.refresh(thread.id).await;
+    // A turn is running (waiting on an approval) when it is merged.
+    let c = core.send(thread.id, "hi");
+    core.ok(&c).await;
+    core.added_item(|i| matches!(i.kind, blongo_protocol::ItemKind::ApprovalRequest { .. }))
+        .await;
+    gh.pull(json!({"number": 1, "merged": true, "state": "closed"}))
+        .await;
+    let heard = core.refresh_heard(thread.id).await;
+    assert_eq!(
+        heard,
+        [
+            "acme/widgets#1 was merged. The thread is busy, so it was not archived; archive it \
+          from the PR tab when it is done."
+        ]
+    );
+    assert!(worktree.exists());
+    core.shutdown();
+}
+
+#[tokio::test]
 async fn a_branch_with_new_commits_is_not_deleted() {
     let dir = temp_dir("forge-merge-moved");
     github_project(&dir);
@@ -1902,6 +2003,10 @@ async fn a_branch_with_new_commits_is_not_deleted() {
     // Merged at an older commit than the branch on GitHub now has.
     gh.pull(json!({"number": 1, "head_sha": "e".repeat(40), "merged": true, "state": "closed"}))
         .await;
+    gh.control(
+        json!({"op": "ref", "repo": "acme/widgets", "branch": "blongo/fix-ci", "sha": head}),
+    )
+    .await;
     let _ = core.refresh(thread.id).await;
     let err = core
         .query(Query::PrArchive {

@@ -10,11 +10,7 @@
 //! commit; the branch on GitHub is deleted only when asked for, and only
 //! while it is still at the merged commit.
 
-use std::path::PathBuf;
-
-use blongo_forge::branch;
 use blongo_forge::github::RepoInfo;
-use blongo_forge::remote;
 use blongo_protocol::{MergeMethod, PrDetail, PrLink, PrState, PrStatus};
 
 use super::forge::ForgeCtx;
@@ -149,22 +145,14 @@ impl Orchestrator {
             if link.read_only || !forge::owns_branch(thread) || ours != Some(&link.head_branch) {
                 return Err("only the thread that owns the branch can delete it".into());
             }
-            let project = self
-                .projects
-                .get(&thread.project_id)
-                .ok_or("unknown project")?;
-            Ok(Some((
-                link,
-                PathBuf::from(thread.cwd(project)),
-                status.head_sha.clone(),
-            )))
+            Ok(Some((link, status.head_sha.clone())))
         })();
         match job {
             Ok(None) => self.archive_for(id, thread_id),
-            Ok(Some((link, cwd, sha))) => {
+            Ok(Some((link, sha))) => {
                 let ctx = self.forge_ctx();
                 self.spawn_job(Key::None, async move {
-                    let result = delete_remote_branch(&ctx, &link, &cwd, &sha).await;
+                    let result = delete_remote_branch(&ctx, &link, &sha).await;
                     JobDone::ForgeMerge(Box::new(MergeDone::BranchDeleted {
                         query: id,
                         thread_id,
@@ -242,14 +230,13 @@ impl Orchestrator {
         let label = link.label();
         if project.forge.archive_on_merge && forge::owns_branch(thread) {
             if self.ensure_idle(thread).is_ok() {
-                let title = thread.title.clone();
+                // Said when the archive commits (a turn starting first
+                // refuses it, and the scheduler reports that).
+                self.forge.auto_archiving.insert(thread_id);
                 self.deferred.push_back(Deferred::Dispatch(Pending::new(
                     Command::ThreadArchive { thread_id },
                     Reply::Internal,
                 )));
-                self.emit(CoreEvent::Notice {
-                    message: format!("{label} was merged, so \"{title}\" was archived."),
-                });
             } else {
                 self.thread_notice(
                     thread_id,
@@ -331,17 +318,15 @@ async fn merge(
 }
 
 /// Delete the merged branch on GitHub, only while it is still at the
-/// merged commit (nobody pushed to it since).
-async fn delete_remote_branch(
-    ctx: &ForgeCtx,
-    link: &PrLink,
-    cwd: &std::path::Path,
-    sha: &str,
-) -> Result<(), String> {
-    let remote_name = remote::remote_name(cwd)
+/// merged commit (nobody pushed to it since). Asked of the pull
+/// request's own repository, not the folder's remote.
+async fn delete_remote_branch(ctx: &ForgeCtx, link: &PrLink, sha: &str) -> Result<(), String> {
+    let (gh, repo) = forge::client_for(ctx, link).await?;
+    let tip = gh
+        .branch_tip(&repo, &link.head_branch)
         .await
-        .ok_or("this folder has no git remote")?;
-    match branch::remote_branch_tip(cwd, &remote_name, &link.head_branch).await? {
+        .map_err(|e| ctx.fail(&repo.host, e))?;
+    match tip {
         None => return Ok(()),
         Some(tip) if tip == sha => {}
         Some(_) => {
@@ -351,7 +336,6 @@ async fn delete_remote_branch(
             ));
         }
     }
-    let (gh, repo) = forge::client_for(ctx, link).await?;
     gh.delete_branch(&repo, &link.head_branch)
         .await
         .map_err(|e| ctx.fail(&repo.host, e))

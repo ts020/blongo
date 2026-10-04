@@ -63,6 +63,9 @@ pub(super) struct ForgeRt {
     /// What a query answers once its command committed (default: "sent
     /// to the agent").
     pub answers: HashMap<QueryId, String>,
+    /// Threads being archived because their pull request was merged (said
+    /// once the archive is committed).
+    pub auto_archiving: HashSet<ThreadId>,
     tokens: TokenCache,
 }
 
@@ -207,6 +210,10 @@ impl ForgeRt {
         self.fast_until.remove(&thread_id);
         self.failures.remove(&thread_id);
         self.lookup.remove(&thread_id);
+        // What was seen of the previous pull request is no news base for
+        // the next one.
+        self.seen.remove(&thread_id);
+        self.states.remove(&thread_id);
     }
 
     /// Something happened on the thread: poll it soon and fast for a while.
@@ -358,6 +365,17 @@ impl Orchestrator {
                 self.consider_merged(*thread_id, status);
             }
             EventKind::ThreadArchived { thread_id } => {
+                if self.forge.auto_archiving.remove(thread_id)
+                    && let Some(thread) = self.threads.get(thread_id)
+                {
+                    let label = thread.pr.as_ref().map(|l| l.label()).unwrap_or_default();
+                    self.emit(CoreEvent::Notice {
+                        message: format!(
+                            "{label} was merged, so \"{}\" was archived.",
+                            thread.title
+                        ),
+                    });
+                }
                 self.forge.forget(*thread_id);
                 self.answer_pr_waiters(*thread_id, Err("the thread was archived".into()));
             }

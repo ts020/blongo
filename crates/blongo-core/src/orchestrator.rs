@@ -854,6 +854,19 @@ impl Orchestrator {
                 command_id: pending.command.command_id,
                 reason,
             }),
+            Reply::Internal
+                if matches!(
+                    pending.command.command,
+                    Command::ThreadArchive { thread_id } if self.forge.auto_archiving.remove(&thread_id)
+                ) =>
+            {
+                self.emit(CoreEvent::Notice {
+                    message: format!(
+                        "A merged pull request's thread was not archived: {reason}. Archive it \
+                         from the PR tab."
+                    ),
+                });
+            }
             Reply::Internal => {
                 eprintln!("blongo-core: scheduled command refused: {reason}");
                 self.emit(CoreEvent::Notice {

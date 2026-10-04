@@ -329,6 +329,27 @@ impl GitHub {
         Ok(())
     }
 
+    /// The commit `branch` points at on GitHub (`None`: no such branch).
+    pub async fn branch_tip(
+        &self,
+        repo: &RepoRef,
+        branch: &str,
+    ) -> Result<Option<String>, GhError> {
+        let path: Vec<String> = branch.split('/').map(encode).collect();
+        match self
+            .get(&format!(
+                "/repos/{}/git/ref/heads/{}",
+                repo.full_name(),
+                path.join("/")
+            ))
+            .await
+        {
+            Ok(v) => Ok(v["object"]["sha"].as_str().map(str::to_owned)),
+            Err(GhError::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// `DELETE /repos/{owner}/{name}/git/refs/heads/{branch}`; a branch
     /// already gone is fine.
     pub async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), GhError> {

@@ -43,7 +43,8 @@ pub struct PrView {
     /// allowed).
     merge_method: Option<MergeMethod>,
     /// The user pressed Merge despite the blockers: ask once more.
-    confirm_merge: bool,
+    /// A merge waiting on "anyway" (`Some(true)`: auto-merge).
+    confirm_merge: Option<bool>,
     /// A merge or archive request is on its way.
     merging: bool,
     /// Delete the branch on GitHub when archiving.
@@ -91,7 +92,7 @@ impl PrView {
             pushing: false,
             sending: false,
             merge_method: None,
-            confirm_merge: false,
+            confirm_merge: None,
             merging: false,
             delete_remote: false,
             edit_base: None,
@@ -265,14 +266,23 @@ impl PrView {
         if self.merging {
             return;
         }
-        if !auto && !self.confirm_merge && !detail.blockers().is_empty() {
-            self.confirm_merge = true;
+        // Auto-merge waits for what GitHub enforces, so it asks only
+        // about what GitHub never sees or may not require.
+        let unsure = if auto {
+            detail.ahead.is_some_and(|n| n > 0)
+                || detail.uncommitted > 0
+                || detail.status.unresolved_threads > 0
+        } else {
+            !detail.blockers().is_empty()
+        };
+        if unsure && self.confirm_merge != Some(auto) {
+            self.confirm_merge = Some(auto);
             cx.notify();
             return;
         }
         let sha = detail.status.head_sha.clone();
         self.merging = true;
-        self.confirm_merge = false;
+        self.confirm_merge = None;
         self.message = None;
         cx.notify();
         crate::query::ask(
@@ -415,7 +425,7 @@ impl PrView {
                     "pr-merge".into(),
                     if self.merging {
                         "Merging…"
-                    } else if self.confirm_merge {
+                    } else if self.confirm_merge == Some(false) {
                         "Merge anyway"
                     } else {
                         "Merge"
@@ -428,13 +438,22 @@ impl PrView {
                     theme::text(),
                     cx.listener(move |this, _, _, cx| this.merge(chosen, false, cx)),
                 ));
-                if self.confirm_merge {
+                if let Some(auto) = self.confirm_merge {
+                    if auto {
+                        r = r.child(button(
+                            "pr-auto-merge".into(),
+                            "Merge when ready anyway",
+                            theme::surface_hover(),
+                            theme::text(),
+                            cx.listener(move |this, _, _, cx| this.merge(chosen, true, cx)),
+                        ));
+                    }
                     r = r
-                        .child(
-                            div()
-                                .text_color(theme::warning())
-                                .child("Not ready (see above). Merge anyway?"),
-                        )
+                        .child(div().text_color(theme::warning()).child(if auto {
+                            "Local commits, uncommitted changes or open conversations (see above)."
+                        } else {
+                            "Not ready (see above). Merge anyway?"
+                        }))
                         .child(
                             div()
                                 .id("pr-merge-cancel")
@@ -442,7 +461,7 @@ impl PrView {
                                 .cursor_pointer()
                                 .child("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_merge = false;
+                                    this.confirm_merge = None;
                                     cx.notify();
                                 })),
                         );
@@ -470,7 +489,8 @@ impl PrView {
                         .text_color(theme::success())
                         .child("Archive the thread when you are done:"),
                 );
-                if !detail.delete_branch_on_merge {
+                // Only the thread that owns the branch may delete it.
+                if !detail.delete_branch_on_merge && detail.auto_fix.is_some() {
                     r = r.child(
                         div()
                             .id("pr-delete-remote")
@@ -677,12 +697,20 @@ impl Render for PrView {
                                         .text_color(crate::pr::color(status.badge()))
                                         .child(state),
                                 )
-                                .child(SharedString::from(format!(
-                                    "{} wants to merge {} into {}",
-                                    detail.author,
-                                    link.as_ref().map_or("?", |l| l.head_branch.as_str()),
-                                    link.as_ref().map_or("?", |l| l.base_branch.as_str()),
-                                )))
+                                .child(SharedString::from({
+                                    let head =
+                                        link.as_ref().map_or("?", |l| l.head_branch.as_str());
+                                    let base =
+                                        link.as_ref().map_or("?", |l| l.base_branch.as_str());
+                                    if status.state == PrState::Merged {
+                                        format!("{}'s {head} was merged into {base}", detail.author)
+                                    } else {
+                                        format!(
+                                            "{} wants to merge {head} into {base}",
+                                            detail.author
+                                        )
+                                    }
+                                }))
                                 .child(SharedString::from(format!(
                                     "+{} −{} in {} file{}",
                                     detail.additions,
