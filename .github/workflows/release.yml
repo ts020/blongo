@@ -4,7 +4,8 @@ name: Release
 # platform and publishes them as a GitHub Release. A tag with a hyphen
 # (v0.1.0-rc.1) becomes a pre-release. Creating the release (and its new
 # tag) on github.com works too: the files are attached to that release.
-# macOS downloads are a Blongo.app in a .dmg (packaging/macos/bundle.sh).
+# macOS downloads are a Blongo.app in a .dmg (packaging/macos/bundle.sh),
+# Apple Silicon only.
 # A pull request that touches this file builds the same archives without
 # publishing, so changes here are checked before they reach a real tag.
 
@@ -30,9 +31,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
             mac_arch: arm64
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            mac_arch: x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-2025
     runs-on: ${{ matrix.os }}
@@ -121,7 +119,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [arm64, x86_64]
+        arch: [arm64]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4

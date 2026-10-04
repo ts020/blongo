@@ -5,7 +5,7 @@
 Pushing a `v*` tag builds Blongo and publishes it as a GitHub Release
 (`.github/workflows/release.yml`), with `SHA256SUMS.txt`:
 
-- macOS (Apple Silicon and Intel): `Blongo-<tag>-macos-<arch>.dmg`. Open it
+- macOS (Apple Silicon only): `Blongo-<tag>-macos-arm64.dmg`. Open it
   and drag Blongo to Applications. `blongo-serve` is inside the app at
   `Blongo.app/Contents/MacOS/blongo-serve`.
 - Linux x86_64 and Windows x86_64: an archive with `blongo` and
