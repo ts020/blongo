@@ -78,45 +78,86 @@ jobs:
           fi
           rm -r "$name"
           ls -l
-      # macOS gets Blongo.app (with blongo-serve inside) in a .dmg. Signing
-      # and notarization use the secrets below on tags; without them (and on
-      # pull requests) the app is ad-hoc signed. See packaging/macos/bundle.sh.
+      # macOS: Blongo.app (blongo-serve inside), ad-hoc signed. On tags the
+      # dmg is made by macos-dmg below, the only job that sees the signing
+      # secrets; on pull requests it is made here, unsigned.
       - name: Package (macOS app)
         if: runner.os == 'macOS'
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ github.ref_type == 'tag' && secrets.MACOS_CERTIFICATE_P12_BASE64 || '' }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ github.ref_type == 'tag' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
-          APPLE_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_ID || '' }}
-          APPLE_TEAM_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_TEAM_ID || '' }}
-          APPLE_APP_PASSWORD: ${{ github.ref_type == 'tag' && secrets.APPLE_APP_PASSWORD || '' }}
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            label="$GITHUB_REF_NAME"
             version="${GITHUB_REF_NAME#v}"
           else
-            label="pr-${GITHUB_SHA::7}"
             version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           fi
+          mkdir -p app dist
+          packaging/macos/bundle.sh app "$version" target/release app
+          tar -czf "app/Blongo-app-${{ matrix.mac_arch }}.tar.gz" -C app Blongo.app
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            packaging/macos/bundle.sh dmg app/Blongo.app \
+              "dist/Blongo-pr-${GITHUB_SHA::7}-macos-${{ matrix.mac_arch }}.dmg"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: app-${{ matrix.mac_arch }}
+          path: app/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS' || github.ref_type != 'tag'
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Signs and notarizes the macOS app when the `release` environment holds
+  # the Apple secrets, then wraps it in a dmg. The environment requires the
+  # owner's approval, so nothing else in a run can reach those secrets
+  # (docs/macos-signing.md).
+  macos-dmg:
+    name: macOS dmg (${{ matrix.arch }})
+    if: github.ref_type == 'tag'
+    needs: build
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-${{ matrix.arch }}
+          path: app
+      - name: Sign, notarize and package
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          tar -xzf app/Blongo-app-${{ matrix.arch }}.tar.gz -C app
           mkdir -p dist
-          packaging/macos/bundle.sh "$version" target/release \
-            "dist/Blongo-${label}-macos-${{ matrix.mac_arch }}.dmg"
-          ls -l dist
+          packaging/macos/bundle.sh dmg app/Blongo.app \
+            "dist/Blongo-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}.dmg"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: dist-macos-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   publish:
     name: publish GitHub Release
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, macos-dmg]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: dist-*
           path: dist
           merge-multiple: true
       - name: Checksums
