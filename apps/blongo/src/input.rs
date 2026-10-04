@@ -173,6 +173,11 @@ impl TextInput {
         &self.content
     }
 
+    pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = text.into();
+        cx.notify();
+    }
+
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.content = if self.multiline {
             text.to_owned()

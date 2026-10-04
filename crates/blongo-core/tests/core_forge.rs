@@ -2032,3 +2032,386 @@ async fn a_branch_with_new_commits_is_not_deleted() {
     assert_eq!(git(&main, &["rev-parse", "blongo/fix-ci"]), head);
     core.shutdown();
 }
+
+// ------------------------------------------------- threads from PRs/issues
+
+impl TestCore {
+    /// Start a thread from `source`: the reply and the thread created.
+    async fn open_from(
+        &mut self,
+        project_id: Option<ProjectId>,
+        source: blongo_protocol::ThreadSource,
+    ) -> Result<(blongo_protocol::ThreadOpened, Thread), String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 43);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let thread_id = ThreadId::new();
+        self.handle().client().query(
+            id,
+            Query::ThreadFrom {
+                project_id,
+                thread_id,
+                source,
+                provider: Default::default(),
+                model: None,
+            },
+        );
+        let mut created = None;
+        let reply = self
+            .until(|e| match e {
+                CoreEvent::Reply { id: got, result } if *got == id => Some(result.clone()),
+                CoreEvent::Event(ev) => {
+                    if let EventKind::ThreadCreated { thread } = &ev.kind
+                        && thread.id == thread_id
+                    {
+                        created = Some((**thread).clone());
+                    }
+                    None
+                }
+                _ => None,
+            })
+            .await;
+        match reply? {
+            QueryReply::ThreadOpened(opened) => {
+                assert_eq!(opened.thread_id, thread_id);
+                Ok((opened, created.expect("the thread was created first")))
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+}
+
+/// Push a commit on a new `branch` to the remote (as `refspec`'s
+/// destination when given) without keeping the local branch; its sha.
+fn push_remote_branch(project: &Path, branch: &str, dest: Option<&str>) -> String {
+    git(project, &["checkout", "--quiet", "-b", branch]);
+    commit_file(
+        project,
+        &format!("{}.txt", branch.replace('/', "-")),
+        branch,
+    );
+    let sha = git(project, &["rev-parse", "HEAD"]);
+    let refspec = format!(
+        "{branch}:{}",
+        dest.unwrap_or(&format!("refs/heads/{branch}"))
+    );
+    git(project, &["push", "--quiet", "origin", &refspec]);
+    git(project, &["checkout", "--quiet", "main"]);
+    git(project, &["branch", "--quiet", "-D", branch]);
+    sha
+}
+
+#[tokio::test]
+async fn candidates_list_pull_requests_issues_and_free_branches() {
+    let dir = temp_dir("forge-open-candidates");
+    github_project(&dir);
+    let main = dir.join("project");
+    push_remote_branch(&main, "feature/a", None);
+    git(&main, &["branch", "local-only"]);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let (_thread, _) = core.thread_with_pr(project).await;
+    gh.pull(
+        json!({"number": 3, "title": "Feature A", "head": "feature/a",
+                   "updated_at": "2026-10-03T00:00:00Z"}),
+    )
+    .await;
+    gh.pull(
+        json!({"number": 4, "title": "Fix typo", "head": "patch-1", "head_repo": "someone/widgets",
+                   "reviewers": ["octocat"], "updated_at": "2026-10-01T00:00:00Z"}),
+    )
+    .await;
+    gh.control(json!({"op": "issue", "repo": "acme/widgets", "issue":
+        {"number": 5, "title": "Crash on\nempty input", "assignees": ["octocat"],
+         "updated_at": "2026-10-01T00:00:00Z"}}))
+        .await;
+    gh.control(json!({"op": "issue", "repo": "acme/widgets", "issue":
+        {"number": 6, "title": "Docs", "updated_at": "2026-10-03T00:00:00Z"}}))
+        .await;
+    gh.control(json!({"op": "issue", "repo": "acme/widgets", "issue":
+        {"number": 7, "title": "Old", "state": "closed"}}))
+        .await;
+    let QueryReply::Candidates(c) = core
+        .query(Query::ForgeCandidates {
+            project_id: project,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("not candidates");
+    };
+    assert_eq!(c.repo, "acme/widgets");
+    assert_eq!(c.problem, None);
+    // The user's own first, then recently updated.
+    let pulls: Vec<(u64, bool, bool)> =
+        c.pulls.iter().map(|p| (p.number, p.mine, p.fork)).collect();
+    assert_eq!(
+        pulls,
+        [(4, true, true), (1, false, false), (3, false, false)]
+    );
+    assert_eq!(c.pulls[2].head_branch, "feature/a");
+    let issues: Vec<(u64, bool)> = c.issues.iter().map(|i| (i.number, i.mine)).collect();
+    assert_eq!(issues, [(5, true), (6, false)]);
+    assert_eq!(c.issues[0].title, "Crash on empty input");
+    // Branches nothing has checked out (main and the thread's are).
+    let branches: Vec<(&str, bool)> = c
+        .branches
+        .iter()
+        .map(|b| (b.name.as_str(), b.remote_only))
+        .collect();
+    assert!(branches.contains(&("feature/a", true)), "{branches:?}");
+    assert!(branches.contains(&("local-only", false)), "{branches:?}");
+    assert!(
+        !branches
+            .iter()
+            .any(|(b, _)| *b == "main" || *b == "blongo/fix-ci"),
+        "{branches:?}"
+    );
+    // GitHub down: branches are still offered.
+    gh.control(json!({"op": "fail", "path_prefix": "/repos/acme/widgets/pulls", "status": 502}))
+        .await;
+    let QueryReply::Candidates(c) = core
+        .query(Query::ForgeCandidates {
+            project_id: project,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("not candidates");
+    };
+    assert!(c.problem.is_some());
+    assert!(c.pulls.is_empty() && c.issues.is_empty());
+    assert!(!c.branches.is_empty());
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_thread_opens_on_a_pull_requests_branch_and_links_it() {
+    let dir = temp_dir("forge-open-pull");
+    github_project(&dir);
+    let main = dir.join("project");
+    let sha = push_remote_branch(&main, "feature/a", None);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    gh.pull(json!({"number": 3, "title": "Feature A", "head": "feature/a", "head_sha": sha}))
+        .await;
+    let (opened, thread) = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Pull {
+                reference: "#3".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(thread.title, "Feature A");
+    assert_eq!(opened.draft, None);
+    assert!(
+        opened.message.contains("acme/widgets#3"),
+        "{}",
+        opened.message
+    );
+    let wt = thread.worktree.clone().unwrap();
+    assert_eq!(wt.branch, "feature/a");
+    assert_eq!(git(Path::new(&wt.path), &["rev-parse", "HEAD"]), sha);
+    let link = core.linked(thread.id).await.unwrap();
+    assert_eq!(link.number, 3);
+    assert!(!link.read_only);
+    // Its branch is taken now.
+    let err = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Pull {
+                reference: "#3".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("feature/a is checked out in"), "{err}");
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_fork_pull_request_opens_read_only_from_its_url() {
+    let dir = temp_dir("forge-open-fork");
+    github_project(&dir);
+    let main = dir.join("project");
+    let sha = push_remote_branch(&main, "tmp", Some("refs/pull/4/head"));
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    gh.pull(json!({"number": 4, "title": "Fix typo", "head": "patch-1",
+                   "head_repo": "someone/widgets", "head_sha": sha}))
+        .await;
+    // No project named: the one whose remote is the URL's repository.
+    let (opened, thread) = core
+        .open_from(
+            None,
+            blongo_protocol::ThreadSource::Pull {
+                reference: "https://github.com/acme/widgets/pull/4".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(thread.project_id, project);
+    assert!(opened.message.contains("read-only"), "{}", opened.message);
+    let wt = thread.worktree.clone().unwrap();
+    assert_eq!(wt.branch, "blongo/pr-4");
+    assert_eq!(git(Path::new(&wt.path), &["rev-parse", "HEAD"]), sha);
+    let link = core.linked(thread.id).await.unwrap();
+    assert!(link.read_only);
+    // Another repository's pull request has no project here.
+    let err = core
+        .open_from(
+            None,
+            blongo_protocol::ThreadSource::Pull {
+                reference: "https://github.com/other/repo/pull/1".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("no project here works on other/repo"), "{err}");
+    let err = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Pull {
+                reference: "other/repo#1".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("not this project's repository"), "{err}");
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn an_issue_starts_a_named_branch_a_draft_and_closes_it() {
+    let dir = temp_dir("forge-open-issue");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    gh.control(json!({"op": "issue", "repo": "acme/widgets", "issue":
+        {"number": 5, "title": "Crash on empty input", "body": "Steps:\r\n1. run it"}}))
+        .await;
+    let (opened, thread) = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Issue {
+                reference: "#5".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(thread.title, "Crash on empty input");
+    assert_eq!(
+        opened.draft.as_deref(),
+        Some(
+            "Work on issue #5: Crash on empty input\n\nSteps:\n1. run it\n\n\
+             https://github.com/acme/widgets/issues/5\n"
+        )
+    );
+    let wt = thread.worktree.clone().unwrap();
+    assert_eq!(wt.branch, "blongo/5-crash-on-empty-input");
+    // From the base branch.
+    let main = dir.join("project");
+    assert_eq!(
+        git(Path::new(&wt.path), &["rev-parse", "HEAD"]),
+        git(&main, &["rev-parse", "main"])
+    );
+    // Nothing was sent to the agent.
+    assert_eq!(thread.status, blongo_protocol::ThreadStatus::Idle);
+    // The pull request closes the issue.
+    commit_file(Path::new(&wt.path), "fix.txt", "Fix the crash");
+    let prep = core.prepare(thread.id).await;
+    assert_eq!(prep.closes, Some(5));
+    assert_eq!(prep.suggested_branch, "blongo/5-crash-on-empty-input");
+    assert!(
+        prep.draft_prompt.contains("`Closes #5`"),
+        "{}",
+        prep.draft_prompt
+    );
+    // The same issue again: the next free name.
+    let (_, again) = core
+        .open_from(
+            Some(project),
+            blongo_protocol::ThreadSource::Issue {
+                reference: "https://github.com/acme/widgets/issues/5".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        again.worktree.unwrap().branch,
+        "blongo/5-crash-on-empty-input-2"
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn branches_open_and_bad_sources_are_refused() {
+    let dir = temp_dir("forge-open-branch");
+    github_project(&dir);
+    let main = dir.join("project");
+    let remote_sha = push_remote_branch(&main, "feature/b", None);
+    git(&main, &["branch", "local-only"]);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let branch = |name: &str| blongo_protocol::ThreadSource::Branch { name: name.into() };
+    // A local branch: checked out as it is.
+    let (_, local) = core
+        .open_from(Some(project), branch("local-only"))
+        .await
+        .unwrap();
+    let wt = local.worktree.unwrap();
+    assert_eq!(wt.branch, "local-only");
+    assert_eq!(
+        git(Path::new(&wt.path), &["rev-parse", "HEAD"]),
+        git(&main, &["rev-parse", "main"])
+    );
+    // Only on the remote: fetched.
+    let (_, remote) = core
+        .open_from(Some(project), branch("feature/b"))
+        .await
+        .unwrap();
+    let wt = remote.worktree.unwrap();
+    assert_eq!(wt.branch, "feature/b");
+    assert_eq!(git(Path::new(&wt.path), &["rev-parse", "HEAD"]), remote_sha);
+    // Refused: checked out already, nowhere, not a name.
+    for (name, want) in [
+        ("main", "main is checked out in"),
+        ("nope", "there is no branch nope here or on origin"),
+        ("-x", "is not a branch name"),
+    ] {
+        let err = core
+            .open_from(Some(project), branch(name))
+            .await
+            .unwrap_err();
+        assert!(err.contains(want), "{name}: {err}");
+    }
+    // Pull requests and issues GitHub says no to.
+    gh.pull(json!({"number": 8, "merged": true, "state": "closed"}))
+        .await;
+    gh.control(
+        json!({"op": "issue", "repo": "acme/widgets", "issue": {"number": 9, "state": "closed"}}),
+    )
+    .await;
+    gh.pull(json!({"number": 10})).await;
+    let pull = |r: &str| blongo_protocol::ThreadSource::Pull {
+        reference: r.into(),
+    };
+    let issue = |r: &str| blongo_protocol::ThreadSource::Issue {
+        reference: r.into(),
+    };
+    for (source, want) in [
+        (pull("#8"), "#8 is merged already"),
+        (pull("#99"), "acme/widgets#99 was not found"),
+        (pull("x"), "enter a pull request URL"),
+        (issue("#9"), "issue #9 is closed"),
+        (issue("#10"), "#10 is a pull request; open it as one"),
+    ] {
+        let err = core.open_from(Some(project), source).await.unwrap_err();
+        assert!(err.contains(want), "{want}: {err}");
+    }
+    // A thread without a project to go to.
+    let err = core.open_from(None, branch("feature/b")).await.unwrap_err();
+    assert!(err.contains("choose a project"), "{err}");
+    core.shutdown();
+}

@@ -33,6 +33,7 @@ use crate::{
 mod autofix;
 mod forge;
 mod merge;
+mod open;
 mod tools;
 
 /// Default title of a new thread; replaced by the first message.
@@ -199,8 +200,7 @@ enum PrepPlan {
         project_path: PathBuf,
         path: PathBuf,
         branch: String,
-        /// Start from the remote's base branch (`None`: the project's HEAD).
-        base: Option<forge::BasePlan>,
+        checkout: open::Checkout,
     },
     Rollback {
         cwd: PathBuf,
@@ -244,6 +244,7 @@ enum JobDone {
     ForgeQuery(Box<forge::QueryDone>),
     ForgeFix(Box<autofix::FixDone>),
     ForgeMerge(Box<merge::MergeDone>),
+    ForgeOpen(Box<open::OpenDone>),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -679,7 +680,7 @@ impl Orchestrator {
         match item {
             Deferred::Dispatch(pending) => command_key(&pending.command.command),
             Deferred::Query(_, Query::GitSwitch { .. } | Query::PrCreate { .. }) => Key::Global,
-            Deferred::Query(_, query) => Key::Thread(query.thread_id()),
+            Deferred::Query(_, query) => query.thread_id().map_or(Key::None, Key::Thread),
             Deferred::Import(_) => Key::Global,
         }
     }
@@ -843,6 +844,7 @@ impl Orchestrator {
             JobDone::ForgeQuery(done) => self.forge_query_done(*done),
             JobDone::ForgeFix(done) => self.fix_done(*done),
             JobDone::ForgeMerge(done) => self.merge_done(*done),
+            JobDone::ForgeOpen(done) => self.open_done(*done),
         }
     }
 
@@ -877,6 +879,7 @@ impl Orchestrator {
             Reply::Query(id) => {
                 self.forge.drafts.retain(|_, q| *q != id);
                 self.forge.answers.remove(&id);
+                self.open_refused(id);
                 self.emit(CoreEvent::Reply {
                     id,
                     result: Err(reason),
@@ -894,6 +897,9 @@ impl Orchestrator {
             return self.fix_sent(run_id);
         }
         if let Reply::Query(id) = reply {
+            if self.opened(id) {
+                return;
+            }
             // A draft answers when its turn ends; a fix now.
             if !self.forge.drafts.values().any(|q| *q == id) {
                 let text = self
@@ -1044,8 +1050,8 @@ impl Orchestrator {
                 }
                 let project_path = PathBuf::from(&project.path);
                 let id = thread_id.0.simple().to_string();
-                let branch = format!("{}{}", project.forge.branch_prefix, &id[id.len() - 12..]);
-                let base = self.base_plan(project);
+                let generated = format!("{}{}", project.forge.branch_prefix, &id[id.len() - 12..]);
+                let (branch, checkout) = self.worktree_checkout(*thread_id, *project_id, generated);
                 let path = self
                     .config
                     .data_dir
@@ -1055,7 +1061,7 @@ impl Orchestrator {
                     project_path,
                     path,
                     branch,
-                    base,
+                    checkout,
                 }))
             }
             Command::ThreadRollback {
@@ -3380,18 +3386,31 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
             project_path,
             path,
             branch,
-            base,
+            checkout,
         } => {
             let root = blongo_git::work_tree_root(&project_path)
                 .await
                 .ok_or_else(|| format!("{} is not in a git repository", project_path.display()))?;
-            let start = match base {
-                Some(plan) => forge::worktree_base(&root, plan).await,
-                None => forge::WorktreeBase::default(),
-            };
-            blongo_git::add_worktree(&root, &path, &branch, start.start.as_deref())
-                .await
-                .map_err(|e| format!("{e:#}"))?;
+            let start = match checkout {
+                open::Checkout::New(base) => {
+                    let start = match base {
+                        Some(plan) => forge::worktree_base(&root, plan).await,
+                        None => forge::WorktreeBase::default(),
+                    };
+                    blongo_git::add_worktree(&root, &path, &branch, start.start.as_deref())
+                        .await
+                        .map(|()| start)
+                }
+                open::Checkout::At(at) => {
+                    blongo_git::add_worktree(&root, &path, &branch, Some(&at))
+                        .await
+                        .map(|()| forge::WorktreeBase::default())
+                }
+                open::Checkout::Existing => blongo_git::add_worktree_on(&root, &path, &branch)
+                    .await
+                    .map(|()| forge::WorktreeBase::default()),
+            }
+            .map_err(|e| format!("{e:#}"))?;
             // A project inside a larger repository keeps its relative place
             // in the worktree.
             let rel = project_path

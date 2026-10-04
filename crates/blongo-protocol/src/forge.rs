@@ -446,6 +446,10 @@ pub struct PrPrepare {
     pub draft_prompt: String,
     /// The token may push (else the pull request cannot be created).
     pub can_push: bool,
+    /// The thread was started from this issue: the description says
+    /// `Closes #n`.
+    #[serde(default)]
+    pub closes: Option<u64>,
 }
 
 /// What the user confirmed in the Create PR form.
@@ -461,6 +465,77 @@ pub struct PrCreateRequest {
     /// Commit the uncommitted changes first with this message (`None`:
     /// refuse when there are any).
     pub commit_message: Option<String>,
+}
+
+/// Where a new thread starts from (`Query::ThreadFrom`): its own
+/// worktree on that pull request's, issue's or branch's work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThreadSource {
+    /// A pull request of the project's repository: `#12`, `12` or its
+    /// URL. Its branch is checked out and the pull request linked; one
+    /// from a fork is read-only.
+    Pull { reference: String },
+    /// An issue of the project's repository (`#12`, `12` or its URL): a
+    /// new branch from the base, the issue in the first message's draft,
+    /// and `Closes #12` in the pull request.
+    Issue { reference: String },
+    /// A branch of the project's repository, local or on its remote.
+    Branch { name: String },
+}
+
+/// A pull request or issue offered as a place to start a thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Candidate {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    /// RFC 3339, as GitHub gave it.
+    pub updated_at: String,
+    /// Assigned to the token's user (or, for a pull request, asked to
+    /// review it).
+    pub mine: bool,
+    pub draft: bool,
+    /// Pull requests: their head branch.
+    pub head_branch: String,
+    /// Pull requests: from a fork (read-only here).
+    pub fork: bool,
+}
+
+/// A branch offered as a place to start a thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BranchCandidate {
+    pub name: String,
+    /// Only on the remote so far.
+    pub remote_only: bool,
+}
+
+/// What "New thread from…" offers for a project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForgeCandidates {
+    /// `owner/name` on GitHub (empty: not a GitHub repository).
+    pub repo: String,
+    /// Open pull requests, the user's first, then recently updated.
+    pub pulls: Vec<Candidate>,
+    /// Open issues, the same order.
+    pub issues: Vec<Candidate>,
+    /// Branches no thread or checkout has, newest commit first.
+    pub branches: Vec<BranchCandidate>,
+    /// Why GitHub's lists are missing (branches are still offered).
+    pub problem: Option<String>,
+}
+
+/// A thread was started from a pull request, issue or branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadOpened {
+    pub thread_id: crate::ThreadId,
+    /// For the composer: the issue to work on (never sent by itself).
+    pub draft: Option<String>,
+    /// A human-readable summary.
+    pub message: String,
 }
 
 /// The agent's draft of a pull request.
@@ -543,11 +618,43 @@ pub fn branch_slug(title: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
+/// `body` ending with `Closes #n` when the work is for issue `n` (and it
+/// does not say so yet).
+pub fn closing_body(body: &str, closes: Option<u64>) -> String {
+    let Some(n) = closes else {
+        return body.to_owned();
+    };
+    let line = format!("Closes #{n}");
+    let lower = body.to_ascii_lowercase();
+    let has = ["closes", "fixes", "resolves"].iter().any(|k| {
+        let want = format!("{k} #{n}");
+        lower
+            .match_indices(&want)
+            .any(|(i, _)| !lower[i + want.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    });
+    if has {
+        body.to_owned()
+    } else if body.trim().is_empty() {
+        line
+    } else {
+        format!("{}\n\n{line}", body.trim_end())
+    }
+}
+
 /// Parse what a user typed to link a pull request: a URL
 /// (`https://host/owner/name/pull/12`, extra path or query allowed),
 /// `owner/name#12`, or `#12` / `12` (the thread's own repository).
 /// Returns `(host, repo, number)`; `None` host/repo mean "the thread's".
 pub fn parse_pr_ref(input: &str) -> Option<(Option<String>, Option<String>, u64)> {
+    parse_ref(input, "pull")
+}
+
+/// [`parse_pr_ref`] for an issue (`https://host/owner/name/issues/12`).
+pub fn parse_issue_ref(input: &str) -> Option<(Option<String>, Option<String>, u64)> {
+    parse_ref(input, "issues")
+}
+
+fn parse_ref(input: &str, kind: &str) -> Option<(Option<String>, Option<String>, u64)> {
     let s = input.trim();
     let number = |n: &str| n.parse::<u64>().ok().filter(|n| *n > 0);
     let name_ok = |s: &str| {
@@ -563,7 +670,7 @@ pub fn parse_pr_ref(input: &str) -> Option<(Option<String>, Option<String>, u64)
         let host = parts.next()?.to_ascii_lowercase();
         let owner = parts.next()?;
         let name = parts.next()?;
-        if parts.next()? != "pull" {
+        if parts.next()? != kind {
             return None;
         }
         let n = number(parts.next()?)?;
@@ -626,6 +733,22 @@ mod tests {
     }
 
     #[test]
+    fn bodies_close_their_issue() {
+        assert_eq!(closing_body("", Some(5)), "Closes #5");
+        assert_eq!(closing_body("Fix it.\n", Some(5)), "Fix it.\n\nCloses #5");
+        assert_eq!(
+            closing_body("Fixes #5 for good", Some(5)),
+            "Fixes #5 for good"
+        );
+        assert_eq!(
+            closing_body("Closes #50", Some(5)),
+            "Closes #50\n\nCloses #5"
+        );
+        assert_eq!(closing_body("closes #5.", Some(5)), "closes #5.");
+        assert_eq!(closing_body("Fix it.", None), "Fix it.");
+    }
+
+    #[test]
     fn parses_pr_references() {
         assert_eq!(
             parse_pr_ref("https://github.com/ts020/blongo/pull/12/files?x=1"),
@@ -637,6 +760,11 @@ mod tests {
         );
         assert_eq!(parse_pr_ref("#7"), Some((None, None, 7)));
         assert_eq!(parse_pr_ref(" 7 "), Some((None, None, 7)));
+        assert_eq!(
+            parse_issue_ref("https://github.com/ts020/blongo/issues/3"),
+            Some((Some("github.com".into()), Some("ts020/blongo".into()), 3))
+        );
+        assert_eq!(parse_issue_ref("https://github.com/a/b/pull/3"), None);
         for bad in [
             "",
             "0",

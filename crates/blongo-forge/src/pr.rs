@@ -14,6 +14,8 @@ pub struct DraftFacts<'a> {
     pub uncommitted: &'a [String],
     pub diff_stat: &'a str,
     pub template: Option<&'a str>,
+    /// The issue the work is for (the body ends with `Closes #n`).
+    pub closes: Option<u64>,
 }
 
 /// The message sent to the agent: what is on the branch and the JSON
@@ -53,6 +55,11 @@ pub fn draft_prompt(facts: &DraftFacts) -> String {
         p.push_str(&format!(
             "\nThe repository's pull request template (follow its headings):\n```markdown\n{}\n```\n",
             t.trim()
+        ));
+    }
+    if let Some(n) = facts.closes {
+        p.push_str(&format!(
+            "\nThe work is for issue #{n}: end the body with the line `Closes #{n}`.\n"
         ));
     }
     p.push_str(
@@ -333,9 +340,11 @@ mod tests {
             uncommitted: &["a.rs".into()],
             diff_stat: " a.rs | 2 +-",
             template: Some("## Why"),
+            closes: Some(12),
         });
         for want in [
             "blongo/x into main",
+            "`Closes #12`",
             "- Add parser",
             "a.rs",
             "## Why",

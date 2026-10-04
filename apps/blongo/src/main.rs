@@ -48,6 +48,7 @@ mod input;
 mod keymap;
 mod markdown;
 mod notify;
+mod open_from;
 mod palette;
 mod pr;
 mod pr_create;

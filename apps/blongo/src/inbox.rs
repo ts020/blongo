@@ -7,12 +7,20 @@
 
 use blongo_client::forge::{self, Forge, PrDetail, PullRequest, ReviewComment, TokenFile};
 use blongo_protocol::workspace::DiffFileStat;
-use gpui::{Context, Entity, FontWeight, SharedString, Subscription, Window, div, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, FontWeight, SharedString, Subscription, Window, div, prelude::*,
+    px,
+};
 
 use crate::diff::{DiffEvent, DiffView, Source};
 use crate::input::TextInput;
 use crate::theme;
 use crate::timeline::button;
+
+pub enum InboxEvent {
+    /// Start a thread on this GitHub pull request (its URL).
+    OpenAsThread(String),
+}
 
 pub struct InboxView {
     forges: Vec<Forge>,
@@ -27,7 +35,14 @@ pub struct InboxView {
     _diff_events: Option<Subscription>,
 }
 
+impl EventEmitter<InboxEvent> for InboxView {}
+
 impl InboxView {
+    pub fn set_message(&mut self, ok: bool, text: String, cx: &mut Context<Self>) {
+        self.message = Some((ok, text.into()));
+        cx.notify();
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let summary_input = cx.new(|cx| TextInput::new("Review summary (optional)", false, cx));
         let mut this = Self {
@@ -313,6 +328,11 @@ impl Render for InboxView {
                     ),
             );
         }
+        let open_url = self
+            .selected
+            .and_then(|ix| self.prs.get(ix))
+            .filter(|pr| pr.kind == forge::ForgeKind::GitHub)
+            .map(|pr| pr.url.clone());
         let right = match &self.diff {
             None => div()
                 .flex_1()
@@ -348,6 +368,17 @@ impl Render for InboxView {
                                 .text_sm()
                                 .child(self.summary_input.clone()),
                         )
+                        .when_some(open_url, |d, url| {
+                            d.child(button(
+                                "inbox-open-thread".into(),
+                                "Open as thread",
+                                theme::surface_hover(),
+                                theme::text(),
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(InboxEvent::OpenAsThread(url.clone()))
+                                }),
+                            ))
+                        })
                         .when_some(self.message.clone(), |d, (ok, m)| {
                             d.child(
                                 div()

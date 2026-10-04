@@ -42,6 +42,89 @@ pub async fn fetch(
     .map(drop)
 }
 
+/// Fetch pull request `number`'s head (`refs/pull/N/head`, a fork's work
+/// too) into the hidden ref it returns, `refs/blongo/pull/N`.
+pub async fn fetch_pull(cwd: &Path, remote: &str, number: u64) -> Result<String, String> {
+    if !plain(remote) {
+        return Err("not a remote name".into());
+    }
+    let local = format!("refs/blongo/pull/{number}");
+    let refspec = format!("+refs/pull/{number}/head:{local}");
+    run(
+        cwd,
+        &["fetch", "--quiet", "--no-tags", "--", remote, &refspec],
+        FETCH_TIMEOUT,
+    )
+    .await?;
+    Ok(local)
+}
+
+/// The branches checked out in `cwd`'s repository (its main checkout
+/// and every worktree), with where.
+pub async fn checked_out(cwd: &Path) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(list) = quick(cwd, &["worktree", "list", "--porcelain"]).await else {
+        return out;
+    };
+    let mut path = String::new();
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = p.to_owned();
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            out.insert(b.to_owned(), path.clone());
+        }
+    }
+    out
+}
+
+/// Local branches and `remote`'s branches with no local namesake,
+/// newest commit first, at most `limit`; `true`: only on the remote.
+pub async fn recent_branches(
+    cwd: &Path,
+    remote: Option<&str>,
+    limit: usize,
+) -> Vec<(String, bool)> {
+    let remote = remote.filter(|r| plain(r)).unwrap_or("");
+    // No remote: a pattern nothing matches.
+    let remotes = if remote.is_empty() {
+        "refs/heads/.none".to_owned()
+    } else {
+        format!("refs/remotes/{remote}")
+    };
+    let Ok(out) = quick(
+        cwd,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)",
+            "refs/heads",
+            &remotes,
+        ],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let prefix = format!("{remotes}/");
+    let local: std::collections::HashSet<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("refs/heads/"))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    out.lines()
+        .filter_map(|l| {
+            if let Some(b) = l.strip_prefix("refs/heads/") {
+                Some((b.to_owned(), false))
+            } else {
+                let b = l.strip_prefix(&prefix)?;
+                (b != "HEAD" && !local.contains(b)).then(|| (b.to_owned(), true))
+            }
+        })
+        .filter(|(b, _)| seen.insert(b.clone()))
+        .take(limit)
+        .collect()
+}
+
 /// The remote-tracking branch `refs/remotes/{remote}/{branch}` exists.
 pub async fn has_remote_branch(cwd: &Path, remote: &str, branch: &str) -> bool {
     plain(remote)

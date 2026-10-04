@@ -375,6 +375,20 @@ pub async fn add_worktree(
     Ok(())
 }
 
+/// Add a worktree at `path` with the existing local `branch` checked out
+/// (git refuses a branch checked out elsewhere).
+pub async fn add_worktree_on(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
+    if branch.starts_with('-') {
+        bail!("not a branch name");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path_str = path.to_string_lossy();
+    git(repo, &["worktree", "add", "--quiet", &path_str, branch]).await?;
+    Ok(())
+}
+
 /// The top of the worktree containing `path`, checked to be one Blongo
 /// may delete: a linked worktree (never a main checkout) of `repo`'s
 /// repository (same git common dir) whose top lies strictly inside `root`

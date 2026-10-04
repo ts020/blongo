@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 
 use blongo_protocol::{
-    CheckDetail, CheckState, ChecksState, ChecksSummary, MergeMethod, MergeState, Mergeable,
-    PrDetail, PrState, PrStatus, ReviewComment, ReviewDecision, ReviewDetail, ReviewState,
-    ReviewThread,
+    Candidate, CheckDetail, CheckState, ChecksState, ChecksSummary, MergeMethod, MergeState,
+    Mergeable, PrDetail, PrState, PrStatus, ReviewComment, ReviewDecision, ReviewDetail,
+    ReviewState, ReviewThread,
 };
 use serde_json::{Value, json};
 
@@ -74,6 +74,21 @@ pub struct PullInfo {
     pub head_sha: String,
     pub base_branch: String,
 }
+
+/// An issue as REST returns it (also a pull request seen as an issue).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueInfo {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub body: String,
+    pub open: bool,
+    /// It is a pull request.
+    pub is_pull: bool,
+}
+
+/// Open pull requests and issues listed for "New thread from…".
+const MAX_CANDIDATES: usize = 30;
 
 /// A check that failed on a commit, with what GitHub keeps of why: the
 /// run's summary, its annotations and the end of its log. All of it is
@@ -193,6 +208,82 @@ impl GitHub {
             .get(&format!("/repos/{}/pulls/{number}", repo.full_name()))
             .await?;
         pull_info(&v).ok_or_else(|| GhError::Other("GitHub: unexpected pull request".into()))
+    }
+
+    /// `GET /repos/{owner}/{name}/issues/{number}`.
+    pub async fn issue(&self, repo: &RepoRef, number: u64) -> Result<IssueInfo, GhError> {
+        let v = self
+            .get(&format!("/repos/{}/issues/{number}", repo.full_name()))
+            .await?;
+        Ok(IssueInfo {
+            number: v["number"].as_u64().unwrap_or(number),
+            url: v["html_url"].as_str().unwrap_or("").to_owned(),
+            title: v["title"].as_str().unwrap_or("").to_owned(),
+            body: v["body"].as_str().unwrap_or("").to_owned(),
+            open: v["state"].as_str() == Some("open"),
+            is_pull: v.get("pull_request").is_some_and(|p| !p.is_null()),
+        })
+    }
+
+    /// The token's user (`GET /user`).
+    pub async fn login(&self) -> Result<String, GhError> {
+        let v = self.get("/user").await?;
+        v["login"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| GhError::Other("GitHub: no login".into()))
+    }
+
+    /// Open pull requests, most recently updated first; `mine` when
+    /// `login` is asked to review or assigned.
+    pub async fn open_pulls(
+        &self,
+        repo: &RepoRef,
+        login: Option<&str>,
+    ) -> Result<Vec<Candidate>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{}/pulls?state=open&sort=updated&direction=desc&per_page={MAX_CANDIDATES}",
+                repo.full_name()
+            ))
+            .await?;
+        let full = repo.full_name();
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                let mut c = candidate(p, login)?;
+                c.mine |= people(&p["requested_reviewers"], login);
+                c.draft = p["draft"].as_bool().unwrap_or(false);
+                c.head_branch = p["head"]["ref"].as_str().unwrap_or("").to_owned();
+                c.fork = !p["head"]["repo"]["full_name"]
+                    .as_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&full));
+                Some(c)
+            })
+            .take(MAX_CANDIDATES)
+            .collect())
+    }
+
+    /// Open issues (not pull requests), most recently updated first.
+    pub async fn open_issues(
+        &self,
+        repo: &RepoRef,
+        login: Option<&str>,
+    ) -> Result<Vec<Candidate>, GhError> {
+        let v = self
+            .get(&format!(
+                "/repos/{}/issues?state=open&sort=updated&direction=desc&per_page={MAX_CANDIDATES}",
+                repo.full_name()
+            ))
+            .await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|i| i.get("pull_request").is_none_or(Value::is_null))
+            .filter_map(|i| candidate(i, login))
+            .take(MAX_CANDIDATES)
+            .collect())
     }
 
     /// The newest pull request whose head is `branch` in the repository
@@ -791,6 +882,35 @@ fn graphql_error(v: &Value) -> GhError {
         "FORBIDDEN" => GhError::Auth(short(msg)),
         _ => GhError::Other(format!("GitHub: {}", short(msg))),
     }
+}
+
+/// Whether `login` is among `list`'s users.
+fn people(list: &Value, login: Option<&str>) -> bool {
+    login.is_some_and(|me| {
+        list.as_array().into_iter().flatten().any(|u| {
+            u["login"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case(me))
+        })
+    })
+}
+
+/// The fields pull requests and issues share. Titles are one line.
+fn candidate(v: &Value, login: Option<&str>) -> Option<Candidate> {
+    Some(Candidate {
+        number: v["number"].as_u64()?,
+        title: v["title"]
+            .as_str()
+            .unwrap_or("")
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(300)
+            .collect(),
+        author: v["user"]["login"].as_str().unwrap_or("").to_owned(),
+        updated_at: v["updated_at"].as_str().unwrap_or("").to_owned(),
+        mine: people(&v["assignees"], login),
+        ..Candidate::default()
+    })
 }
 
 fn pull_info(v: &Value) -> Option<PullInfo> {

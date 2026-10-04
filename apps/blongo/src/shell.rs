@@ -30,9 +30,10 @@ use gpui::{
 use crate::deeplink::Link;
 use crate::diff::{DiffEvent, DiffView};
 use crate::files::FilesView;
-use crate::inbox::InboxView;
+use crate::inbox::{InboxEvent, InboxView};
 use crate::input::{InputEvent, TextInput};
 use crate::keymap::{Binding, Cmd};
+use crate::open_from::{OpenFromEvent, OpenFromView};
 use crate::palette::{Palette, PaletteEvent};
 use crate::pr_create::PrCreateView;
 use crate::pr_view::PrView;
@@ -70,6 +71,8 @@ pub enum View {
     Pr,
     Inbox,
     Settings,
+    /// "New thread from…" for a project.
+    OpenFrom,
 }
 
 /// Fixed facts the shell shows (settings screen) or needs.
@@ -159,6 +162,11 @@ pub struct Shell {
     /// A file to open once the files view exists.
     open_file: Option<String>,
     inbox: Option<Entity<InboxView>>,
+    /// "New thread from…" and the environment it asks.
+    open_from: Option<(EnvId, Entity<OpenFromView>)>,
+    /// The issue text last put into the composer (taken out again when
+    /// another thread is opened from something and it was left as is).
+    issue_draft: Option<String>,
     settings_view: Option<Entity<SettingsView>>,
     palette: Option<Entity<Palette>>,
     bindings: Vec<Binding>,
@@ -269,6 +277,8 @@ impl Shell {
             info: None,
             open_file: None,
             inbox: None,
+            open_from: None,
+            issue_draft: None,
             settings_view: None,
             confirm_link_project: None,
             palette: None,
@@ -416,6 +426,9 @@ impl Shell {
                 project_id,
                 worktree,
             } => self.new_thread(*env, *project_id, *worktree, cx),
+            SidebarEvent::NewThreadFrom(env, project_id) => {
+                self.open_from(*env, *project_id, window, cx)
+            }
             SidebarEvent::Archive(env, id) => {
                 self.dispatch(*env, Command::ThreadArchive { thread_id: *id })
             }
@@ -1177,7 +1190,7 @@ impl Shell {
         self.terminal = None;
         self.usage.clear();
         self.diff_scope = DiffScope::Thread;
-        if matches!(self.view, View::Inbox | View::Settings) {
+        if matches!(self.view, View::Inbox | View::Settings | View::OpenFrom) {
             self.view = View::Chat;
         }
         if self.view == View::Pr {
@@ -1832,11 +1845,124 @@ impl Shell {
         );
     }
 
+    /// Show "New thread from…" for `project_id`.
+    fn open_from(
+        &mut self,
+        env: EnvId,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let same = self
+            .open_from
+            .as_ref()
+            .is_some_and(|(e, v)| *e == env && v.read(cx).project_id == project_id);
+        if same {
+            if let Some((_, view)) = &self.open_from {
+                view.update(cx, |v, cx| v.reopen(cx));
+            }
+        } else {
+            let name = self
+                .sidebar
+                .read(cx)
+                .envs
+                .get(env)
+                .and_then(|e| e.projects.iter().find(|p| p.id == project_id))
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            let backend = self.backend(env).clone();
+            let provider = self.default_provider;
+            let view = cx.new(|cx| OpenFromView::new(backend, project_id, name, provider, cx));
+            self.view_subscriptions.push(cx.subscribe_in(
+                &view,
+                window,
+                move |this, _, event: &OpenFromEvent, _, cx| {
+                    let OpenFromEvent::Opened { thread_id, draft } = event;
+                    this.opened_thread(env, *thread_id, draft.clone(), cx);
+                },
+            ));
+            self.open_from = Some((env, view));
+        }
+        self.view = View::OpenFrom;
+        cx.notify();
+    }
+
+    /// A thread started from a pull request, issue or branch: open it,
+    /// with the issue (if any) in the composer.
+    fn opened_thread(
+        &mut self,
+        env: EnvId,
+        thread_id: ThreadId,
+        draft: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let exists = self
+            .sidebar
+            .read(cx)
+            .envs
+            .get(env)
+            .is_some_and(|e| e.threads.iter().any(|t| t.id == thread_id));
+        if exists {
+            self.select(env, thread_id, cx);
+        } else {
+            self.pending_select = Some((env, thread_id));
+        }
+        self.view = View::Chat;
+        let untouched = self
+            .issue_draft
+            .take()
+            .is_some_and(|d| self.composer.read(cx).text() == d);
+        if untouched || draft.is_some() {
+            let text = draft.clone().unwrap_or_default();
+            self.composer.update(cx, |c, cx| c.set_text(&text, cx));
+        }
+        self.issue_draft = draft;
+        self.pending_focus = Some(self.composer.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// The review inbox's "Open as thread": the local project whose
+    /// remote is the pull request's repository gets the thread.
+    fn open_review_as_thread(&mut self, url: String, cx: &mut Context<Self>) {
+        let backend = self.backend(LOCAL).clone();
+        crate::query::ask(
+            &backend,
+            Query::ThreadFrom {
+                project_id: None,
+                thread_id: ThreadId::new(),
+                source: blongo_protocol::ThreadSource::Pull { reference: url },
+                provider: self.default_provider,
+                model: None,
+            },
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                match result {
+                    Ok(QueryReply::ThreadOpened(o)) => {
+                        this.opened_thread(LOCAL, o.thread_id, o.draft, cx);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        if let Some(inbox) = &this.inbox {
+                            inbox.update(cx, |i, cx| i.set_message(false, err, cx));
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
     fn ensure_inbox(&mut self, cx: &mut Context<Self>) -> Entity<InboxView> {
         if let Some(inbox) = &self.inbox {
             return inbox.clone();
         }
         let inbox = cx.new(InboxView::new);
+        self.view_subscriptions
+            .push(cx.subscribe(&inbox, |this, _, event: &InboxEvent, cx| {
+                let InboxEvent::OpenAsThread(url) = event;
+                this.open_review_as_thread(url.clone(), cx);
+            }));
         self.inbox = Some(inbox.clone());
         inbox
     }
@@ -2058,6 +2184,7 @@ impl Shell {
             View::Pr => "view.pr",
             View::Inbox => "view.inbox",
             View::Settings => "view.settings",
+            View::OpenFrom => "view.openFrom",
         });
         names
     }
@@ -2718,6 +2845,12 @@ impl Shell {
             View::Inbox => {
                 let body = self.ensure_inbox(cx).into_any_element();
                 return self.render_page("Review inbox", body, cx);
+            }
+            View::OpenFrom => {
+                if let Some((_, view)) = &self.open_from {
+                    let body = view.clone().into_any_element();
+                    return self.render_page("New thread from…", body, cx);
+                }
             }
             _ => {}
         }

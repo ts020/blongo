@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunId, ThreadId};
+use crate::{ProjectId, ProviderKind, RunId, ThreadId};
 
 /// Client-chosen id that pairs a query with its reply.
 pub type QueryId = u64;
@@ -151,10 +151,28 @@ pub enum Query {
         #[serde(default)]
         delete_remote: bool,
     },
+    /// The pull requests, issues and branches a thread of the project
+    /// can start from.
+    ForgeCandidates {
+        project_id: ProjectId,
+    },
+    /// Start thread `thread_id` in its own worktree on `source`'s work
+    /// (`project_id: None`: the project whose remote is the pull request
+    /// URL's repository). Answered with `ThreadOpened` once it exists.
+    ThreadFrom {
+        project_id: Option<ProjectId>,
+        thread_id: ThreadId,
+        source: crate::forge::ThreadSource,
+        #[serde(default)]
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+    },
 }
 
 impl Query {
-    pub fn thread_id(&self) -> ThreadId {
+    /// The existing thread the query is about (`None`: a project's).
+    pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::DiffSummary { thread_id, .. }
             | Self::DiffFile { thread_id, .. }
@@ -176,7 +194,8 @@ impl Query {
             | Self::PrComments { thread_id, .. }
             | Self::PrMergeBase { thread_id }
             | Self::PrMerge { thread_id, .. }
-            | Self::PrArchive { thread_id, .. } => *thread_id,
+            | Self::PrArchive { thread_id, .. } => Some(*thread_id),
+            Self::ForgeCandidates { .. } | Self::ThreadFrom { .. } => None,
         }
     }
 
@@ -217,6 +236,8 @@ pub enum QueryReply {
     PrDetail(Box<crate::forge::PrDetail>),
     PrPrepare(Box<crate::forge::PrPrepare>),
     PrDraft(crate::forge::PrDraft),
+    Candidates(Box<crate::forge::ForgeCandidates>),
+    ThreadOpened(crate::forge::ThreadOpened),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

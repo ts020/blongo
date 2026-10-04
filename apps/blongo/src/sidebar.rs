@@ -31,6 +31,8 @@ pub enum SidebarEvent {
         project_id: ProjectId,
         worktree: bool,
     },
+    /// "New thread from…" a pull request, issue or branch.
+    NewThreadFrom(EnvId, ProjectId),
     Archive(EnvId, ThreadId),
     AddProject(EnvId, String),
     /// "NAME TARGET [CODE]" from the add-environment form.
@@ -410,49 +412,55 @@ impl Render for Sidebar {
             }
             for project in &env.projects {
                 let project_id = project.id;
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("p-{project_id}")))
-                        .mt_2()
-                        .px_2()
-                        .py_1()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_md()
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::text_muted())
-                                .child(SharedString::from(project.name.clone())),
-                        )
-                        .child(
-                            small_action(format!("wt-{project_id}").into(), "+ Worktree").on_click(
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.emit(SidebarEvent::NewThread {
-                                        env: env_id,
-                                        project_id,
-                                        worktree: true,
-                                    })
-                                }),
+                list =
+                    list.child(
+                        div()
+                            .id(SharedString::from(format!("p-{project_id}")))
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .rounded_md()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_muted())
+                                    .child(SharedString::from(project.name.clone())),
+                            )
+                            .child(
+                                small_action(format!("from-{project_id}").into(), "From…")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(SidebarEvent::NewThreadFrom(env_id, project_id))
+                                    })),
+                            )
+                            .child(
+                                small_action(format!("wt-{project_id}").into(), "+ Worktree")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(SidebarEvent::NewThread {
+                                            env: env_id,
+                                            project_id,
+                                            worktree: true,
+                                        })
+                                    })),
+                            )
+                            .child(
+                                small_action(format!("new-{project_id}").into(), "+ New").on_click(
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.emit(SidebarEvent::NewThread {
+                                            env: env_id,
+                                            project_id,
+                                            worktree: false,
+                                        })
+                                    }),
+                                ),
                             ),
-                        )
-                        .child(
-                            small_action(format!("new-{project_id}").into(), "+ New").on_click(
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.emit(SidebarEvent::NewThread {
-                                        env: env_id,
-                                        project_id,
-                                        worktree: false,
-                                    })
-                                }),
-                            ),
-                        ),
-                );
+                    );
                 for thread in env.threads.iter().filter(|t| t.project_id == project_id) {
                     let thread_id = thread.id;
                     let selected = self.selected == Some((env_id, thread_id));

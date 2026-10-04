@@ -47,6 +47,13 @@ Control ops:
       body, author, merge_state ("CLEAN"/"BLOCKED"/...), reviews:
       [{"author", "state"}], can_update, checks may also carry "url",
       "workflow", "started_at", "completed_at"
+  {"op": "issue", "repo": "o/n", "issue": {number, title, body, state, author,
+      assignees: ["login"], updated_at}}  merges into the issue (created if
+      missing). GET .../issues?state=open lists them with the open pulls
+      (as GitHub does, marked "pull_request"); GET .../issues/N answers one.
+  {"op": "user", "login": "octocat"}   what GET /user answers.
+  Pulls may also carry "assignees", "reviewers" (logins) and "updated_at";
+  GET .../pulls?state=open lists the open ones.
   {"op": "rate", "limit": 5000, "remaining": 4000}
   {"op": "fail", "path_prefix": "/graphql", "status": 502, "count": 1}
   {"op": "clear_log"}
@@ -65,6 +72,7 @@ LOCK = threading.Lock()
 REPOS = {}
 LOG = []
 RATE = {"limit": 5000, "remaining": 4999}
+USER = {"login": "octocat"}
 FAILS = []
 
 
@@ -125,7 +133,33 @@ def rest_pull(full, p):
             "repo": {"full_name": p["head_repo"]} if p["head_repo"] else None,
         },
         "base": {"ref": p["base"], "sha": "b" * 40},
+        "user": {"login": p["author"]},
+        "updated_at": p.get("updated_at", "2026-10-04T00:00:00Z"),
+        "assignees": [{"login": a} for a in p.get("assignees", [])],
+        "requested_reviewers": [{"login": a} for a in p.get("reviewers", [])],
     }
+
+
+def rest_issue(full, i):
+    return {
+        "number": i["number"],
+        "title": i.get("title", f"Issue {i['number']}"),
+        "body": i.get("body", ""),
+        "state": i.get("state", "open"),
+        "html_url": f"https://github.com/{full}/issues/{i['number']}",
+        "user": {"login": i.get("author", "octocat")},
+        "updated_at": i.get("updated_at", "2026-10-04T00:00:00Z"),
+        "assignees": [{"login": a} for a in i.get("assignees", [])],
+    }
+
+
+def pull_as_issue(full, p):
+    out = rest_issue(full, {"number": p["number"], "title": p["title"], "body": p["body"],
+                            "state": p["state"], "author": p["author"],
+                            "updated_at": p.get("updated_at", "2026-10-04T00:00:00Z")})
+    out["html_url"] = f"https://github.com/{full}/pull/{p['number']}"
+    out["pull_request"] = {"url": out["html_url"]}
+    return out
 
 
 def graphql_pull(p):
@@ -359,10 +393,37 @@ class Handler(BaseHTTPRequestHandler):
                 if not p:
                     return self.reply(404, {"message": "Not Found"})
                 return self.reply(200, rest_pull(full, p))
+            if url.path == "/user":
+                return self.reply(200, {"login": USER["login"]})
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/issues/(\d+)", url.path)
+            if m:
+                full = f"{m[1]}/{m[2]}"
+                r = REPOS.get(full, {})
+                n = int(m[3])
+                if n in r.get("issues", {}):
+                    return self.reply(200, rest_issue(full, r["issues"][n]))
+                if n in r.get("pulls", {}):
+                    return self.reply(200, pull_as_issue(full, r["pulls"][n]))
+                return self.reply(404, {"message": "Not Found"})
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/issues", url.path)
+            if m:
+                full = f"{m[1]}/{m[2]}"
+                r = REPOS.get(full, {})
+                items = [rest_issue(full, i) for i in r.get("issues", {}).values()
+                         if i.get("state", "open") == "open"]
+                items += [pull_as_issue(full, p) for p in r.get("pulls", {}).values()
+                          if p["state"] == "open" and not p["merged"]]
+                items.sort(key=lambda i: (i["updated_at"], i["number"]), reverse=True)
+                return self.reply(200, items)
             m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/pulls", url.path)
             if m:
                 full = f"{m[1]}/{m[2]}"
                 q = parse_qs(url.query)
+                if "head" not in q:
+                    pulls = [rest_pull(full, p) for p in REPOS.get(full, {}).get("pulls", {}).values()
+                             if p["state"] == "open" and not p["merged"]]
+                    pulls.sort(key=lambda p: (p["updated_at"], p["number"]), reverse=True)
+                    return self.reply(200, pulls)
                 head = unquote(q.get("head", [""])[0])
                 owner, _, branch = head.partition(":")
                 pulls = [
@@ -526,6 +587,13 @@ class Handler(BaseHTTPRequestHandler):
             p = pulls.get(number) or pull_defaults(full, number)
             p.update(fields)
             pulls[number] = p
+        elif op == "issue":
+            fields = body["issue"]
+            issues = repo(body["repo"]).setdefault("issues", {})
+            n = int(fields["number"])
+            issues[n] = {**issues.get(n, {}), **fields}
+        elif op == "user":
+            USER["login"] = body["login"]
         elif op == "ref":
             repo(body["repo"]).setdefault("refs", {})[body["branch"]] = body["sha"]
         elif op == "rate":

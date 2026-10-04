@@ -66,6 +66,11 @@ pub(super) struct ForgeRt {
     /// Threads being archived because their pull request was merged (said
     /// once the archive is committed).
     pub auto_archiving: HashSet<ThreadId>,
+    /// Threads being opened from a pull request, issue or branch: where
+    /// their worktree starts.
+    pub sources: HashMap<ThreadId, super::open::Source>,
+    /// `ThreadFrom` queries waiting for their thread.
+    pub opening: HashMap<QueryId, super::open::Opening>,
     tokens: TokenCache,
 }
 
@@ -605,7 +610,7 @@ impl Orchestrator {
             if !self.config.forge {
                 return Err("GitHub integration is turned off".to_owned());
             }
-            let thread = self.live_thread(query.thread_id())?;
+            let thread = self.live_thread(query.thread_id().ok_or("not a thread query")?)?;
             let project = self
                 .projects
                 .get(&thread.project_id)
@@ -618,6 +623,7 @@ impl Orchestrator {
                     BaseBranch::GithubDefault => None,
                 };
                 let title = (thread.title != DEFAULT_TITLE).then(|| thread.title.clone());
+                let closes = self.thread_issue(thread.id);
                 return Ok((
                     thread.id,
                     None,
@@ -627,6 +633,7 @@ impl Orchestrator {
                         prefix: project.forge.branch_prefix.clone(),
                         base,
                         title,
+                        closes,
                     },
                 ));
             }
@@ -676,7 +683,7 @@ impl Orchestrator {
             if !self.config.forge {
                 return Err("GitHub integration is turned off".to_owned());
             }
-            let (thread, cwd) = self.thread_cwd(query.thread_id())?;
+            let (thread, cwd) = self.thread_cwd(query.thread_id().ok_or("not a thread query")?)?;
             self.ensure_idle(&thread)?;
             let branch = own_branch(&thread)?;
             if let Some(busy) = self
@@ -1218,6 +1225,8 @@ enum PrOp {
         /// The project's base branch setting (`None`: GitHub's default).
         base: Option<String>,
         title: Option<String>,
+        /// The issue the thread was started from.
+        closes: Option<u64>,
     },
     Create {
         cwd: PathBuf,
@@ -1245,8 +1254,9 @@ async fn run_pr_op(
             prefix,
             base,
             title,
+            closes,
         } => {
-            done.result = match prepare(ctx, &cwd, &branch, &prefix, base, title).await {
+            done.result = match prepare(ctx, &cwd, &branch, &prefix, base, title, closes).await {
                 Ok((prep, info)) => {
                     done.info = Some(info);
                     Ok(QueryReply::PrPrepare(Box::new(prep)))
@@ -1374,6 +1384,7 @@ async fn prepare(
     prefix: &str,
     base: Option<String>,
     title: Option<String>,
+    closes: Option<u64>,
 ) -> Result<(PrPrepare, (String, String, RepoInfo)), String> {
     let (gh, repo, remote_name) = folder_repo(ctx, cwd).await?;
     let info = gh
@@ -1417,6 +1428,7 @@ async fn prepare(
         uncommitted: &uncommitted,
         diff_stat: &diff_stat,
         template: template.as_deref(),
+        closes,
     });
     let prep = PrPrepare {
         repo: repo.full_name(),
@@ -1431,6 +1443,7 @@ async fn prepare(
         title,
         draft_prompt,
         can_push: info.can_push,
+        closes,
     };
     Ok((prep, (repo.host.clone(), repo.full_name(), info)))
 }

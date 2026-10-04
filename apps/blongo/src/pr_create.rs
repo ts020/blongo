@@ -112,7 +112,9 @@ impl PrCreateView {
             });
         };
         set(&self.title, &prep.title, cx);
-        set(&self.body, prep.template.as_deref().unwrap_or(""), cx);
+        let body =
+            blongo_protocol::closing_body(prep.template.as_deref().unwrap_or(""), prep.closes);
+        set(&self.body, &body, cx);
         set(&self.base, &prep.base, cx);
         set(&self.branch, &prep.suggested_branch, cx);
         let message = if prep.title.is_empty() {
@@ -151,8 +153,10 @@ impl PrCreateView {
                 this.drafting = false;
                 match result {
                     Ok(QueryReply::PrDraft(draft)) => {
+                        let closes = this.prep.as_ref().and_then(|p| p.closes);
+                        let body = blongo_protocol::closing_body(&draft.body, closes);
                         this.title.update(cx, |i, cx| i.set_text(&draft.title, cx));
-                        this.body.update(cx, |i, cx| i.set_text(&draft.body, cx));
+                        this.body.update(cx, |i, cx| i.set_text(&body, cx));
                         if let Some(m) = &draft.commit_message {
                             this.commit.update(cx, |i, cx| i.set_text(m, cx));
                         }

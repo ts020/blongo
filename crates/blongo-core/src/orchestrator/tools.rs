@@ -99,6 +99,19 @@ impl Orchestrator {
         {
             return self.pr_archive(id, thread_id, delete_remote);
         }
+        if let Query::ForgeCandidates { project_id } = query {
+            return self.forge_candidates(id, project_id);
+        }
+        if let Query::ThreadFrom {
+            project_id,
+            thread_id,
+            source,
+            provider,
+            model,
+        } = query
+        {
+            return self.thread_from(id, project_id, thread_id, source, provider, model);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -115,7 +128,7 @@ impl Orchestrator {
     }
 
     fn query_plan(&self, query: &Query) -> Result<(PathBuf, Plan), String> {
-        let (_, cwd) = self.thread_cwd(query.thread_id())?;
+        let (_, cwd) = self.thread_cwd(query.thread_id().ok_or("not a thread query")?)?;
         let cwd = PathBuf::from(cwd);
         let plan = match query {
             Query::DiffSummary { thread_id, scope } => {
@@ -198,7 +211,9 @@ impl Orchestrator {
             | Query::PrComments { .. }
             | Query::PrMergeBase { .. }
             | Query::PrMerge { .. }
-            | Query::PrArchive { .. } => {
+            | Query::PrArchive { .. }
+            | Query::ForgeCandidates { .. }
+            | Query::ThreadFrom { .. } => {
                 return Err("not a workspace query".into());
             }
         };
@@ -216,7 +231,7 @@ impl Orchestrator {
             return self.pr_merge_base(id, thread_id, key);
         }
         let checked = (|| {
-            let thread_id = query.thread_id();
+            let thread_id = query.thread_id().ok_or("not a thread query")?;
             let (thread, cwd) = self.thread_cwd(thread_id)?;
             self.ensure_idle(&thread)?;
             if matches!(query, Query::GitSwitch { .. })
