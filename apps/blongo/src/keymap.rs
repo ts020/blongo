@@ -135,6 +135,25 @@ pub const COMMANDS: &[CommandDef] = &[
         Some("alt-m"),
         Some("threadOpen"),
     ),
+    c("pr.link", "Link a pull request…", None, Some("threadOpen")),
+    c(
+        "pr.open",
+        "Open the pull request on GitHub",
+        None,
+        Some("threadOpen"),
+    ),
+    c(
+        "pr.refresh",
+        "Check the pull request now",
+        None,
+        Some("threadOpen"),
+    ),
+    c(
+        "pr.unlink",
+        "Unlink the pull request",
+        None,
+        Some("threadOpen"),
+    ),
     c("theme.toggle", "Toggle light / dark theme", None, None),
     c("approval.toggle", "Toggle auto-approve", None, None),
     c(

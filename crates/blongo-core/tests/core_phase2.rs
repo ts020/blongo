@@ -82,7 +82,7 @@ impl TestCore {
         self.until(|e| match e {
             CoreEvent::Event(ev) => match &ev.kind {
                 EventKind::ThreadCreated { thread } if thread.id == thread_id => {
-                    Some(thread.clone())
+                    Some((**thread).clone())
                 }
                 _ => None,
             },

@@ -6,6 +6,7 @@ members = [
     "crates/blongo-store",
     "crates/blongo-core",
     "crates/blongo-git",
+    "crates/blongo-forge",
     "crates/blongo-client",
     "crates/blongo-server",
     "apps/blongo",
@@ -23,6 +24,7 @@ blongo-harness = { path = "crates/blongo-harness" }
 blongo-store = { path = "crates/blongo-store" }
 blongo-core = { path = "crates/blongo-core" }
 blongo-git = { path = "crates/blongo-git" }
+blongo-forge = { path = "crates/blongo-forge" }
 blongo-client = { path = "crates/blongo-client" }
 blongo-server = { path = "crates/blongo-server" }
 
