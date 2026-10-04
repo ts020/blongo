@@ -86,6 +86,9 @@ pub struct CoreConfig {
     /// Talk to this GitHub API instead of the one the remote names (the
     /// tests' fake server; GraphQL at `{api}/graphql`).
     pub github_api: Option<String>,
+    /// The GitHub CLI asked for tokens (`None`: `gh` on the `PATH`;
+    /// `BLONGO_GH`).
+    pub gh_program: Option<PathBuf>,
 }
 
 impl CoreConfig {
@@ -115,6 +118,7 @@ impl CoreConfig {
             settings: CoreSettings::default(),
             forge: true,
             forge_tokens: blongo_forge::forge::default_path(),
+            gh_program: None,
             github_api: None,
         }
     }
@@ -146,6 +150,9 @@ impl CoreConfig {
             .unwrap_or_default();
         config.mcp = std::env::var("BLONGO_MCP").map_or(true, |v| v != "0");
         config.forge = std::env::var("BLONGO_FORGE").map_or(true, |v| v != "0");
+        config.gh_program = std::env::var_os("BLONGO_GH")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
         config.github_api = std::env::var("BLONGO_GITHUB_API")
             .ok()
             .filter(|a| !a.trim().is_empty());

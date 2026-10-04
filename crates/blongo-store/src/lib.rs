@@ -509,7 +509,6 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Re-read the newest sequence (after another connection committed).
     /// A forge cache entry (see the `forge_cache` table) and when it was
     /// written.
     pub fn forge_cache(&self, key: &str) -> anyhow::Result<Option<(String, Timestamp)>> {
@@ -530,6 +529,7 @@ impl Store {
         Ok(())
     }
 
+    /// Re-read the newest sequence (after another connection committed).
     pub fn refresh_last_sequence(&mut self) -> anyhow::Result<u64> {
         let stored: i64 =
             self.conn

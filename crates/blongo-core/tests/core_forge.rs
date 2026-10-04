@@ -12,6 +12,7 @@ use blongo_protocol::workspace::{Query, QueryReply};
 use blongo_protocol::{ChecksState, PrLink, PrState, PrStatus, Thread};
 use common::*;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
@@ -192,6 +193,30 @@ impl TestCore {
             _ => None,
         })
         .await
+    }
+
+    fn send_query(&mut self, query: Query) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.handle().client().query(id, query);
+        id
+    }
+
+    /// The replies to `ids`, in that order, whatever order they come in.
+    async fn replies(&mut self, ids: &[u64]) -> Vec<Result<QueryReply, String>> {
+        let mut got: HashMap<u64, Result<QueryReply, String>> = HashMap::new();
+        while got.len() < ids.len() {
+            let (id, result) = self
+                .until(|e| match e {
+                    CoreEvent::Reply { id, result } if ids.contains(id) => {
+                        Some((*id, result.clone()))
+                    }
+                    _ => None,
+                })
+                .await;
+            got.insert(id, result);
+        }
+        ids.iter().map(|id| got.remove(id).unwrap()).collect()
     }
 
     /// `PrRefresh`, with the status events that came before its reply.
@@ -432,12 +457,10 @@ async fn read_only_and_missing_token() {
     std::fs::write(&fake_gh, "#!/bin/sh\nexit 1\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // SAFETY: only this test reads BLONGO_GH, and it sets it before the
-    // core starts (the core's job reads it later on another thread).
-    unsafe { std::env::set_var("BLONGO_GH", &fake_gh) };
     let (mut core, _) = TestCore::start_with(&dir, |c| {
         c.forge_tokens = tokens.clone();
         c.github_api = Some(api);
+        c.gh_program = Some(fake_gh);
     });
     let project = core.project(&dir).await;
     let thread = core.thread(project, false).await;
@@ -456,6 +479,49 @@ async fn read_only_and_missing_token() {
     });
     let link = core.linked(thread.id).await.unwrap();
     assert!(link.read_only, "a fork's pull request without push access");
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn threads_sharing_a_pull_request_and_unlinked_refreshes() {
+    let dir = temp_dir("forge-shared");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    gh.pull(json!({"number": 7, "head": "fast-parser"})).await;
+    let project = core.project(&dir).await;
+    let a = core.thread(project, false).await;
+    let b = core.thread(project, false).await;
+    for t in [a.id, b.id] {
+        core.dispatch(Command::ThreadLinkPr {
+            thread_id: t,
+            pr: "#7".into(),
+        });
+        core.linked(t).await.unwrap();
+    }
+
+    // Both refreshes land in one poll; each thread gets the status.
+    gh.pull(json!({"number": 7, "checks": [
+        {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}
+    ]}))
+    .await;
+    let qa = core.send_query(Query::PrRefresh { thread_id: a.id });
+    let qb = core.send_query(Query::PrRefresh { thread_id: b.id });
+    for reply in core.replies(&[qa, qb]).await {
+        assert_eq!(
+            reply,
+            Ok(QueryReply::Done("acme/widgets#7 checked".into())),
+            "{reply:?}"
+        );
+    }
+
+    // A refresh still pending when the link goes is answered.
+    let q = core.send_query(Query::PrRefresh { thread_id: a.id });
+    core.dispatch(Command::ThreadUnlinkPr { thread_id: a.id });
+    let reply = tokio::time::timeout(Duration::from_secs(10), core.replies(&[q]))
+        .await
+        .expect("the refresh was answered")
+        .remove(0);
+    assert!(matches!(reply, Ok(QueryReply::Done(_))), "{reply:?}");
     core.shutdown();
 }
 

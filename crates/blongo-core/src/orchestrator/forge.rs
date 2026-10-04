@@ -43,13 +43,22 @@ pub(super) struct ForgeRt {
     low_rate: bool,
     /// `PrRefresh` queries waiting for their thread's next check.
     waiters: HashMap<ThreadId, Vec<QueryId>>,
+    tokens: TokenCache,
 }
+
+/// How long a token is reused before it is read again (saves running
+/// `gh auth token` on every fast poll).
+const TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
+
+type TokenCache = Arc<std::sync::Mutex<HashMap<String, (Instant, String)>>>;
 
 /// What a poll job needs, resolved on the loop.
 #[derive(Clone)]
 pub(super) struct ForgeCtx {
     tokens: PathBuf,
+    gh: Option<PathBuf>,
     api: Option<String>,
+    cache: TokenCache,
 }
 
 impl ForgeCtx {
@@ -61,15 +70,32 @@ impl ForgeCtx {
     }
 
     async fn token(&self, host: &str) -> Result<String, String> {
-        auth::token_for(host, &self.tokens)
-            .await
-            .map(|t| t.token)
-            .ok_or_else(|| {
-                format!(
-                    "no GitHub token for {host}: sign in with `gh auth login` or add a token \
-                     in Settings"
-                )
-            })
+        if let Some((at, token)) = self.cache.lock().unwrap().get(host)
+            && at.elapsed() < TOKEN_TTL
+        {
+            return Ok(token.clone());
+        }
+        let token = auth::token_for(host, &self.tokens, self.gh.as_deref()).await;
+        let mut cache = self.cache.lock().unwrap();
+        match &token {
+            Some(t) => cache.insert(host.to_owned(), (Instant::now(), t.token.clone())),
+            None => cache.remove(host),
+        };
+        token.map(|t| t.token).ok_or_else(|| {
+            format!(
+                "no GitHub token for {host}: sign in with `gh auth login` or add a token in \
+                 Settings"
+            )
+        })
+    }
+
+    /// The message for a failed call; a refused token is read again next
+    /// time.
+    fn fail(&self, host: &str, err: GhError) -> String {
+        if matches!(err, GhError::Auth(_)) {
+            self.cache.lock().unwrap().remove(host);
+        }
+        describe(err)
     }
 }
 
@@ -129,7 +155,12 @@ impl ForgeRt {
         let now = Instant::now();
         self.fast_until.insert(thread_id, now + FAST_WINDOW);
         self.failures.remove(&thread_id);
-        let at = now + after;
+        self.due_at(thread_id, now + after);
+    }
+
+    /// Due at `at`, unless something (a refresh, a turn while the job ran)
+    /// already made it due sooner.
+    fn due_at(&mut self, thread_id: ThreadId, at: Instant) {
         self.due
             .entry(thread_id)
             .and_modify(|d| *d = (*d).min(at))
@@ -151,7 +182,9 @@ impl Orchestrator {
     fn forge_ctx(&self) -> ForgeCtx {
         ForgeCtx {
             tokens: self.config.forge_tokens.clone(),
+            gh: self.config.gh_program.clone(),
             api: self.config.github_api.clone(),
+            cache: self.forge.tokens.clone(),
         }
     }
 
@@ -188,7 +221,7 @@ impl Orchestrator {
                     let at = now + Duration::from_millis(500 * (i as u64 % 20));
                     self.forge.due.insert(thread.id, at);
                 }
-                (None, _) if thread.worktree.is_some() && !thread.pr_dismissed => {
+                (None, _) if owns_branch(thread) => {
                     self.forge.lookup.insert(thread.id);
                 }
                 (None, _) => {}
@@ -203,6 +236,8 @@ impl Orchestrator {
                 self.forge.forget(*thread_id);
                 if pr.is_some() && self.config.forge {
                     self.forge.hurry(*thread_id, FAST);
+                } else if pr.is_none() {
+                    self.answer_pr_waiters(*thread_id, Ok("unlinked".into()));
                 }
             }
             EventKind::ThreadArchived { thread_id } => {
@@ -231,7 +266,7 @@ impl Orchestrator {
                 self.forge.hurry(thread_id, AFTER_TURN);
             }
             Some(_) => {}
-            None if thread.worktree.is_some() && !thread.pr_dismissed => {
+            None if owns_branch(thread) => {
                 self.forge.lookup.insert(thread_id);
             }
             None => {}
@@ -283,33 +318,44 @@ impl Orchestrator {
             .map(|(t, _)| *t)
             .collect();
         let mut polls = Vec::new();
+        let mut skipped = Vec::new();
         for thread_id in due {
             self.forge.due.remove(&thread_id);
-            let Some(thread) = self.threads.get(&thread_id).filter(|t| !t.archived) else {
-                continue;
-            };
-            let Some(link) = thread.pr.clone() else {
-                continue;
-            };
-            polls.push(PollTarget { thread_id, link });
+            let link = self
+                .threads
+                .get(&thread_id)
+                .filter(|t| !t.archived)
+                .and_then(|t| t.pr.clone());
+            match link {
+                Some(link) => polls.push(PollTarget { thread_id, link }),
+                None => skipped.push(thread_id),
+            }
         }
         let mut lookups = Vec::new();
         for thread_id in std::mem::take(&mut self.forge.lookup) {
-            let Some(thread) = self.threads.get(&thread_id).filter(|t| !t.archived) else {
+            let thread = self.threads.get(&thread_id).filter(|t| !t.archived);
+            let project = thread.and_then(|t| self.projects.get(&t.project_id));
+            let (Some(thread), Some(project)) = (thread, project) else {
+                skipped.push(thread_id);
                 continue;
             };
             if thread.pr.is_some() {
+                // Linked meanwhile: a poll answers its waiters.
+                self.forge.hurry(thread_id, Duration::ZERO);
                 continue;
             }
-            let Some(project) = self.projects.get(&thread.project_id) else {
-                continue;
-            };
             lookups.push(LookupTarget {
                 thread_id,
                 cwd: PathBuf::from(thread.cwd(project)),
                 branch: thread.worktree.as_ref().map(|w| w.branch.clone()),
                 cached_info: None,
             });
+        }
+        // Nothing will check these: never leave a refresh unanswered.
+        for thread_id in skipped {
+            if !polls.iter().any(|p| p.thread_id == thread_id) {
+                self.answer_pr_waiters(thread_id, Err("nothing to check".into()));
+            }
         }
         if polls.is_empty() && lookups.is_empty() {
             return;
@@ -354,7 +400,7 @@ impl Orchestrator {
                     self.forge.failures.remove(&thread_id);
                     if !status.state.is_final() {
                         let next = now + self.forge.interval(thread_id, &status, now);
-                        self.forge.due.insert(thread_id, next);
+                        self.forge.due_at(thread_id, next);
                     }
                     if thread.pr_status.as_ref() != Some(&status) {
                         events.push(EventKind::ThreadPrStatus {
@@ -368,7 +414,7 @@ impl Orchestrator {
                     let failures = self.forge.failures.entry(thread_id).or_insert(0);
                     *failures += 1;
                     let wait = ForgeRt::backoff(*failures);
-                    self.forge.due.insert(thread_id, now + wait);
+                    self.forge.due_at(thread_id, now + wait);
                     let mut status = thread.pr_status.clone().unwrap_or_default();
                     if status.error.as_deref() != Some(err.as_str()) {
                         status.error = Some(err.clone());
@@ -509,6 +555,16 @@ impl Orchestrator {
     }
 }
 
+/// Whether a thread's branch is its own to look a pull request up for:
+/// subagent threads and forks share their source's worktree, and the
+/// pull request belongs to the thread that made it.
+fn owns_branch(thread: &Thread) -> bool {
+    thread.worktree.is_some()
+        && !thread.pr_dismissed
+        && thread.parent_thread_id.is_none()
+        && thread.forked_from.is_none()
+}
+
 /// A branch name (or, with `prefix`, the start of one) git accepts and
 /// that cannot be read as an option: letters, digits, `.`, `_`, `-`, `/`;
 /// no `..`, `//`, `@{`, leading `-` / `/` / `.`, trailing `.lock` / `.`
@@ -543,9 +599,18 @@ pub(super) async fn link(
     };
     let repo = match repo_name {
         Some(full) => {
+            let origin_host = origin.as_ref().map(|o| o.host.clone());
             let host = host
-                .or_else(|| origin.as_ref().map(|o| o.host.clone()))
+                .or_else(|| origin_host.clone())
                 .unwrap_or_else(|| "github.com".into());
+            // A token goes only to github.com or the folder's own host, not
+            // to whatever host a pasted URL names.
+            if host != "github.com" && origin_host.as_deref() != Some(host.as_str()) {
+                return Err(format!(
+                    "{host} is not this folder's GitHub host; only github.com and the remote's \
+                     host are linked"
+                ));
+            }
             RepoRef::parse(&format!("https://{host}/{full}")).ok_or("not a GitHub repository")?
         }
         None => {
@@ -554,10 +619,13 @@ pub(super) async fn link(
     };
     let token = ctx.token(&repo.host).await?;
     let gh = ctx.client(&repo, token);
-    let info = gh.repo_info(&repo).await.map_err(describe)?;
+    let info = gh
+        .repo_info(&repo)
+        .await
+        .map_err(|e| ctx.fail(&repo.host, e))?;
     let pull = gh.pull(&repo, number).await.map_err(|e| match e {
         GhError::NotFound => format!("{}#{number} was not found", repo.full_name()),
-        e => describe(e),
+        e => ctx.fail(&repo.host, e),
     })?;
     Ok(found(&gh, &repo, info, pull).await)
 }
@@ -575,16 +643,27 @@ async fn found(gh: &GitHub, repo: &RepoRef, info: RepoInfo, pull: PullInfo) -> F
         head_sha: pull.head_sha.clone(),
         ..PrStatus::default()
     });
-    let read_only = !info.can_push || pull.head_repo.as_deref() != Some(&repo.full_name());
+    // GitHub answers with the canonical casing; remotes may differ.
+    let read_only = !info.can_push
+        || !pull
+            .head_repo
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&repo.full_name()));
+    // Opened by the app: only a page on the repository's own host.
+    let url_ok = pull
+        .url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&repo.host));
     Found {
         link: PrLink {
             host: repo.host.clone(),
             repo: repo.full_name(),
             number: pull.number,
-            url: if pull.url.is_empty() {
-                repo.pull_url(pull.number)
-            } else {
+            url: if url_ok {
                 pull.url.clone()
+            } else {
+                repo.pull_url(pull.number)
             },
             head_branch: pull.head_branch,
             base_branch: pull.base_branch,
@@ -633,13 +712,17 @@ async fn run_poll(ctx: ForgeCtx, polls: Vec<PollTarget>, lookups: Vec<LookupTarg
         };
         let gh = ctx.client(&repo, token);
         for chunk in targets.chunks(MAX_BATCH) {
-            let numbers: Vec<u64> = chunk.iter().map(|t| t.link.number).collect();
+            // Several threads may share a pull request: ask once.
+            let mut numbers: Vec<u64> = chunk.iter().map(|t| t.link.number).collect();
+            numbers.sort_unstable();
+            numbers.dedup();
             match gh.statuses(&repo, &numbers).await {
-                Ok((mut map, rate)) => {
+                Ok((map, rate)) => {
                     done.rate = rate.or(done.rate);
                     for t in chunk {
                         let result = map
-                            .remove(&t.link.number)
+                            .get(&t.link.number)
+                            .cloned()
                             .ok_or_else(|| format!("{} was not found", t.link.label()));
                         done.polled.push((t.thread_id, t.link.clone(), result));
                     }
@@ -651,7 +734,7 @@ async fn run_poll(ctx: ForgeCtx, polls: Vec<PollTarget>, lookups: Vec<LookupTarg
                             remaining: 0,
                         });
                     }
-                    let msg = describe(err);
+                    let msg = ctx.fail(&host, err);
                     for t in chunk {
                         done.polled
                             .push((t.thread_id, t.link.clone(), Err(msg.clone())));
@@ -712,11 +795,18 @@ async fn look_up(
         }
     }?;
     let gh = ctx.client(&repo, token);
-    let info = gh.repo_info(&repo).await.map_err(describe)?;
+    let info = gh
+        .repo_info(&repo)
+        .await
+        .map_err(|e| ctx.fail(&repo.host, e))?;
     if info.default_branch == branch {
         return Ok(None);
     }
-    let Some(pull) = gh.find_pull(&repo, &branch).await.map_err(describe)? else {
+    let Some(pull) = gh
+        .find_pull(&repo, &branch)
+        .await
+        .map_err(|e| ctx.fail(&repo.host, e))?
+    else {
         return Ok(None);
     };
     Ok(Some(found(&gh, &repo, info, pull).await))

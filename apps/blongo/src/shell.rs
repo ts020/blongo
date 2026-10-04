@@ -1910,12 +1910,13 @@ impl Shell {
             }
             "pr.open" => {
                 if let Some(pr) = self.selected_thread(cx).and_then(|t| t.pr) {
-                    cx.open_url(&pr.url);
+                    open_pr(&pr, cx);
                 }
             }
             "pr.refresh" => self.refresh_pr(cx),
             "pr.unlink" => {
-                if let Some((_, thread_id)) = self.selected(cx) {
+                let linked = self.selected_thread(cx).is_some_and(|t| t.pr.is_some());
+                if let Some((_, thread_id)) = self.selected(cx).filter(|_| linked) {
                     self.dispatch_selected(Command::ThreadUnlinkPr { thread_id }, cx);
                 }
             }
@@ -2576,7 +2577,7 @@ impl Shell {
                 .as_ref()
                 .map(|s| s.title.clone())
                 .filter(|t| !t.is_empty());
-            let url = pr.url.clone();
+            let link = pr.clone();
             let label = match &title {
                 Some(t) => format!("#{} {t}", pr.number),
                 None => format!("#{}", pr.number),
@@ -2593,7 +2594,7 @@ impl Shell {
                 .text_xs()
                 .cursor_pointer()
                 .hover(|d| d.bg(theme::surface_hover()))
-                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                .on_click(cx.listener(move |_, _, _, cx| open_pr(&link, cx)))
                 .child(
                     div()
                         .overflow_hidden()
@@ -3065,4 +3066,12 @@ fn canonical(path: &str) -> PathBuf {
     std::path::Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Open a pull request's page. The URL came from GitHub (or a remote
+/// server): only an `https` page on the pull request's own host opens.
+fn open_pr(pr: &blongo_protocol::PrLink, cx: &mut App) {
+    if let Some(url) = crate::pr::safe_url(pr) {
+        cx.open_url(&url);
+    }
 }

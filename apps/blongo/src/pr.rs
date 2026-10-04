@@ -1,7 +1,9 @@
 //! How a thread's pull request looks in the UI: the badge, its colour and
 //! which status changes are worth a notification.
 
-use blongo_protocol::{ChecksState, Mergeable, PrBadge, PrState, PrStatus, ReviewDecision, Thread};
+use blongo_protocol::{
+    ChecksState, Mergeable, PrBadge, PrLink, PrState, PrStatus, ReviewDecision, Thread,
+};
 use gpui::Hsla;
 
 use crate::theme;
@@ -55,6 +57,26 @@ pub fn sidebar_label(thread: &Thread) -> Option<String> {
     } else {
         format!("#{} {glyph}", pr.number)
     })
+}
+
+/// A pull request's web page, if its URL is an `https` page on its own
+/// host (else the page Blongo builds from host, repository and number).
+pub fn safe_url(pr: &PrLink) -> Option<String> {
+    let own = pr
+        .url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(host, path)| host.eq_ignore_ascii_case(&pr.host) && !path.contains(".."));
+    if own {
+        return Some(pr.url.clone());
+    }
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    };
+    (plain(&pr.host) && plain(&pr.repo) && !pr.host.contains('/'))
+        .then(|| format!("https://{}/{}/pull/{}", pr.host, pr.repo, pr.number))
 }
 
 /// What changed between two polls that the user wants to hear about, as
@@ -127,5 +149,30 @@ mod tests {
         let mut errored = approved.clone();
         errored.error = Some("offline".into());
         assert_eq!(transition(Some(&passed), &errored), None);
+    }
+
+    #[test]
+    fn only_own_host_pages_open() {
+        let mut pr = PrLink {
+            host: "github.com".into(),
+            repo: "acme/widgets".into(),
+            number: 7,
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            head_branch: "x".into(),
+            base_branch: "main".into(),
+            read_only: false,
+        };
+        assert_eq!(safe_url(&pr).as_deref(), Some(pr.url.as_str()));
+        for bad in [
+            "file:///etc/passwd",
+            "https://evil.example/x",
+            "javascript:x",
+        ] {
+            pr.url = bad.into();
+            assert_eq!(
+                safe_url(&pr).as_deref(),
+                Some("https://github.com/acme/widgets/pull/7")
+            );
+        }
     }
 }

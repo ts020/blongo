@@ -27,15 +27,16 @@ pub struct Token {
 
 /// The token for `host` (lowercase, as in [`crate::remote::RepoRef`]).
 /// `None`: neither source has one; the caller shows the PR as unreachable
-/// with a hint to sign in.
-pub async fn token_for(host: &str, forge_file: &Path) -> Option<Token> {
+/// with a hint to sign in. `gh` names the GitHub CLI program (`None`:
+/// `gh` on the `PATH`).
+pub async fn token_for(host: &str, forge_file: &Path, gh: Option<&Path>) -> Option<Token> {
     if let Some(token) = from_file(host, forge_file) {
         return Some(Token {
             token,
             source: TokenSource::ForgeFile,
         });
     }
-    from_gh(host).await.map(|token| Token {
+    from_gh(host, gh).await.map(|token| Token {
         token,
         source: TokenSource::GhCli,
     })
@@ -47,12 +48,11 @@ fn from_file(host: &str, path: &Path) -> Option<String> {
     (api_host(&forge.api).as_deref() == Some(host)).then(|| forge.token.clone())
 }
 
-/// `gh auth token --hostname H`. `BLONGO_GH` names another program (the
-/// tests' stand-in). A missing gh, a signed-out host or a hang (10 s) all
-/// read as "no token".
-async fn from_gh(host: &str) -> Option<String> {
-    let program = std::env::var("BLONGO_GH").unwrap_or_else(|_| "gh".into());
-    let child = tokio::process::Command::new(&program)
+/// `gh auth token --hostname H`. A missing gh, a signed-out host or a
+/// hang (10 s) all read as "no token".
+async fn from_gh(host: &str, program: Option<&Path>) -> Option<String> {
+    let program = program.unwrap_or(Path::new("gh"));
+    let child = tokio::process::Command::new(program)
         .args(["auth", "token", "--hostname", host])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
