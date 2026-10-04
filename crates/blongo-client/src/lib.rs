@@ -3,12 +3,12 @@
 //! that reaches a `blongo serve` over Blongo's wire protocol, plus the
 //! pieces both ends share (transports, secrets, the reconnect policy).
 
+pub use blongo_forge::{forge, http};
+
 pub mod backend;
 pub mod backoff;
 pub mod environments;
-pub mod forge;
 pub mod handshake;
-pub mod http;
 pub mod net;
 pub mod pairing;
 pub mod remote;

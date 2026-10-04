@@ -53,11 +53,7 @@ impl std::fmt::Debug for Credential {
 }
 
 pub fn config_dir() -> PathBuf {
-    std::env::var_os("BLONGO_CONFIG_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir().map(|d| d.join("blongo")))
-        .unwrap_or_else(|| PathBuf::from(".blongo-config"))
+    blongo_forge::config_dir()
 }
 
 pub fn default_path() -> PathBuf {

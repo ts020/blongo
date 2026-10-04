@@ -65,6 +65,9 @@ impl Orchestrator {
     /// Resolve a query's folder and trees on the loop, run it as a task
     /// and answer straight from there.
     pub(super) fn query(&mut self, id: QueryId, query: Query) {
+        if let Query::PrRefresh { thread_id } = query {
+            return self.pr_refresh(id, thread_id);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -153,6 +156,7 @@ impl Orchestrator {
                     message: message.clone(),
                 }
             }
+            Query::PrRefresh { .. } => return Err("not a workspace query".into()),
         };
         Ok((cwd, plan))
     }
