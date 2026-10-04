@@ -18,6 +18,7 @@ pub use blongo_protocol::{
     ItemKind, ProjectId, RunId, RunStatus, ThreadId,
 };
 pub use blongo_server::{ServeConfig, ServerHandle};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 pub use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -225,6 +226,10 @@ pub async fn run_finished(rx: &mut UnboundedReceiver<CoreEvent>) -> RunStatus {
     .await
 }
 
+/// How long a cut link keeps swallowing server output before it closes:
+/// longer than the fake Codex's 50 ms between "slow" deltas.
+const CUT_SWALLOW: Duration = Duration::from_millis(200);
+
 /// A TCP proxy whose connections can be cut (the server keeps running,
 /// the client sees a dropped link) and whose upstream can be changed.
 pub struct Proxy {
@@ -260,14 +265,31 @@ impl Proxy {
                     };
                     let (mut cr, mut cw) = client.into_split();
                     let (mut sr, mut sw) = server.into_split();
+                    let is_cut = || generation.load(Ordering::SeqCst) != my_gen;
+                    // Once cut, what the server sends is swallowed instead of
+                    // delivered, so events are always in flight when the link
+                    // drops (a fast client would otherwise have them all).
+                    let downstream = async {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match sr.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            if !is_cut() && cw.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    };
                     let cut = async {
-                        while generation.load(Ordering::SeqCst) == my_gen {
+                        while !is_cut() {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
+                        tokio::time::sleep(CUT_SWALLOW).await;
                     };
                     tokio::select! {
                         _ = tokio::io::copy(&mut cr, &mut sw) => {}
-                        _ = tokio::io::copy(&mut sr, &mut cw) => {}
+                        _ = downstream => {}
                         _ = cut => {}
                     }
                 });
