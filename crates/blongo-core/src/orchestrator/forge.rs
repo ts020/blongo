@@ -48,6 +48,15 @@ pub(super) struct ForgeRt {
     waiters: HashMap<ThreadId, Vec<QueryId>>,
     /// `PrDraft` queries waiting for the run that answers them.
     pub drafts: HashMap<RunId, QueryId>,
+    /// CI fix messages waiting for their run to end.
+    pub fixes: HashMap<RunId, super::autofix::Fix>,
+    /// Threads with a CI fix on its way (report, queued or running turn).
+    pub fixing: HashSet<ThreadId>,
+    /// The head commit and checks state last committed per thread (a
+    /// failure is acted on when it is news).
+    pub seen: HashMap<ThreadId, (String, ChecksState)>,
+    /// Thread notices to commit once the current commit is done.
+    pub notices: Vec<(ThreadId, String)>,
     tokens: TokenCache,
 }
 
@@ -67,14 +76,14 @@ pub(super) struct ForgeCtx {
 }
 
 impl ForgeCtx {
-    fn client(&self, repo: &RepoRef, token: String) -> GitHub {
+    pub(super) fn client(&self, repo: &RepoRef, token: String) -> GitHub {
         match &self.api {
             Some(api) => GitHub::with_api(api, token),
             None => GitHub::new(repo, token),
         }
     }
 
-    async fn token(&self, host: &str) -> Result<String, String> {
+    pub(super) async fn token(&self, host: &str) -> Result<String, String> {
         if let Some((at, token)) = self.cache.lock().unwrap().get(host)
             && at.elapsed() < TOKEN_TTL
         {
@@ -96,7 +105,7 @@ impl ForgeCtx {
 
     /// The message for a failed call; a refused token is read again next
     /// time.
-    fn fail(&self, host: &str, err: GhError) -> String {
+    pub(super) fn fail(&self, host: &str, err: GhError) -> String {
         if matches!(err, GhError::Auth(_)) {
             self.cache.lock().unwrap().remove(host);
         }
@@ -195,7 +204,7 @@ impl ForgeRt {
     }
 
     /// Something happened on the thread: poll it soon and fast for a while.
-    fn hurry(&mut self, thread_id: ThreadId, after: Duration) {
+    pub(super) fn hurry(&mut self, thread_id: ThreadId, after: Duration) {
         let now = Instant::now();
         self.fast_until.insert(thread_id, now + FAST_WINDOW);
         self.failures.remove(&thread_id);
@@ -223,7 +232,7 @@ impl ForgeRt {
 }
 
 impl Orchestrator {
-    fn forge_ctx(&self) -> ForgeCtx {
+    pub(super) fn forge_ctx(&self) -> ForgeCtx {
         ForgeCtx {
             tokens: self.config.forge_tokens.clone(),
             gh: self.config.gh_program.clone(),
@@ -293,6 +302,11 @@ impl Orchestrator {
         }
         let now = Instant::now();
         for (i, thread) in self.threads.values().filter(|t| !t.archived).enumerate() {
+            if let Some(status) = &thread.pr_status {
+                self.forge
+                    .seen
+                    .insert(thread.id, (status.head_sha.clone(), status.checks.state));
+            }
             match (&thread.pr, &thread.pr_status) {
                 (Some(_), Some(status)) if status.state.is_final() => {}
                 (Some(_), _) => {
@@ -321,7 +335,12 @@ impl Orchestrator {
             }
             EventKind::RunStatusChanged { run_id, status, .. } if status.is_terminal() => {
                 self.answer_draft(*run_id, *status);
+                self.finish_fix(*run_id, *status);
             }
+            EventKind::ThreadPrStatus {
+                thread_id,
+                status: Some(status),
+            } => self.consider_fix(*thread_id, status),
             EventKind::ThreadArchived { thread_id } => {
                 self.forge.forget(*thread_id);
                 self.answer_pr_waiters(*thread_id, Err("the thread was archived".into()));
@@ -579,7 +598,10 @@ impl Orchestrator {
             }
             let link = thread.pr.clone().ok_or("no pull request is linked")?;
             let op = match query {
-                Query::PrDetail { .. } => PrOp::Detail { cwd },
+                Query::PrDetail { .. } => PrOp::Detail {
+                    cwd,
+                    auto_fix: self.auto_fix_info(thread),
+                },
                 Query::PrEdit { title, body, .. } => {
                     if link.read_only {
                         return Err(format!("{} is read-only here", link.label()));
@@ -902,7 +924,7 @@ impl Orchestrator {
 /// Whether a thread's branch is its own to look a pull request up for:
 /// subagent threads and forks share their source's worktree, and the
 /// pull request belongs to the thread that made it.
-fn owns_branch(thread: &Thread) -> bool {
+pub(super) fn owns_branch(thread: &Thread) -> bool {
     thread.worktree.is_some()
         && !thread.pr_dismissed
         && thread.parent_thread_id.is_none()
@@ -1145,6 +1167,7 @@ async fn run_poll(ctx: ForgeCtx, polls: Vec<PollTarget>, lookups: Vec<LookupTarg
 enum PrOp {
     Detail {
         cwd: PathBuf,
+        auto_fix: Option<blongo_protocol::AutoFixInfo>,
     },
     Edit {
         title: Option<String>,
@@ -1210,7 +1233,7 @@ async fn run_pr_op(
             done.result = push(&cwd, &branch).await.map(QueryReply::Done);
             done.changed = done.result.is_ok();
         }
-        PrOp::Detail { cwd } => {
+        PrOp::Detail { cwd, auto_fix } => {
             let Some(link) = link else {
                 done.result = Err("no pull request is linked".into());
                 return done;
@@ -1233,6 +1256,7 @@ async fn run_pr_op(
                     }
                     detail.uncommitted = remote::uncommitted(&cwd).await;
                     detail.link = Some(link.clone());
+                    detail.auto_fix = auto_fix;
                     done.status = Some(detail.status.clone());
                     Ok(QueryReply::PrDetail(Box::new(detail)))
                 }
@@ -1392,10 +1416,13 @@ async fn create(
         // Never pushed: the name must be free on GitHub, or the push could
         // add to somebody else's branch (and pull request).
         if !pushed {
-            let taken = branch::remote_has_branch(cwd, &remote_name, &request.branch)
+            let tip = branch::remote_branch_tip(cwd, &remote_name, &request.branch)
                 .await
                 .map_err(|e| format!("Checking the branch name on GitHub failed: {e}"))?;
-            if taken {
+            // At this very commit it is ours: an earlier push got through
+            // although it was reported as failed (a timeout).
+            let ours = tip.is_some() && request.branch == branch && tip == branch::head(cwd).await;
+            if tip.is_some() && !ours {
                 return Err(format!(
                     "{} exists on GitHub already; choose another branch name",
                     request.branch

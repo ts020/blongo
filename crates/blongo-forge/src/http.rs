@@ -33,6 +33,9 @@ pub struct Request {
 pub struct Response {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Where a redirect points (never followed: a token must not go to
+    /// the host it names).
+    pub location: Option<String>,
 }
 
 impl Response {
@@ -167,8 +170,9 @@ fn config(req: &Request) -> Result<String, String> {
         }
         c.push_str(&format!("data-raw = {quoted}\n"));
     }
-    // The status code on a line of its own after the body.
-    c.push_str("write-out = \"\\n%{http_code}\"\n");
+    // The redirect target and the status code on lines of their own
+    // after the body.
+    c.push_str("write-out = \"\\n%{redirect_url}\\n%{http_code}\"\n");
     Ok(c)
 }
 
@@ -229,9 +233,16 @@ async fn run(req: &Request) -> Result<Response, String> {
         .and_then(|s| s.trim().parse().ok())
         .ok_or("curl gave no status")?;
     out.truncate(split);
+    let split = out
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .ok_or("curl gave no redirect line")?;
+    let location = String::from_utf8_lossy(&out[split + 1..]).trim().to_owned();
+    out.truncate(split);
     Ok(Response {
         status: code,
         body: out,
+        location: (!location.is_empty()).then_some(location),
     })
 }
 
@@ -271,7 +282,7 @@ pub async fn download(url: &str, dest: &std::path::Path, max: u64) -> Result<u64
         "output = {}\n",
         quote(&dest.display().to_string())
     ));
-    c = c.replace("write-out = \"\\n%{http_code}\"\n", "");
+    c = c.replace("write-out = \"\\n%{redirect_url}\\n%{http_code}\"\n", "");
     let program = std::env::var("BLONGO_CURL").unwrap_or_else(|_| "curl".into());
     let mut child = tokio::process::Command::new(&program)
         .args(["-q", "--config", "-"])

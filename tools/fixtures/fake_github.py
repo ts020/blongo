@@ -16,6 +16,13 @@ Supported API (only what Blongo asks):
   PATCH /repos/O/N/pulls/NUM   {title, body}
   POST /repos/O/N/pulls        {title, body, head, base, draft} (422 when an
                                open pull has that head already)
+  GET  /repos/O/N/commits/SHA/check-runs   checks of the pull whose head is SHA
+  GET  /repos/O/N/check-runs/ID/annotations
+  GET  /repos/O/N/actions/jobs/ID/logs     302 to /__blob/ID (served without
+                                           a token; requests are logged)
+  GET  /repos/O/N/commits/SHA/status       status checks (those with "state")
+  Checks may carry "summary", "annotations": [{"path", "start_line",
+  "message"}] and "log" (text) for these.
   POST /graphql   rateLimit + repository(owner,name){ pNUM: pullRequest(number:NUM){...} }
                   repository(owner,name){ pullRequest(number:NUM){...detail...} }
 
@@ -196,6 +203,27 @@ def graphql_detail(full, p):
     return out
 
 
+def check_run(p, i, c):
+    return {
+        "id": p["number"] * 100 + i,
+        "name": c["name"],
+        "status": c["status"].lower(),
+        "conclusion": (c.get("conclusion") or "").lower() or None,
+        "details_url": c.get("url"),
+        "app": {"slug": "github-actions" if c.get("workflow") else "other"},
+        "output": {"title": c.get("summary"), "summary": None, "text": None},
+    }
+
+
+def find_check(run_id):
+    number, i = divmod(run_id, 100)
+    for r in REPOS.values():
+        p = r["pulls"].get(number)
+        if p and i < len(p["checks"]):
+            return p, p["checks"][i]
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -238,9 +266,53 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if self.path == "/__log":
                 return self.reply(200, LOG)
+            m = re.fullmatch(r"/__blob/(\d+)", self.path)
+            if m:
+                LOG.append({"method": "GET", "path": self.path,
+                            "auth": self.headers.get("Authorization", ""), "body": None})
+                c = find_check(int(m[1]))
+                data = (c[1].get("log", "") if c else "").encode()
+                self.send_response(200 if c else 404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.gate():
                 return
             url = urlsplit(self.path)
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/commits/([0-9a-f]+)/check-runs", url.path)
+            if m:
+                runs = []
+                for p in REPOS.get(f"{m[1]}/{m[2]}", {}).get("pulls", {}).values():
+                    if p["head_sha"] != m[3]:
+                        continue
+                    for i, c in enumerate(p["checks"]):
+                        if "status" in c:
+                            runs.append(check_run(p, i, c))
+                return self.reply(200, {"total_count": len(runs), "check_runs": runs})
+            m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/commits/([0-9a-f]+)/status", url.path)
+            if m:
+                statuses = []
+                for p in REPOS.get(f"{m[1]}/{m[2]}", {}).get("pulls", {}).values():
+                    if p["head_sha"] == m[3]:
+                        statuses += [{"context": c["name"], "state": c["state"].lower(),
+                                      "description": c.get("description", "")}
+                                     for c in p["checks"] if "state" in c]
+                return self.reply(200, {"statuses": statuses})
+            m = re.fullmatch(r"/repos/[^/]+/[^/]+/check-runs/(\d+)/annotations", url.path)
+            if m:
+                c = find_check(int(m[1]))
+                return self.reply(200, c[1].get("annotations", []) if c else [])
+            m = re.fullmatch(r"/repos/[^/]+/[^/]+/actions/jobs/(\d+)/logs", url.path)
+            if m:
+                if not find_check(int(m[1])):
+                    return self.reply(404, {"message": "Not Found"})
+                self.send_response(302)
+                self.send_header("Location", f"http://{self.headers['Host']}/__blob/{m[1]}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             m = re.fullmatch(r"/repos/([^/]+)/([^/]+)", url.path)
             if m:
                 full = f"{m[1]}/{m[2]}"

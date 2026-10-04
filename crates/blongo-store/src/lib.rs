@@ -543,6 +543,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_forge_cache(&self, key: &str) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached("DELETE FROM forge_cache WHERE key = ?1")?
+            .execute([key])?;
+        Ok(())
+    }
+
     /// Re-read the newest sequence (after another connection committed).
     pub fn refresh_last_sequence(&mut self) -> anyhow::Result<u64> {
         let stored: i64 =

@@ -81,8 +81,13 @@ pub async fn remote_head(cwd: &Path, remote: &str) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// Whether `remote` has `branch` now (asks the remote; no ref changes).
-pub async fn remote_has_branch(cwd: &Path, remote: &str, branch: &str) -> Result<bool, String> {
+/// The commit `remote` has for `branch` now (`None`: no such branch).
+/// Asks the remote; no ref changes.
+pub async fn remote_branch_tip(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
     if !plain(remote) || !plain(branch) {
         return Err("not a branch name".into());
     }
@@ -98,7 +103,11 @@ pub async fn remote_has_branch(cwd: &Path, remote: &str, branch: &str) -> Result
         Duration::from_secs(30),
     )
     .await?;
-    Ok(!out.trim().is_empty())
+    Ok(out
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty()))
 }
 
 /// The commit HEAD points at.
@@ -249,6 +258,81 @@ pub async fn template(cwd: &Path) -> Option<String> {
 /// Neither empty nor an option, no whitespace or control characters: a
 /// name safe to put after the arguments it follows (callers validate
 /// branch names more strictly).
+/// What bringing the base branch into the checked-out branch did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The branch has the base's commits already.
+    UpToDate,
+    /// Merged without conflicts (a merge commit, nothing pushed).
+    Merged,
+    /// The merge stopped with these files in conflict; it is left in
+    /// progress for someone to resolve and commit.
+    Conflicts(Vec<String>),
+}
+
+/// Merge `refs/remotes/{remote}/{base}` (fetched by the caller) into the
+/// checked-out branch. Never a rebase; a merge already in progress is
+/// reported with its conflicted files instead of starting another.
+pub async fn merge_base(cwd: &Path, remote: &str, base: &str) -> Result<MergeOutcome, String> {
+    if !plain(remote) || !plain(base) {
+        return Err("not a branch name".into());
+    }
+    if quick(cwd, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+        .await
+        .is_ok()
+    {
+        let files = conflicted(cwd).await;
+        return if files.is_empty() {
+            Err("a merge is in progress; commit it first".into())
+        } else {
+            Ok(MergeOutcome::Conflicts(files))
+        };
+    }
+    let target = format!("refs/remotes/{remote}/{base}");
+    if quick(cwd, &["merge-base", "--is-ancestor", &target, "HEAD"])
+        .await
+        .is_ok()
+    {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    if !uncommitted_files(cwd).await.is_empty() {
+        return Err("commit or discard the uncommitted changes first".into());
+    }
+    let message = format!("Merge {remote}/{base}");
+    match run(
+        cwd,
+        &["merge", "--no-edit", "--no-ff", "-m", &message, &target],
+        Duration::from_secs(120),
+    )
+    .await
+    {
+        Ok(_) => Ok(MergeOutcome::Merged),
+        Err(err) => {
+            let files = conflicted(cwd).await;
+            if files.is_empty() {
+                let _ = quick(cwd, &["merge", "--abort"]).await;
+                Err(err)
+            } else {
+                Ok(MergeOutcome::Conflicts(files))
+            }
+        }
+    }
+}
+
+/// Files with unresolved conflicts.
+async fn conflicted(cwd: &Path) -> Vec<String> {
+    quick(cwd, &["diff", "--name-only", "--diff-filter=U", "-z"])
+        .await
+        .map(|out| {
+            out.split('\0')
+                .filter(|f| !f.is_empty())
+                .take(MAX_LIST)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn plain(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
@@ -317,6 +401,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merges_the_base_and_reports_conflicts() {
+        let work = temp("merge");
+        sh(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        sh(&work, &["add", "."]);
+        sh(&work, &["commit", "-qm", "init"]);
+        // A fake remote-tracking branch for the base.
+        sh(&work, &["checkout", "-qb", "topic"]);
+        sh(&work, &["update-ref", "refs/remotes/origin/main", "main"]);
+        assert_eq!(
+            merge_base(&work, "origin", "main").await,
+            Ok(MergeOutcome::UpToDate)
+        );
+        // The base moves on elsewhere: a clean merge.
+        sh(&work, &["checkout", "-q", "main"]);
+        std::fs::write(work.join("b.txt"), "b\n").unwrap();
+        sh(&work, &["add", "."]);
+        sh(&work, &["commit", "-qm", "b"]);
+        sh(&work, &["update-ref", "refs/remotes/origin/main", "main"]);
+        sh(&work, &["checkout", "-q", "topic"]);
+        sh(&work, &["config", "user.name", "t"]);
+        sh(&work, &["config", "user.email", "t@t"]);
+        assert_eq!(
+            merge_base(&work, "origin", "main").await,
+            Ok(MergeOutcome::Merged)
+        );
+        assert!(work.join("b.txt").exists());
+        // Both sides change a.txt: conflicts are left for the agent.
+        sh(&work, &["checkout", "-q", "main"]);
+        std::fs::write(work.join("a.txt"), "base\n").unwrap();
+        sh(&work, &["commit", "-qam", "base"]);
+        sh(&work, &["update-ref", "refs/remotes/origin/main", "main"]);
+        sh(&work, &["checkout", "-q", "topic"]);
+        std::fs::write(work.join("a.txt"), "topic\n").unwrap();
+        // Uncommitted changes are refused before merging.
+        assert!(merge_base(&work, "origin", "main").await.is_err());
+        sh(&work, &["commit", "-qam", "topic"]);
+        let want = Ok(MergeOutcome::Conflicts(vec!["a.txt".into()]));
+        assert_eq!(merge_base(&work, "origin", "main").await, want);
+        // Asking again reports the merge in progress.
+        assert_eq!(merge_base(&work, "origin", "main").await, want);
+        assert_eq!(
+            merge_base(&work, "-x", "main").await,
+            Err("not a branch name".into())
+        );
+    }
+
+    #[tokio::test]
     async fn rename_push_and_never_force() {
         let remote = temp("remote");
         let work = temp("work");
@@ -365,14 +497,14 @@ mod tests {
         );
         assert!(fetch(&work, "origin", "-x", FETCH_TIMEOUT).await.is_err());
         assert!(
-            remote_has_branch(&work, "origin", "blongo/fix-b")
+            remote_branch_tip(&work, "origin", "blongo/fix-b")
                 .await
                 .unwrap()
+                .is_some()
         );
-        assert!(
-            !remote_has_branch(&work, "origin", "blongo/nope")
-                .await
-                .unwrap()
+        assert_eq!(
+            remote_branch_tip(&work, "origin", "blongo/nope").await,
+            Ok(None)
         );
 
         std::fs::create_dir_all(work.join(".github")).unwrap();

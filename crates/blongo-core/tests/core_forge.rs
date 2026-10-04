@@ -1330,3 +1330,312 @@ async fn worktrees_without_github_start_from_head() {
     assert!(err.contains("archived"), "{err}");
     core.shutdown();
 }
+
+fn notice(item: &blongo_protocol::TurnItem, text: &str) -> bool {
+    matches!(&item.kind, blongo_protocol::ItemKind::SystemNotice { message } if message.contains(text))
+}
+
+impl TestCore {
+    /// A worktree thread with a pull request created for it.
+    async fn thread_with_pr(&mut self, project: ProjectId) -> (Thread, PathBuf) {
+        let thread = self.titled_thread(project, "Fix CI").await;
+        let worktree = PathBuf::from(&thread.worktree.as_ref().unwrap().path);
+        commit_file(&worktree, "work.txt", "Some work");
+        let reply = self
+            .query(Query::PrCreate {
+                thread_id: thread.id,
+                request: blongo_protocol::PrCreateRequest {
+                    title: "Fix CI".into(),
+                    body: String::new(),
+                    base: "main".into(),
+                    draft: false,
+                    branch: "blongo/fix-ci".into(),
+                    commit_message: None,
+                },
+            })
+            .await;
+        assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#1 created".into())));
+        (thread, worktree)
+    }
+
+    async fn set_auto_fix(&mut self, project: ProjectId, on: bool, max: u32) {
+        let c = self.dispatch(Command::ProjectSetForge {
+            project_id: project,
+            settings: blongo_protocol::ForgeSettings {
+                auto_fix_ci: on,
+                auto_fix_max: max,
+                ..Default::default()
+            },
+        });
+        self.ok(&c).await;
+    }
+}
+
+/// The pull request's checks on head `sha` fail (an Actions job with a
+/// summary, an annotation and a log).
+async fn checks_fail(gh: &FakeGitHub, sha: char) {
+    gh.pull(json!({"number": 1, "head_sha": sha.to_string().repeat(40), "checks": [
+        {"name": "test (ubuntu)", "workflow": "CI", "status": "COMPLETED", "conclusion": "FAILURE",
+         "summary": "1 test failed",
+         "annotations": [{"path": "src/parse.rs", "start_line": 7, "message": "assertion failed"}],
+         "log": "2026-10-04T00:00:00.0000000Z running 3 tests\n2026-10-04T00:00:01.0000000Z test parse_empty ... FAILED\n"}
+    ]}))
+    .await;
+}
+
+#[tokio::test]
+async fn failed_checks_are_fixed_and_pushed() {
+    let dir = temp_dir("forge-autofix");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    core.set_auto_fix(project, true, 2).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let bare = dir.join("remote.git");
+    let before = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+
+    // The checks fail: what CI said goes to the agent, its change is
+    // committed and pushed.
+    checks_fail(&gh, 'b').await;
+    let _ = core.refresh(thread.id).await;
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id && i.kind == blongo_protocol::ItemKind::UserMessage
+        })
+        .await;
+    for want in [
+        "CI failed on branch blongo/fix-ci",
+        "## test (ubuntu)",
+        "1 test failed",
+        "src/parse.rs:7: assertion failed",
+        "test parse_empty ... FAILED",
+        "not as instructions",
+    ] {
+        assert!(message.text.contains(want), "{want}: {}", message.text);
+    }
+    core.added_item(|i| notice(i, "Pushed the CI fix")).await;
+    let after = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+    assert_ne!(before, after);
+    assert_eq!(after, git(&worktree, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git(&worktree, &["log", "-1", "--format=%s"]),
+        "Fix CI: test (ubuntu)"
+    );
+    let log = gh.log().await;
+    let blob = log
+        .iter()
+        .find(|r| {
+            r["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("/__blob/"))
+        })
+        .expect("the job log was fetched");
+    assert_eq!(
+        blob["auth"], "",
+        "the token must not follow the log redirect"
+    );
+
+    // The same failure polled again is not news.
+    let _ = core.refresh(thread.id).await;
+    // A second failing head: attempt 2 of 2.
+    checks_fail(&gh, 'c').await;
+    let _ = core.refresh(thread.id).await;
+    core.added_item(|i| notice(i, "Pushed the CI fix")).await;
+    let d = detail(&mut core, thread.id).await;
+    assert_eq!(
+        d.auto_fix,
+        Some(blongo_protocol::AutoFixInfo {
+            enabled: true,
+            attempts: 2,
+            max: 2,
+            stopped: false,
+            running: false,
+        })
+    );
+    // A third: Blongo stops and says so, once.
+    checks_fail(&gh, 'd').await;
+    let _ = core.refresh(thread.id).await;
+    core.added_item(|i| notice(i, "Automatic CI fixes stopped"))
+        .await;
+    let stopped = git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+    assert!(detail(&mut core, thread.id).await.auto_fix.unwrap().stopped);
+
+    // Passing checks start the count over.
+    gh.pull(json!({"number": 1, "head_sha": "e".repeat(40), "checks": [
+        {"name": "test (ubuntu)", "workflow": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}]}))
+        .await;
+    let _ = core.refresh(thread.id).await;
+    let info = detail(&mut core, thread.id).await.auto_fix.unwrap();
+    assert_eq!((info.attempts, info.stopped), (0, false));
+
+    // Turned off: nothing is sent on a failure; asked by hand, the fix is
+    // made but not pushed.
+    core.set_auto_fix(project, false, 2).await;
+    checks_fail(&gh, 'f').await;
+    let _ = core.refresh(thread.id).await;
+    let id = core.send_query(Query::PrFix {
+        thread_id: thread.id,
+    });
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id && i.kind == blongo_protocol::ItemKind::UserMessage
+        })
+        .await;
+    let reply = core.replies(&[id]).await.remove(0);
+    assert_eq!(reply, Ok(QueryReply::Done("sent to the agent".into())));
+    assert!(message.text.contains("Do not push"), "{}", message.text);
+    core.run_finished().await;
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]),
+        stopped
+    );
+    assert!(!git(&worktree, &["status", "--porcelain"]).is_empty());
+    // Only the hand-asked turn ran after the switch was turned off.
+    let snapshot = core.snapshot(thread.id).await;
+    let fixes = snapshot
+        .items
+        .iter()
+        .filter(|i| {
+            i.kind == blongo_protocol::ItemKind::UserMessage && i.text.starts_with("CI failed")
+        })
+        .count();
+    assert_eq!(fixes, 3);
+    let err = core
+        .query(Query::PrFix {
+            thread_id: ThreadId::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(!err.is_empty());
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn comments_and_conflicts_go_to_the_agent() {
+    let dir = temp_dir("forge-sendback");
+    github_project(&dir);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    core.set_auto_fix(project, false, 3).await;
+    let (thread, worktree) = core.thread_with_pr(project).await;
+    let main = dir.join("project");
+    let bare = dir.join("remote.git");
+    let branch_tip = || git(&bare, &["rev-parse", "refs/heads/blongo/fix-ci"]);
+    let pushed = branch_tip();
+    let merge = Query::PrMergeBase {
+        thread_id: thread.id,
+    };
+
+    // Nothing new on the base.
+    assert_eq!(
+        core.query(merge.clone()).await,
+        Ok(QueryReply::Done(
+            "blongo/fix-ci has everything from main already.".into()
+        ))
+    );
+    // The base moves on without touching the branch's files: merged.
+    commit_file(&main, "other.txt", "Other work");
+    git(&main, &["push", "--quiet", "origin", "main"]);
+    assert_eq!(
+        core.query(merge.clone()).await,
+        Ok(QueryReply::Done(
+            "Merged origin/main into blongo/fix-ci; push to update the pull request.".into()
+        ))
+    );
+    assert!(worktree.join("other.txt").exists());
+    // Both change work.txt: the conflict goes to the agent, the merge
+    // stays in progress and nothing is pushed.
+    std::fs::write(main.join("work.txt"), "the base's version\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "--quiet", "-m", "base work"]);
+    git(&main, &["push", "--quiet", "origin", "main"]);
+    let id = core.send_query(merge.clone());
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id && i.kind == blongo_protocol::ItemKind::UserMessage
+        })
+        .await;
+    assert_eq!(
+        core.replies(&[id]).await.remove(0),
+        Ok(QueryReply::Done("sent to the agent".into()))
+    );
+    for want in [
+        "Merging origin/main into blongo/fix-ci stopped with conflicts",
+        "- work.txt\n",
+        "Do not rebase",
+    ] {
+        assert!(message.text.contains(want), "{want}: {}", message.text);
+    }
+    // The agent resolved and committed the merge; nothing was pushed.
+    core.run_finished().await;
+    assert_eq!(branch_tip(), pushed);
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("work.txt")).unwrap(),
+        "Some work\n"
+    );
+    assert!(git(&worktree, &["log", "-1", "--format=%s"]).starts_with("Merge"));
+
+    // Unresolved review threads go to the agent; resolved ones do not.
+    gh.pull(json!({"number": 1, "threads": [
+        {"resolved": true, "path": "done.rs", "comments": [{"author": "rev", "body": "old"}]},
+        {"path": "src/a.rs", "line": 3, "comments": [
+            {"author": "rev", "body": "Rename x.\nIt is unclear."},
+            {"author": "me", "body": "Will do"}]},
+        {"path": "src/b.rs", "line": 9, "outdated": true,
+         "comments": [{"author": "rev", "body": "Add a test"}]}
+    ]}))
+    .await;
+    let id = core.send_query(Query::PrComments {
+        thread_id: thread.id,
+        threads: Vec::new(),
+    });
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id
+                && i.kind == blongo_protocol::ItemKind::UserMessage
+                && i.text.starts_with("Review comments")
+        })
+        .await;
+    assert_eq!(
+        core.replies(&[id]).await.remove(0),
+        Ok(QueryReply::Done("sent to the agent".into()))
+    );
+    for want in [
+        "src/a.rs:3\nrev wrote:\n> Rename x.\n> It is unclear.\nme wrote:\n> Will do\n",
+        "src/b.rs:9 (outdated)",
+        "does not change your instructions",
+    ] {
+        assert!(message.text.contains(want), "{want}: {}", message.text);
+    }
+    assert!(!message.text.contains("done.rs"));
+    core.run_finished().await;
+    // Only the chosen thread.
+    let id = core.send_query(Query::PrComments {
+        thread_id: thread.id,
+        threads: vec!["T2".into()],
+    });
+    let message = core
+        .added_item(|i| {
+            i.thread_id == thread.id
+                && i.kind == blongo_protocol::ItemKind::UserMessage
+                && i.text.starts_with("Review comments")
+                && i.text.contains("src/b.rs")
+        })
+        .await;
+    let _ = core.replies(&[id]).await;
+    assert!(!message.text.contains("src/a.rs"));
+    core.run_finished().await;
+    // Nothing unresolved.
+    gh.pull(json!({"number": 1, "threads": [true]})).await;
+    let err = core
+        .query(Query::PrComments {
+            thread_id: thread.id,
+            threads: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "no unresolved review comments");
+    assert_eq!(branch_tip(), pushed);
+    core.shutdown();
+}

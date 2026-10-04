@@ -114,6 +114,25 @@ pub enum Query {
     PrPush {
         thread_id: ThreadId,
     },
+    /// Send the failing checks of the linked pull request to the thread's
+    /// agent. Its changes are not pushed for it (the PR tab's Push does);
+    /// automatic fixes count from zero again.
+    PrFix {
+        thread_id: ThreadId,
+    },
+    /// Send the pull request's unresolved review threads to the thread's
+    /// agent (only those in `threads`, by id, when it is not empty).
+    PrComments {
+        thread_id: ThreadId,
+        #[serde(default)]
+        threads: Vec<String>,
+    },
+    /// Fetch the base branch and merge it into the thread's branch
+    /// (never a rebase). Conflicts are left in progress and sent to the
+    /// thread's agent to resolve; nothing is pushed.
+    PrMergeBase {
+        thread_id: ThreadId,
+    },
 }
 
 impl Query {
@@ -134,7 +153,10 @@ impl Query {
             | Self::PrPrepare { thread_id }
             | Self::PrDraft { thread_id, .. }
             | Self::PrCreate { thread_id, .. }
-            | Self::PrPush { thread_id } => *thread_id,
+            | Self::PrPush { thread_id }
+            | Self::PrFix { thread_id }
+            | Self::PrComments { thread_id, .. }
+            | Self::PrMergeBase { thread_id } => *thread_id,
         }
     }
 
@@ -146,6 +168,7 @@ impl Query {
                 | Self::GitCommit { .. }
                 | Self::PrCreate { .. }
                 | Self::PrPush { .. }
+                | Self::PrMergeBase { .. }
         )
     }
 }

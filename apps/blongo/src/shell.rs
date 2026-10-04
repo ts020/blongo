@@ -735,6 +735,9 @@ impl Shell {
                 cx.notify();
             }
             CoreEvent::Notice { message } => {
+                if message.starts_with("Automatic CI fixes stopped") {
+                    self.notify(&message, "Blongo", cx);
+                }
                 self.notice = Some(if env == LOCAL {
                     message.into()
                 } else {
@@ -1070,8 +1073,20 @@ impl Shell {
                 if let Some(status) = status.thread_status() {
                     self.set_thread_status(env, *thread_id, status, cx);
                 }
+                // A turn ended: the PR tab's local state (commits to push,
+                // a fix on its way) may have changed.
+                if status.is_terminal() {
+                    self.reload_pr_view(env, *thread_id, cx);
+                }
             }
             EventKind::ItemAdded { item } | EventKind::ItemUpdated { item } => {
+                // A notice outside a turn (a CI fix pushed, …).
+                if matches!(kind, EventKind::ItemAdded { .. })
+                    && item.run_id.is_none()
+                    && matches!(item.kind, ItemKind::SystemNotice { .. })
+                {
+                    self.reload_pr_view(env, item.thread_id, cx);
+                }
                 if let (
                     EventKind::ItemAdded { .. },
                     ItemKind::ApprovalRequest {
@@ -2255,6 +2270,15 @@ impl Shell {
     }
 
     /// A desktop notification, as the settings allow.
+    /// Fetch the PR tab's detail again when it shows `thread_id`.
+    fn reload_pr_view(&self, env: EnvId, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if let Some(pr) = &self.pr_view
+            && self.pr_view_for == Some((env, thread_id))
+        {
+            pr.update(cx, |p, cx| p.reload(cx));
+        }
+    }
+
     fn notify(&self, body: &str, title: &str, cx: &App) {
         let show = match cx.global::<Settings>().value.notifications {
             NotifyMode::Off => false,

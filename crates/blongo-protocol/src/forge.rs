@@ -292,6 +292,26 @@ pub struct PrDetail {
     pub behind: Option<u32>,
     /// Files changed in the thread's folder and not committed.
     pub uncommitted: u32,
+    /// Automatic CI fixes for this pull request (`None`: not possible
+    /// here: read-only, or not the thread's own branch).
+    #[serde(default)]
+    pub auto_fix: Option<AutoFixInfo>,
+}
+
+/// Where automatic CI fixes of a pull request stand.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoFixInfo {
+    /// The project's setting.
+    pub enabled: bool,
+    /// Fix turns sent since the checks last passed.
+    pub attempts: u32,
+    /// Attempts before Blongo stops and asks.
+    pub max: u32,
+    /// Stopped after `max` attempts (until the checks pass or a fix is
+    /// asked for by hand).
+    pub stopped: bool,
+    /// A fix turn is queued or running.
+    pub running: bool,
 }
 
 impl PrDetail {

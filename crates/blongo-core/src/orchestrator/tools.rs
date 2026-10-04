@@ -77,6 +77,12 @@ impl Orchestrator {
         if let Query::PrDraft { thread_id, prompt } = query {
             return self.pr_draft(id, thread_id, prompt);
         }
+        if let Query::PrFix { thread_id } = query {
+            return self.pr_fix(id, thread_id);
+        }
+        if let Query::PrComments { thread_id, threads } = query {
+            return self.pr_comments(id, thread_id, threads);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -171,7 +177,10 @@ impl Orchestrator {
             | Query::PrPrepare { .. }
             | Query::PrDraft { .. }
             | Query::PrCreate { .. }
-            | Query::PrPush { .. } => {
+            | Query::PrPush { .. }
+            | Query::PrFix { .. }
+            | Query::PrComments { .. }
+            | Query::PrMergeBase { .. } => {
                 return Err("not a workspace query".into());
             }
         };
@@ -184,6 +193,9 @@ impl Orchestrator {
     pub(super) fn mutate(&mut self, id: QueryId, query: Query, key: Key) {
         if matches!(query, Query::PrCreate { .. } | Query::PrPush { .. }) {
             return self.pr_mutate(id, query, key);
+        }
+        if let Query::PrMergeBase { thread_id } = query {
+            return self.pr_merge_base(id, thread_id, key);
         }
         let checked = (|| {
             let thread_id = query.thread_id();

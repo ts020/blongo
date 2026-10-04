@@ -35,6 +35,8 @@ pub struct PrView {
     saving: bool,
     /// A push is running.
     pushing: bool,
+    /// Something is on its way to the agent (a fix, comments, a merge).
+    sending: bool,
     /// Title, body and whether the body was cut, as the form opened with
     /// them: only what the user changed is sent (a poll may reload the
     /// detail meanwhile).
@@ -76,6 +78,7 @@ impl PrView {
             reload_again: false,
             saving: false,
             pushing: false,
+            sending: false,
             edit_base: None,
             error: None,
             editing: false,
@@ -205,6 +208,40 @@ impl PrView {
 }
 
 impl PrView {
+    /// Send something to the agent: the failed checks, review comments,
+    /// or the base branch merged in (conflicts go to the agent). Nothing
+    /// it changes is pushed for the user.
+    fn send(&mut self, query: Query, cx: &mut Context<Self>) {
+        if self.sending {
+            return;
+        }
+        self.sending = true;
+        self.message = None;
+        cx.notify();
+        crate::query::ask(
+            &self.backend,
+            query,
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                this.sending = false;
+                match result {
+                    Ok(QueryReply::Done(text)) if text == "sent to the agent" => {
+                        this.message = Some((
+                            true,
+                            "Sent to the agent; push its changes from here when it is done.".into(),
+                        ))
+                    }
+                    Ok(QueryReply::Done(text)) => this.message = Some((true, text.into())),
+                    Ok(_) => {}
+                    Err(err) => this.message = Some((false, err.into())),
+                }
+                this.reload(cx);
+                cx.notify();
+            },
+        );
+    }
+
     /// Push the local commits (never forced).
     fn push(&mut self, cx: &mut Context<Self>) {
         if self.pushing {
@@ -539,6 +576,13 @@ impl Render for PrView {
         };
         let can_push =
             detail.ahead.is_some_and(|a| a > 0) && !link.as_ref().is_some_and(|l| l.read_only);
+        // The base branch can be merged in by the thread that owns the
+        // branch (the same threads automatic fixes are for).
+        let owned = detail.auto_fix.is_some();
+        let conflicting = status.mergeable == blongo_protocol::Mergeable::Conflicting
+            || detail.merge_state == blongo_protocol::MergeState::Dirty;
+        let behind_base = detail.merge_state == blongo_protocol::MergeState::Behind;
+        let thread_id = self.thread_id;
         merge = merge.child(
             div()
                 .flex()
@@ -558,12 +602,89 @@ impl Render for PrView {
                         theme::text(),
                         cx.listener(|this, _, _, cx| this.push(cx)),
                     ))
+                })
+                .when(owned && (conflicting || behind_base), |d| {
+                    d.child(button(
+                        "pr-merge-base".into(),
+                        if self.sending {
+                            "Sending…"
+                        } else if conflicting {
+                            "Resolve conflicts with agent"
+                        } else {
+                            "Merge base in"
+                        },
+                        theme::surface_hover(),
+                        theme::text(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.send(Query::PrMergeBase { thread_id }, cx)
+                        }),
+                    ))
                 }),
         );
         root = root.child(merge);
+        // What the last action did, where the buttons are.
+        if let Some((ok, text)) = &self.message {
+            root = root.child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(if *ok {
+                        theme::success()
+                    } else {
+                        theme::danger()
+                    })
+                    .child(text.clone()),
+            );
+        }
 
-        // Checks.
+        // Checks, and what Blongo does when they fail.
         root = root.child(section("CHECKS"));
+        let failing = status.checks.state == blongo_protocol::ChecksState::Failure;
+        if let Some(fix) = &detail.auto_fix {
+            let text = if fix.running {
+                "A fix by the agent is on its way.".to_owned()
+            } else if !fix.enabled {
+                "Automatic fixes are off for this project (Settings › GitHub).".to_owned()
+            } else if fix.stopped {
+                format!(
+                    "Automatic fixes stopped after {} attempts; fix it by hand or ask the agent.",
+                    fix.attempts
+                )
+            } else {
+                format!(
+                    "Failed checks go to the agent and its fix is pushed ({} of {} attempts used).",
+                    fix.attempts, fix.max
+                )
+            };
+            root = root.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_faint())
+                            .child(SharedString::from(text)),
+                    )
+                    .when(failing && !fix.running, |d| {
+                        d.child(button(
+                            "pr-fix".into(),
+                            if self.sending {
+                                "Sending…"
+                            } else {
+                                "Ask agent to fix"
+                            },
+                            theme::surface_hover(),
+                            theme::text(),
+                            cx.listener(move |this, _, _, cx| {
+                                this.send(Query::PrFix { thread_id }, cx)
+                            }),
+                        ))
+                    }),
+            );
+        }
         if detail.checks.is_empty() {
             root = root.child(
                 div()
@@ -639,7 +760,29 @@ impl Render for PrView {
 
         // Conversations, unresolved first.
         let resolved = detail.threads.iter().filter(|t| t.resolved).count();
+        let unresolved = detail.threads.len() - resolved;
         root = root.child(section("CONVERSATIONS"));
+        if unresolved > 0 {
+            root = root.child(div().flex().mb_1().child(button(
+                "pr-send-comments".into(),
+                if self.sending {
+                    "Sending…"
+                } else {
+                    "Send unresolved to agent"
+                },
+                theme::surface_hover(),
+                theme::text(),
+                cx.listener(move |this, _, _, cx| {
+                    this.send(
+                        Query::PrComments {
+                            thread_id,
+                            threads: Vec::new(),
+                        },
+                        cx,
+                    )
+                }),
+            )));
+        }
         if detail.threads.is_empty() {
             root = root.child(
                 div()
@@ -676,7 +819,26 @@ impl Render for PrView {
                         .text_color(theme::text_muted())
                         .child(SharedString::from(place))
                         .when(thread.resolved, |d| d.child("resolved"))
-                        .when(thread.outdated, |d| d.child("outdated")),
+                        .when(thread.outdated, |d| d.child("outdated"))
+                        .when(!thread.resolved, |d| {
+                            let id = thread.id.clone();
+                            d.child(div().flex_1()).child(
+                                div()
+                                    .id(("pr-thread-send", ix))
+                                    .text_color(theme::accent())
+                                    .cursor_pointer()
+                                    .child("Send to agent")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send(
+                                            Query::PrComments {
+                                                thread_id,
+                                                threads: vec![id.clone()],
+                                            },
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        }),
                 );
             for comment in &thread.comments {
                 card = card.child(
@@ -749,19 +911,6 @@ impl Render for PrView {
                         .child(SharedString::from(line.to_owned())),
                 );
             }
-        }
-        if let Some((ok, text)) = &self.message {
-            root = root.child(
-                div()
-                    .mt_2()
-                    .text_xs()
-                    .text_color(if *ok {
-                        theme::success()
-                    } else {
-                        theme::danger()
-                    })
-                    .child(text.clone()),
-            );
         }
         root
     }

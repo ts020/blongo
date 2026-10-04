@@ -14,7 +14,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::input::{InputEvent, TextInput};
+use crate::input::TextInput;
 use crate::theme;
 use crate::timeline::button;
 
@@ -40,7 +40,6 @@ pub struct PrCreateView {
     /// Result of the last draft or create.
     message: Option<(bool, SharedString)>,
     focus: FocusHandle,
-    _subscriptions: [gpui::Subscription; 1],
 }
 
 impl PrCreateView {
@@ -50,9 +49,6 @@ impl PrCreateView {
         let base = cx.new(|cx| TextInput::new("Base branch", false, cx));
         let branch = cx.new(|cx| TextInput::new("Branch", false, cx));
         let commit = cx.new(|cx| TextInput::new("Commit message", false, cx));
-        // Only the Create button commits and pushes: Enter in the title
-        // does nothing.
-        let subscriptions = [cx.subscribe(&title, |_, _, _: &InputEvent, _| {})];
         let mut this = Self {
             backend,
             thread_id,
@@ -69,7 +65,6 @@ impl PrCreateView {
             creating: false,
             message: None,
             focus: cx.focus_handle(),
-            _subscriptions: subscriptions,
         };
         this.reload(cx);
         this

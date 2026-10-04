@@ -74,6 +74,26 @@ pub struct PullInfo {
     pub base_branch: String,
 }
 
+/// A check that failed on a commit, with what GitHub keeps of why: the
+/// run's summary, its annotations and the end of its log. All of it is
+/// CI output (untrusted).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailedCheck {
+    pub name: String,
+    pub summary: String,
+    /// `path:line: message` lines.
+    pub annotations: Vec<String>,
+    pub log_tail: Option<String>,
+}
+
+/// Failed checks looked at in detail.
+const MAX_FAILED: usize = 5;
+/// Annotations kept per check.
+const MAX_ANNOTATIONS: usize = 20;
+/// Log lines and bytes kept from the end of a job's log.
+const LOG_LINES: usize = 150;
+const LOG_BYTES: usize = 12 * 1024;
+
 /// A pull request to open.
 pub struct NewPull<'a> {
     pub title: &'a str,
@@ -270,6 +290,119 @@ impl GitHub {
             .ok_or_else(|| GhError::Other("GitHub: unexpected pull request".into()))
     }
 
+    /// Why the checks of commit `sha` failed (REST: check runs with
+    /// their annotations and job logs, and failed commit statuses).
+    pub async fn failure_report(
+        &self,
+        repo: &RepoRef,
+        sha: &str,
+    ) -> Result<Vec<FailedCheck>, GhError> {
+        if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.is_empty() {
+            return Err(GhError::Other("not a commit".into()));
+        }
+        let full = repo.full_name();
+        let runs = self
+            .get(&format!(
+                "/repos/{full}/commits/{sha}/check-runs?filter=latest&per_page=100"
+            ))
+            .await?;
+        let mut out = Vec::new();
+        for run in runs["check_runs"].as_array().into_iter().flatten() {
+            let failed = matches!(
+                run["conclusion"].as_str(),
+                Some("failure" | "timed_out" | "startup_failure")
+            );
+            if !failed || out.len() >= MAX_FAILED {
+                continue;
+            }
+            let Some(id) = run["id"].as_u64() else {
+                continue;
+            };
+            let output = &run["output"];
+            let summary = [&output["title"], &output["summary"], &output["text"]]
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let annotations = match self
+                .get(&format!(
+                    "/repos/{full}/check-runs/{id}/annotations?per_page={MAX_ANNOTATIONS}"
+                ))
+                .await
+            {
+                Ok(v) => v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(MAX_ANNOTATIONS)
+                    .map(|a| {
+                        format!(
+                            "{}:{}: {}",
+                            a["path"].as_str().unwrap_or("?"),
+                            a["start_line"].as_u64().unwrap_or(0),
+                            clip(a["message"].as_str().unwrap_or(""), 1_000)
+                        )
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            // An Actions job's id is its check run's.
+            let log_tail = if run["app"]["slug"].as_str() == Some("github-actions") {
+                self.job_log_tail(repo, id).await
+            } else {
+                None
+            };
+            out.push(FailedCheck {
+                name: clip(run["name"].as_str().unwrap_or("check"), 200),
+                summary: clip(&summary, 4_000),
+                annotations,
+                log_tail,
+            });
+        }
+        if out.len() < MAX_FAILED
+            && let Ok(status) = self
+                .get(&format!("/repos/{full}/commits/{sha}/status"))
+                .await
+        {
+            for s in status["statuses"].as_array().into_iter().flatten() {
+                if matches!(s["state"].as_str(), Some("failure" | "error"))
+                    && out.len() < MAX_FAILED
+                {
+                    out.push(FailedCheck {
+                        name: clip(s["context"].as_str().unwrap_or("status"), 200),
+                        summary: clip(s["description"].as_str().unwrap_or(""), 1_000),
+                        ..FailedCheck::default()
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The end of an Actions job's log. GitHub answers with a redirect to
+    /// short-lived storage, fetched without the token.
+    async fn job_log_tail(&self, repo: &RepoRef, job: u64) -> Option<String> {
+        let url = format!(
+            "{}/repos/{}/actions/jobs/{job}/logs",
+            self.api,
+            repo.full_name()
+        );
+        let resp = http::send(self.request(Request::get(url))).await.ok()?;
+        let body = match (resp.status, resp.location) {
+            (200, _) => resp.body,
+            (301 | 302 | 303 | 307 | 308, Some(location)) => {
+                let resp = http::send(Request::get(location)).await.ok()?;
+                if !resp.ok() {
+                    return None;
+                }
+                resp.body
+            }
+            _ => return None,
+        };
+        Some(log_tail(&String::from_utf8_lossy(&body)))
+    }
+
     async fn graphql(&self, query: &str) -> Result<Value, GhError> {
         let resp = http::send(self.request(Request::post_json(
             self.graphql.clone(),
@@ -403,6 +536,7 @@ fn parse_detail(v: &Value) -> Result<PrDetail, GhError> {
         ahead: None,
         behind: None,
         uncommitted: 0,
+        auto_fix: None,
     })
 }
 
@@ -714,6 +848,50 @@ fn unprocessable(body: &str) -> String {
     v.to_string()
 }
 
+/// The last [`LOG_LINES`] lines of a log (at most [`LOG_BYTES`]), without
+/// the timestamps Actions puts in front and terminal colour codes.
+pub fn log_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    let start = lines.len().saturating_sub(LOG_LINES);
+    let mut out = String::new();
+    for line in &lines[start..] {
+        // `2026-10-04T00:00:00.1234567Z message`
+        let line = match line.split_once(' ') {
+            Some((ts, rest)) if ts.len() >= 20 && ts.ends_with('Z') && ts.contains('T') => rest,
+            _ => line,
+        };
+        let mut clean = String::with_capacity(line.len());
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // CSI: ESC [ params final-byte
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if !c.is_control() || c == '\t' {
+                clean.push(c);
+            }
+        }
+        out.push_str(&clean);
+        out.push('\n');
+    }
+    if out.len() > LOG_BYTES {
+        let mut cut = out.len() - LOG_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut += 1;
+        }
+        out = out[cut..].to_owned();
+    }
+    out
+}
+
 /// At most 200 characters of an error message, on one line.
 fn short(s: &str) -> String {
     s.chars()
@@ -900,6 +1078,18 @@ mod tests {
         assert_eq!(classify(404, "{}"), GhError::NotFound);
         let v = json!({"data": {"repository": null}, "errors": [{"type": "NOT_FOUND", "message": "x"}]});
         assert_eq!(parse_statuses(&v, &[1]).unwrap_err(), GhError::NotFound);
+    }
+
+    #[test]
+    fn log_tails() {
+        let log = "2026-10-04T00:00:01.1234567Z \u{1b}[31merror\u{1b}[0m: boom\nplain line\n";
+        assert_eq!(log_tail(log), "error: boom\nplain line\n");
+        let long: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let tail = log_tail(&long);
+        assert_eq!(tail.lines().count(), LOG_LINES);
+        assert!(tail.ends_with("line 499\n"));
+        let wide = "x".repeat(200) + "\n";
+        assert!(log_tail(&wide.repeat(150)).len() <= LOG_BYTES);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::{
     ApprovalPolicy, CoreConfig, CoreEvent, ImportReport, InstallState, LoginState, Request,
 };
 
+mod autofix;
 mod forge;
 mod tools;
 
@@ -124,9 +125,12 @@ enum Reply {
     Client,
     /// The core itself (scheduled runs): a refusal becomes a notice.
     Internal,
-    /// A query that sent a message (a pull request draft): a refusal
-    /// answers it; success is answered later.
+    /// A query that sent a message (a pull request draft or fix): a
+    /// refusal answers it; a draft is answered when its turn ends, a fix
+    /// once the message is in.
     Query(QueryId),
+    /// An automatic CI fix's message.
+    Fix(RunId),
     /// An agent's MCP tool call.
     Mcp {
         tx: oneshot::Sender<Result<Value, String>>,
@@ -237,6 +241,7 @@ enum JobDone {
     Forge(Box<forge::ForgeDone>),
     /// A PR tab query ended.
     ForgeQuery(Box<forge::QueryDone>),
+    ForgeFix(Box<autofix::FixDone>),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -401,6 +406,7 @@ pub(crate) async fn run(
         }
         core.drain().await;
         core.start_queued().await;
+        core.flush_notices();
     }
 }
 
@@ -833,6 +839,7 @@ impl Orchestrator {
             JobDone::Released(key) => self.release_key(key),
             JobDone::Forge(done) => self.forge_done(*done),
             JobDone::ForgeQuery(done) => self.forge_query_done(*done),
+            JobDone::ForgeFix(done) => self.fix_done(*done),
         }
     }
 
@@ -850,6 +857,7 @@ impl Orchestrator {
                     message: format!("A scheduled task could not run: {reason}"),
                 });
             }
+            Reply::Fix(run_id) => self.fix_refused(run_id, &reason),
             Reply::Query(id) => {
                 self.forge.drafts.retain(|_, q| *q != id);
                 self.emit(CoreEvent::Reply {
@@ -865,6 +873,16 @@ impl Orchestrator {
 
     /// The command committed (or was a duplicate): tell whoever waits.
     fn succeed(&mut self, reply: Reply) {
+        if let Reply::Query(id) = reply {
+            // A draft answers when its turn ends; a fix now.
+            if !self.forge.drafts.values().any(|q| *q == id) {
+                self.emit(CoreEvent::Reply {
+                    id,
+                    result: Ok(QueryReply::Done("sent to the agent".into())),
+                });
+            }
+            return;
+        }
         let Reply::Mcp { tx, then } = reply else {
             return;
         };

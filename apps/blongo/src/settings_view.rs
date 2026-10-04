@@ -911,11 +911,53 @@ impl Render for SettingsView {
                             .child(label("Branch prefix"))
                             .child(field(&self.prefix_input)),
                     )
+                    .child(
+                        row()
+                            .child(label("Fix failed CI"))
+                            .child(
+                                choice("forge-fix-on".into(), "Automatically", f.auto_fix_ci)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_ci = true)
+                                    })),
+                            )
+                            .child(
+                                choice("forge-fix-off".into(), "Only when I ask", !f.auto_fix_ci)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_ci = false)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .child(label("Stop after"))
+                            .children([1u32, 2, 3, 5, 10].map(|n| {
+                                let text: &'static str = match n {
+                                    1 => "1 attempt",
+                                    2 => "2",
+                                    3 => "3",
+                                    5 => "5",
+                                    _ => "10",
+                                };
+                                choice(
+                                    format!("forge-fix-max-{n}").into(),
+                                    text,
+                                    f.auto_fix_max == n,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_max = n)
+                                    },
+                                ))
+                            })),
+                    )
                     .child(div().text_xs().text_color(theme::text_faint()).child(
                         "New worktrees start from the base branch as GitHub has it, and pull \
                          requests target it. When GitHub cannot be asked, the last known default \
                          is used, then the remote's HEAD. Branches Blongo names start with the \
-                         prefix; an empty base field means GitHub's default.",
+                         prefix; an empty base field means GitHub's default. When the checks of \
+                         a pull request fail, what CI said goes to the thread's agent and Blongo \
+                         commits and pushes its fix (never forced), until the checks pass or the \
+                         attempts run out.",
                     ));
             }
         }
