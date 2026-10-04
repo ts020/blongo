@@ -9,8 +9,10 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-/// Longest a fetch or push may take.
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest a fetch may take by default.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest a push may take (a large first push).
+const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Most commit subjects and uncommitted paths listed.
 const MAX_LIST: usize = 200;
 /// Longest diff stat kept.
@@ -18,8 +20,15 @@ const MAX_STAT: usize = 6_000;
 /// Longest pull request template read.
 const MAX_TEMPLATE: u64 = 16 * 1024;
 
-/// Fetch `branch` from `remote` into its remote-tracking branch.
-pub async fn fetch(cwd: &Path, remote: &str, branch: &str) -> Result<(), String> {
+/// Fetch `branch` from `remote` into its remote-tracking branch, giving
+/// up after `timeout` (git is killed then; a stale ref lock it leaves is
+/// git's to report on the next fetch).
+pub async fn fetch(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     if !plain(remote) || !plain(branch) {
         return Err("not a branch name".into());
     }
@@ -27,7 +36,7 @@ pub async fn fetch(cwd: &Path, remote: &str, branch: &str) -> Result<(), String>
     run(
         cwd,
         &["fetch", "--quiet", "--no-tags", "--", remote, &refspec],
-        NETWORK_TIMEOUT,
+        timeout,
     )
     .await
     .map(drop)
@@ -72,6 +81,33 @@ pub async fn remote_head(cwd: &Path, remote: &str) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+/// Whether `remote` has `branch` now (asks the remote; no ref changes).
+pub async fn remote_has_branch(cwd: &Path, remote: &str, branch: &str) -> Result<bool, String> {
+    if !plain(remote) || !plain(branch) {
+        return Err("not a branch name".into());
+    }
+    let out = run(
+        cwd,
+        &[
+            "ls-remote",
+            "--heads",
+            "--",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ],
+        Duration::from_secs(30),
+    )
+    .await?;
+    Ok(!out.trim().is_empty())
+}
+
+/// The commit HEAD points at.
+pub async fn head(cwd: &Path) -> Option<String> {
+    quick(cwd, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .await
+        .ok()
+}
+
 /// The local branch `refs/heads/{branch}` exists.
 pub async fn has_local_branch(cwd: &Path, branch: &str) -> bool {
     plain(branch)
@@ -109,7 +145,7 @@ pub async fn push(cwd: &Path, remote: &str, branch: &str) -> Result<(), String> 
     match run(
         cwd,
         &["push", "--quiet", "--set-upstream", "--", remote, &refspec],
-        NETWORK_TIMEOUT,
+        PUSH_TIMEOUT,
     )
     .await
     {
@@ -174,9 +210,9 @@ pub async fn uncommitted_files(cwd: &Path) -> Vec<String> {
         return Vec::new();
     };
     let mut files = Vec::new();
-    let mut fields = out.split('\0').filter(|f| f.len() > 3);
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
     while let Some(f) = fields.next() {
-        if files.len() < MAX_LIST {
+        if files.len() < MAX_LIST && f.len() > 3 {
             files.push(f[3..].to_owned());
         }
         // Renames and copies carry their old path as an extra field.
@@ -320,12 +356,24 @@ mod tests {
         sh(&work, &["commit", "-qam", "ours", "--allow-empty"]);
         let err = push(&work, "origin", "blongo/fix-b").await.unwrap_err();
         assert!(err.contains("never force-pushes"), "{err}");
-        fetch(&work, "origin", "blongo/fix-b").await.unwrap();
+        fetch(&work, "origin", "blongo/fix-b", FETCH_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(
             commits_since(&work, "origin/blongo/fix-b").await,
             vec!["ours"]
         );
-        assert!(fetch(&work, "origin", "-x").await.is_err());
+        assert!(fetch(&work, "origin", "-x", FETCH_TIMEOUT).await.is_err());
+        assert!(
+            remote_has_branch(&work, "origin", "blongo/fix-b")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !remote_has_branch(&work, "origin", "blongo/nope")
+                .await
+                .unwrap()
+        );
 
         std::fs::create_dir_all(work.join(".github")).unwrap();
         std::fs::write(work.join(".github/pull_request_template.md"), "## Why").unwrap();

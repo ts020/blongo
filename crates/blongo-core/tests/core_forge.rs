@@ -855,6 +855,26 @@ async fn creates_a_pull_request_from_the_worktree() {
         assert!(err.contains(want), "{bad}: {err}");
     }
 
+    // A delegated task works in the same worktree: it follows the rename.
+    let child_id = ThreadId::new();
+    core.dispatch(Command::ThreadCreate {
+        thread_id: child_id,
+        project_id: project,
+        title: "Helper".into(),
+        provider: ProviderKind::Codex,
+        model: None,
+        worktree: false,
+        parent_thread_id: Some(thread.id),
+    });
+    core.until(|e| match e {
+        CoreEvent::Event(ev) => match &ev.kind {
+            EventKind::ThreadCreated { thread } if thread.id == child_id => Some(()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    let mut child_renamed = false;
     request.commit_message = Some("Fix the parser".into());
     let id = core.send_query(Query::PrCreate {
         thread_id: thread.id,
@@ -872,6 +892,11 @@ async fn creates_a_pull_request_from_the_worktree() {
                     {
                         renamed = Some(branch.clone());
                     }
+                    EventKind::ThreadBranchRenamed { thread_id, branch }
+                        if *thread_id == child_id =>
+                    {
+                        child_renamed = branch == "blongo/fix-the-parser";
+                    }
                     EventKind::ThreadPrLinked { thread_id, pr, .. } if *thread_id == thread.id => {
                         linked = pr.clone();
                     }
@@ -884,6 +909,7 @@ async fn creates_a_pull_request_from_the_worktree() {
         .await;
     assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#1 created".into())));
     assert_eq!(renamed.as_deref(), Some("blongo/fix-the-parser"));
+    assert!(child_renamed, "the delegated thread follows the rename");
     let link = linked.unwrap();
     assert_eq!(
         (link.number, link.head_branch.as_str()),
@@ -964,6 +990,11 @@ async fn creates_a_pull_request_from_the_worktree() {
         Some("blongo/fix-the-parser")
     );
     assert_eq!(t.pr.as_ref().map(|p| p.number), Some(1));
+    let child = shell.threads.iter().find(|t| t.id == child_id).unwrap();
+    assert_eq!(
+        child.worktree.as_ref().map(|w| w.branch.as_str()),
+        Some("blongo/fix-the-parser")
+    );
     core.shutdown();
 }
 
@@ -979,7 +1010,8 @@ async fn an_open_pull_request_is_linked_on_retry() {
     commit_file(&worktree, "a.txt", "Add a");
     // Pushed and opened by hand already; the name stays.
     git(&worktree, &["push", "--quiet", "origin", &wt.branch]);
-    gh.pull(json!({"number": 9, "title": "By hand", "head": wt.branch}))
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    gh.pull(json!({"number": 9, "title": "By hand", "head": wt.branch, "head_sha": head}))
         .await;
     let prep = core.prepare(thread.id).await;
     assert!(prep.pushed);
@@ -1100,6 +1132,19 @@ async fn the_agent_drafts_the_pull_request() {
         .await
         .unwrap_err();
     assert!(err.contains("no draft"), "{err}");
+    // An interrupted turn answers with an error.
+    let id = core.send_query(Query::PrDraft {
+        thread_id: thread.id,
+        prompt: "loop".into(),
+    });
+    core.added_item(|i| i.thread_id == thread.id && &*i.text == "loop")
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    core.dispatch(Command::RunInterrupt {
+        thread_id: thread.id,
+    });
+    let err = core.replies(&[id]).await.remove(0).unwrap_err();
+    assert!(err.contains("did not answer"), "{err}");
     let err = core
         .query(Query::PrDraft {
             thread_id: ThreadId::new(),
@@ -1108,5 +1153,180 @@ async fn the_agent_drafts_the_pull_request() {
         .await
         .unwrap_err();
     assert!(!err.is_empty());
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_branch_name_taken_on_github_is_refused() {
+    let dir = temp_dir("forge-taken");
+    github_project(&dir);
+    // A teammate's branch has the name the title suggests.
+    let other = other_clone(&dir);
+    git(&other, &["switch", "--quiet", "-c", "blongo/fix-readme"]);
+    commit_file(&other, "theirs.txt", "Their work");
+    git(&other, &["push", "--quiet", "origin", "blongo/fix-readme"]);
+    let theirs = git(&other, &["rev-parse", "HEAD"]);
+    let (mut core, gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Fix README").await;
+    let wt = thread.worktree.clone().unwrap();
+    let worktree = PathBuf::from(&wt.path);
+    commit_file(&worktree, "mine.txt", "My work");
+    let prep = core.prepare(thread.id).await;
+    assert_eq!(prep.suggested_branch, "blongo/fix-readme");
+    let request = blongo_protocol::PrCreateRequest {
+        title: "Fix README".into(),
+        body: String::new(),
+        base: "main".into(),
+        draft: false,
+        branch: prep.suggested_branch.clone(),
+        commit_message: None,
+    };
+    let err = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("exists on GitHub"), "{err}");
+    // Nothing pushed, nothing renamed, no pull request.
+    let bare = dir.join("remote.git");
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/blongo/fix-readme"]),
+        theirs
+    );
+    assert_eq!(git(&worktree, &["branch", "--show-current"]), wt.branch);
+    assert!(
+        !gh.log()
+            .await
+            .iter()
+            .any(|r| r["method"] == "POST" && r["path"] == "/repos/acme/widgets/pulls")
+    );
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn a_failed_push_keeps_the_rename_and_a_retry_finishes() {
+    let dir = temp_dir("forge-push-retry");
+    github_project(&dir);
+    // The remote refuses pushes while a marker file exists.
+    let bare = dir.join("remote.git");
+    let marker = dir.join("refuse");
+    let hook = bare.join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then echo refused >&2; exit 1; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .args(["+x", &hook.to_string_lossy()])
+        .status()
+        .unwrap();
+    std::fs::write(&marker, "").unwrap();
+    let (mut core, _gh) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Retry push").await;
+    let worktree = PathBuf::from(&thread.worktree.as_ref().unwrap().path);
+    commit_file(&worktree, "a.txt", "Work");
+    let request = blongo_protocol::PrCreateRequest {
+        title: "Retry push".into(),
+        body: String::new(),
+        base: "main".into(),
+        draft: false,
+        branch: "blongo/retry-push".into(),
+        commit_message: None,
+    };
+    let id = core.send_query(Query::PrCreate {
+        thread_id: thread.id,
+        request: request.clone(),
+    });
+    let mut renamed = false;
+    let reply = core
+        .until(|e| match e {
+            CoreEvent::Reply { id: got, result } if *got == id => Some(result.clone()),
+            CoreEvent::Event(ev) => {
+                if let EventKind::ThreadBranchRenamed { thread_id, .. } = &ev.kind {
+                    renamed |= *thread_id == thread.id;
+                }
+                None
+            }
+            _ => None,
+        })
+        .await;
+    let err = reply.unwrap_err();
+    assert!(err.starts_with("Pushing failed"), "{err}");
+    assert!(renamed, "the rename is kept although the push failed");
+    std::fs::remove_file(&marker).unwrap();
+    let reply = core
+        .query(Query::PrCreate {
+            thread_id: thread.id,
+            request,
+        })
+        .await;
+    assert_eq!(reply, Ok(QueryReply::Done("acme/widgets#1 created".into())));
+    core.shutdown();
+}
+
+#[tokio::test]
+async fn worktrees_without_github_start_from_head() {
+    // Integration off: the project's HEAD, as before G3.
+    let dir = temp_dir("forge-off");
+    github_project(&dir);
+    let other = other_clone(&dir);
+    commit_file(&other, "upstream.txt", "Upstream");
+    git(&other, &["push", "--quiet", "origin", "main"]);
+    let (mut core, _) = TestCore::start_with(&dir, |c| c.forge = false);
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Off").await;
+    let wt = thread.worktree.clone().unwrap();
+    assert!(!PathBuf::from(&wt.path).join("upstream.txt").exists());
+    core.shutdown();
+
+    // A remote that is not GitHub (a path) with no HEAD recorded: the
+    // project's HEAD, without a notice.
+    let dir = temp_dir("forge-plain-remote");
+    let bare = dir.join("plain.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+    let project_dir = dir.join("project");
+    git(&project_dir, &["init", "--quiet", "-b", "main"]);
+    git(&project_dir, &["config", "user.name", "Test"]);
+    git(&project_dir, &["config", "user.email", "test@localhost"]);
+    git(
+        &project_dir,
+        &["remote", "add", "origin", &bare.to_string_lossy()],
+    );
+    commit_file(&project_dir, "local.txt", "Local only");
+    let (mut core, _) = start(&dir).await;
+    let project = core.project(&dir).await;
+    let thread = core.titled_thread(project, "Plain").await;
+    let wt = thread.worktree.clone().unwrap();
+    assert!(PathBuf::from(&wt.path).join("local.txt").exists());
+    let snapshot = core.snapshot(thread.id).await;
+    assert!(
+        !snapshot
+            .items
+            .iter()
+            .any(|i| matches!(i.kind, blongo_protocol::ItemKind::SystemNotice { .. })),
+        "no notice for a folder without a GitHub base"
+    );
+
+    // A draft for an archived thread is refused.
+    let c = core.dispatch(Command::ThreadArchive {
+        thread_id: thread.id,
+    });
+    core.ok(&c).await;
+    let err = core
+        .query(Query::PrDraft {
+            thread_id: thread.id,
+            prompt: "hi".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("archived"), "{err}");
     core.shutdown();
 }

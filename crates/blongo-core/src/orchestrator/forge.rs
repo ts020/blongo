@@ -1302,8 +1302,11 @@ async fn prepare(
         .await
         .map_err(|e| ctx.fail(&repo.host, e))?;
     let base = base.unwrap_or_else(|| info.default_branch.clone());
+    if !branch_name_ok(&base, false) {
+        return Err(format!("\"{base}\" cannot be used as a base branch here"));
+    }
     // Compare with GitHub's base as it is now; the last fetch otherwise.
-    let _ = branch::fetch(cwd, &remote_name, &base).await;
+    let _ = branch::fetch(cwd, &remote_name, &base, BASE_FETCH).await;
     let base_ref = if branch::has_remote_branch(cwd, &remote_name, &base).await {
         format!("refs/remotes/{remote_name}/{base}")
     } else {
@@ -1372,8 +1375,9 @@ async fn create(
         if !files.is_empty() {
             let message = request.commit_message.as_deref().ok_or_else(|| {
                 format!(
-                    "{} files are not committed; commit them or enter a commit message",
-                    files.len()
+                    "{} file{} not committed; commit them or enter a commit message",
+                    files.len(),
+                    if files.len() == 1 { " is" } else { "s are" }
                 )
             })?;
             blongo_git::workspace::commit_all(cwd, message)
@@ -1381,10 +1385,24 @@ async fn create(
                 .map_err(|e| format!("Committing failed: {e:#}"))?;
         }
         let mut name = branch.to_owned();
-        if request.branch != branch {
-            if remote::branch_pushed(cwd, branch).await {
-                return Err(format!("{branch} was pushed already, so it keeps its name"));
+        let pushed = remote::branch_pushed(cwd, branch).await;
+        if request.branch != branch && pushed {
+            return Err(format!("{branch} was pushed already, so it keeps its name"));
+        }
+        // Never pushed: the name must be free on GitHub, or the push could
+        // add to somebody else's branch (and pull request).
+        if !pushed {
+            let taken = branch::remote_has_branch(cwd, &remote_name, &request.branch)
+                .await
+                .map_err(|e| format!("Checking the branch name on GitHub failed: {e}"))?;
+            if taken {
+                return Err(format!(
+                    "{} exists on GitHub already; choose another branch name",
+                    request.branch
+                ));
             }
+        }
+        if request.branch != branch {
             branch::rename(cwd, branch, &request.branch)
                 .await
                 .map_err(|e| format!("Renaming the branch failed: {e}"))?;
@@ -1394,6 +1412,7 @@ async fn create(
         branch::push(cwd, &remote_name, &name)
             .await
             .map_err(|e| format!("Pushing failed: {e}"))?;
+        let head = branch::head(cwd).await.unwrap_or_default();
         let info = gh
             .repo_info(&repo)
             .await
@@ -1407,12 +1426,26 @@ async fn create(
         };
         let pull = match gh.create_pull(&repo, &new).await {
             Ok(Some(pull)) => pull,
-            // Opened before (a retry, or by hand): link that one.
-            Ok(None) => gh
-                .find_pull(&repo, &name)
-                .await
-                .map_err(|e| ctx.fail(&repo.host, e))?
-                .ok_or("GitHub says a pull request exists for the branch but did not list it")?,
+            // Opened before (a retry, or by hand): link it only when it is
+            // this branch as just pushed.
+            Ok(None) => {
+                let pull = gh
+                    .find_pull(&repo, &name)
+                    .await
+                    .map_err(|e| ctx.fail(&repo.host, e))?
+                    .ok_or(
+                        "GitHub says a pull request exists for the branch but did not list it",
+                    )?;
+                if pull.state.is_final() || pull.head_sha != head {
+                    return Err(format!(
+                        "{}#{} is open for {name} but is not at this thread's commit; link it \
+                         by hand if it is this work",
+                        repo.full_name(),
+                        pull.number
+                    ));
+                }
+                pull
+            }
             Err(err) => {
                 return Err(format!(
                     "GitHub did not create the pull request: {}",
@@ -1462,6 +1495,9 @@ pub(super) struct WorktreeBase {
 /// Longest the default branch is asked of GitHub before the cached one
 /// is used.
 const BASE_LOOKUP: Duration = Duration::from_secs(8);
+/// Longest the base branch is fetched before the last fetched one is
+/// used (a new worktree waits for it).
+const BASE_FETCH: Duration = Duration::from_secs(15);
 
 /// The remote's base branch, freshly fetched: the project's setting, else
 /// GitHub's default branch, else the last one used, else the remote's
@@ -1492,10 +1528,19 @@ pub(super) async fn worktree_base(root: &Path, plan: BasePlan) -> WorktreeBase {
             }
         }
     };
-    let Some(name) = name.filter(|n| branch_name_ok(n, false)) else {
+    let Some(name) = name else {
         return WorktreeBase::default();
     };
-    let fetched = branch::fetch(root, &remote_name, &name).await;
+    if !branch_name_ok(&name, false) {
+        return WorktreeBase {
+            notice: Some(format!(
+                "This worktree starts from the project's current commit: Blongo does not use \
+                 \"{name}\" as a base branch."
+            )),
+            ..WorktreeBase::default()
+        };
+    }
+    let fetched = branch::fetch(root, &remote_name, &name, BASE_FETCH).await;
     if branch::has_remote_branch(root, &remote_name, &name).await {
         return WorktreeBase {
             start: Some(format!("refs/remotes/{remote_name}/{name}")),

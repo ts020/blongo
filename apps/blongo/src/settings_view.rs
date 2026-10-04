@@ -307,6 +307,17 @@ impl SettingsView {
         };
         let mut settings = settings.clone();
         f(&mut settings);
+        if settings
+            == self
+                .info
+                .forge
+                .as_ref()
+                .map(|(_, _, s)| s.clone())
+                .unwrap_or_default()
+        {
+            self.message = Some((true, "No change".into()));
+            return cx.notify();
+        }
         self.message = Some((true, "Saving…".into()));
         cx.emit(SettingsEvent::SetForge(*project_id, settings));
         cx.notify();
@@ -876,7 +887,11 @@ impl Render for SettingsView {
             Some((_, name, f)) => {
                 let custom = matches!(f.base_branch, BaseBranch::Custom { .. });
                 github = github
-                    .child(row().child(label("Project")).child(div().text_xs().child(name.clone())))
+                    .child(
+                        row()
+                            .child(label("Project"))
+                            .child(div().text_xs().child(name.clone())),
+                    )
                     .child(
                         row()
                             .child(label("Base branch"))

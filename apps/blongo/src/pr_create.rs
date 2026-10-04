@@ -50,11 +50,9 @@ impl PrCreateView {
         let base = cx.new(|cx| TextInput::new("Base branch", false, cx));
         let branch = cx.new(|cx| TextInput::new("Branch", false, cx));
         let commit = cx.new(|cx| TextInput::new("Commit message", false, cx));
-        let subscriptions = [cx.subscribe(&title, |this, _, event, cx| {
-            if let InputEvent::Submit = event {
-                this.create(cx);
-            }
-        })];
+        // Only the Create button commits and pushes: Enter in the title
+        // does nothing.
+        let subscriptions = [cx.subscribe(&title, |_, _, _: &InputEvent, _| {})];
         let mut this = Self {
             backend,
             thread_id,
@@ -458,12 +456,9 @@ impl Render for PrCreateView {
                             cx.notify();
                         })),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text_faint())
-                        .child("Never force-pushed. Enter in the title creates."),
-                ),
+                .child(div().text_xs().text_color(theme::text_faint()).child(
+                    "Nothing is committed or pushed until you press it; never force-pushed.",
+                )),
         );
         if let Some((ok, text)) = &self.message {
             root = root.child(
