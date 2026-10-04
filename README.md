@@ -13,5 +13,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+From a phone or the browser: Releases → Draft a new release → choose a new
+tag such as `v0.1.0` on `main` → Publish. The binaries are attached to that
+release when the builds finish.
+
 The binaries are not code-signed: macOS Gatekeeper and Windows SmartScreen
 warn on first launch.
