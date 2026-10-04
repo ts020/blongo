@@ -21,7 +21,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
 
-use crate::{ForgeSettings, PlanStep, PrLink, PrStatus, ProviderKind};
+use crate::{PlanStep, ProviderKind};
 
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
@@ -95,9 +95,6 @@ pub struct Project {
     /// Absolute folder path; the agent's working directory.
     pub path: String,
     pub created_at: Timestamp,
-    /// GitHub settings (base branch, branch prefix, CI auto-fix).
-    #[serde(default)]
-    pub forge: ForgeSettings,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -142,16 +139,6 @@ pub struct Thread {
     /// when it does not simply continue `provider_thread_id`.
     #[serde(default)]
     pub pending_context: Option<PendingContext>,
-    /// The pull request of the thread's branch.
-    #[serde(default)]
-    pub pr: Option<PrLink>,
-    /// What Blongo last saw of `pr` (`None` until the first poll).
-    #[serde(default)]
-    pub pr_status: Option<PrStatus>,
-    /// The user unlinked the pull request: Blongo does not link the
-    /// branch's pull request again on its own.
-    #[serde(default)]
-    pub pr_dismissed: bool,
 }
 
 impl Thread {
@@ -177,9 +164,6 @@ impl Thread {
             forked_from: None,
             parent_thread_id: None,
             pending_context: None,
-            pr: None,
-            pr_status: None,
-            pr_dismissed: false,
         }
     }
 
@@ -610,20 +594,6 @@ pub enum Command {
     /// Run a schedule now (its next time stays as it is).
     #[serde(rename = "schedule.run_now")]
     ScheduleRunNow { schedule_id: ScheduleId },
-    /// Link the thread to a pull request: a URL, `owner/name#n` or `#n`
-    /// (the thread's repository). Checked against GitHub before the link
-    /// is recorded.
-    #[serde(rename = "thread.link_pr")]
-    ThreadLinkPr { thread_id: ThreadId, pr: String },
-    /// Forget the thread's pull request (it is not linked again
-    /// automatically).
-    #[serde(rename = "thread.unlink_pr")]
-    ThreadUnlinkPr { thread_id: ThreadId },
-    #[serde(rename = "project.set_forge")]
-    ProjectSetForge {
-        project_id: ProjectId,
-        settings: ForgeSettings,
-    },
 }
 
 /// How a message sent while a run is active is delivered.
@@ -642,7 +612,6 @@ impl Command {
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::ProjectCreate { .. }
-            | Self::ProjectSetForge { .. }
             | Self::ScheduleCreate { .. }
             | Self::ScheduleUpdate { .. }
             | Self::ScheduleDelete { .. }
@@ -656,8 +625,6 @@ impl Command {
             | Self::MessageDispatch { thread_id, .. }
             | Self::RunInterrupt { thread_id }
             | Self::RunCancel { thread_id, .. }
-            | Self::ThreadLinkPr { thread_id, .. }
-            | Self::ThreadUnlinkPr { thread_id }
             | Self::RuntimeRequestRespond { thread_id, .. } => Some(*thread_id),
         }
     }
@@ -678,7 +645,7 @@ pub enum EventKind {
     #[serde(rename = "project.created")]
     ProjectCreated { project: Project },
     #[serde(rename = "thread.created")]
-    ThreadCreated { thread: Box<Thread> },
+    ThreadCreated { thread: Thread },
     #[serde(rename = "thread.renamed")]
     ThreadRenamed { thread_id: ThreadId, title: String },
     #[serde(rename = "thread.archived")]
@@ -759,35 +726,12 @@ pub enum EventKind {
     ScheduleUpdated { schedule: Schedule },
     #[serde(rename = "schedule.deleted")]
     ScheduleDeleted { schedule_id: ScheduleId },
-    /// The thread's pull request changed (`None`: unlinked). Clears the
-    /// status.
-    #[serde(rename = "thread.pr_linked")]
-    ThreadPrLinked {
-        thread_id: ThreadId,
-        pr: Option<PrLink>,
-        /// The user unlinked it: do not link the branch's PR again on
-        /// its own.
-        #[serde(default)]
-        manual: bool,
-    },
-    /// A poll saw a different status.
-    #[serde(rename = "thread.pr_status")]
-    ThreadPrStatus {
-        thread_id: ThreadId,
-        status: Option<PrStatus>,
-    },
-    #[serde(rename = "project.forge_changed")]
-    ProjectForgeChanged {
-        project_id: ProjectId,
-        settings: ForgeSettings,
-    },
 }
 
 impl EventKind {
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::ProjectCreated { .. }
-            | Self::ProjectForgeChanged { .. }
             | Self::ScheduleCreated { .. }
             | Self::ScheduleUpdated { .. }
             | Self::ScheduleDeleted { .. } => None,
@@ -803,8 +747,6 @@ impl EventKind {
             | Self::RunStatusChanged { thread_id, .. }
             | Self::ItemTextAppended { thread_id, .. }
             | Self::RunUsage { thread_id, .. }
-            | Self::ThreadPrLinked { thread_id, .. }
-            | Self::ThreadPrStatus { thread_id, .. }
             | Self::ItemFinished { thread_id, .. } => Some(*thread_id),
         }
     }
@@ -830,9 +772,6 @@ impl EventKind {
             Self::ScheduleCreated { .. } => "schedule.created",
             Self::ScheduleUpdated { .. } => "schedule.updated",
             Self::ScheduleDeleted { .. } => "schedule.deleted",
-            Self::ThreadPrLinked { .. } => "thread.pr_linked",
-            Self::ThreadPrStatus { .. } => "thread.pr_status",
-            Self::ProjectForgeChanged { .. } => "project.forge_changed",
         }
     }
 }

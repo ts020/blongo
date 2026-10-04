@@ -11,7 +11,6 @@ local = ["dep:blongo-core"]
 
 [dependencies]
 blongo-protocol.workspace = true
-blongo-forge.workspace = true
 blongo-core = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "io-std"] }
 tokio-tungstenite.workspace = true

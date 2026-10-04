@@ -79,16 +79,6 @@ pub struct CoreConfig {
     /// Settings at start (the app's settings file; changed later with
     /// [`CoreClient::configure`]).
     pub settings: CoreSettings,
-    /// GitHub pull request links and polling.
-    pub forge: bool,
-    /// `forge.json` with saved tokens (default: the config directory's).
-    pub forge_tokens: PathBuf,
-    /// Talk to this GitHub API instead of the one the remote names (the
-    /// tests' fake server; GraphQL at `{api}/graphql`).
-    pub github_api: Option<String>,
-    /// The GitHub CLI asked for tokens (`None`: `gh` on the `PATH`;
-    /// `BLONGO_GH`).
-    pub gh_program: Option<PathBuf>,
 }
 
 impl CoreConfig {
@@ -116,19 +106,13 @@ impl CoreConfig {
             acp_executable: None,
             acp_args: Vec::new(),
             settings: CoreSettings::default(),
-            forge: true,
-            forge_tokens: blongo_forge::forge::default_path(),
-            gh_program: None,
-            github_api: None,
         }
     }
 
     /// `BLONGO_DATA_DIR` (default: the platform data dir + `blongo`),
     /// `BLONGO_CODEX_EXE`, `BLONGO_CLAUDE_EXE`, `BLONGO_ANTIGRAVITY_EXE`,
     /// `BLONGO_ACP_EXE` + `BLONGO_ACP_ARGS` (whitespace-separated),
-    /// `BLONGO_SESSION_IDLE_SECS`, `BLONGO_MCP=0` (no MCP server),
-    /// `BLONGO_FORGE=0` (no GitHub pull request polling),
-    /// `BLONGO_GITHUB_API` (another GitHub API base).
+    /// `BLONGO_SESSION_IDLE_SECS`, `BLONGO_MCP=0` (no MCP server).
     pub fn from_env() -> Self {
         let dir = std::env::var_os("BLONGO_DATA_DIR")
             .filter(|d| !d.is_empty())
@@ -149,13 +133,6 @@ impl CoreConfig {
             .map(|a| a.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();
         config.mcp = std::env::var("BLONGO_MCP").map_or(true, |v| v != "0");
-        config.forge = std::env::var("BLONGO_FORGE").map_or(true, |v| v != "0");
-        config.gh_program = std::env::var_os("BLONGO_GH")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from);
-        config.github_api = std::env::var("BLONGO_GITHUB_API")
-            .ok()
-            .filter(|a| !a.trim().is_empty());
         if let Some(secs) = std::env::var("BLONGO_SESSION_IDLE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())

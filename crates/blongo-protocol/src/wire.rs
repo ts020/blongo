@@ -32,11 +32,10 @@ use crate::{
 };
 
 /// Version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 3;
-/// Oldest version this build still accepts (v3 added pull request links
-/// and forge settings to the shared types and events, which a v2 peer
-/// cannot decode).
-pub const MIN_PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 2;
+/// Oldest version this build still accepts (v2 added schedules, usage and
+/// workspace queries to the shared types, which a v1 peer cannot decode).
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame a client may send (commands carry user text).
 pub const MAX_CLIENT_FRAME: usize = 1 << 20;

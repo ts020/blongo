@@ -10,7 +10,6 @@ blongo-protocol.workspace = true
 blongo-harness.workspace = true
 blongo-store.workspace = true
 blongo-git.workspace = true
-blongo-forge.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
