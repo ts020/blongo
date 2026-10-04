@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 use blongo_protocol::{
-    CommandId, DomainEvent, EventKind, ItemId, ItemKind, PendingContext, Project, ProjectId,
-    ProviderKind, Run, RunId, RunStatus, Schedule, ScheduleId, Thread, ThreadId, ThreadStatus,
-    Timestamp, TurnItem, Worktree,
+    CommandId, DomainEvent, EventKind, ForgeSettings, ItemId, ItemKind, PendingContext, Project,
+    ProjectId, ProviderKind, Run, RunId, RunStatus, Schedule, ScheduleId, Thread, ThreadId,
+    ThreadStatus, Timestamp, TurnItem, Worktree,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -328,7 +328,7 @@ impl Store {
 
     pub fn projects(&self) -> anyhow::Result<Vec<Project>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, path, created_at FROM projects ORDER BY created_at, id",
+            "SELECT id, name, path, created_at, forge FROM projects ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Project {
@@ -336,6 +336,11 @@ impl Store {
                 name: r.get(1)?,
                 path: r.get(2)?,
                 created_at: Timestamp(r.get(3)?),
+                // Unreadable settings fall back to the defaults.
+                forge: r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -363,7 +368,8 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, project_id, title, status, archived, created_at, updated_at,
                     provider_thread_id, provider, model, worktree_path, worktree_branch,
-                    forked_from, pending_context, parent_thread_id
+                    forked_from, pending_context, parent_thread_id,
+                    pr, pr_status, pr_dismissed
              FROM threads WHERE archived = 0 OR ?1
              ORDER BY updated_at DESC, id DESC",
         )?;
@@ -377,7 +383,8 @@ impl Store {
             .prepare_cached(
                 "SELECT id, project_id, title, status, archived, created_at, updated_at,
                     provider_thread_id, provider, model, worktree_path, worktree_branch,
-                    forked_from, pending_context, parent_thread_id
+                    forked_from, pending_context, parent_thread_id,
+                    pr, pr_status, pr_dismissed
                  FROM threads WHERE id = ?1",
             )?
             .query_row([id.to_string()], thread_row)
@@ -503,6 +510,26 @@ impl Store {
     }
 
     /// Re-read the newest sequence (after another connection committed).
+    /// A forge cache entry (see the `forge_cache` table) and when it was
+    /// written.
+    pub fn forge_cache(&self, key: &str) -> anyhow::Result<Option<(String, Timestamp)>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT value, at FROM forge_cache WHERE key = ?1")?
+            .query_row([key], |r| Ok((r.get(0)?, Timestamp(r.get(1)?))))
+            .optional()?)
+    }
+
+    pub fn set_forge_cache(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO forge_cache (key, value, at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (key) DO UPDATE SET value = ?2, at = ?3",
+            )?
+            .execute(params![key, value, Timestamp::now().0])?;
+        Ok(())
+    }
+
     pub fn refresh_last_sequence(&mut self) -> anyhow::Result<u64> {
         let stored: i64 =
             self.conn
@@ -577,13 +604,15 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
     match &event.kind {
         EventKind::ProjectCreated { project } => {
             tx.prepare_cached(
-                "INSERT INTO projects (id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO projects (id, name, path, created_at, forge)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
             .execute(params![
                 project.id.to_string(),
                 project.name,
                 project.path,
-                project.created_at.0
+                project.created_at.0,
+                forge_json(&project.forge)?,
             ])?;
         }
         EventKind::ThreadCreated { thread } => {
@@ -591,8 +620,10 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 "INSERT INTO threads (id, project_id, title, status, archived, created_at,
                                       updated_at, provider_thread_id, provider, model,
                                       worktree_path, worktree_branch, forked_from,
-                                      pending_context, parent_thread_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                      pending_context, parent_thread_id, pr, pr_status,
+                                      pr_dismissed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18)",
             )?
             .execute(params![
                 thread.id.to_string(),
@@ -610,6 +641,9 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 thread.forked_from.map(|t| t.to_string()),
                 context_json(thread.pending_context.as_ref())?,
                 thread.parent_thread_id.map(|t| t.to_string()),
+                opt_json(thread.pr.as_ref())?,
+                opt_json(thread.pr_status.as_ref())?,
+                thread.pr_dismissed,
             ])?;
         }
         EventKind::ThreadRenamed { thread_id, title } => {
@@ -822,6 +856,41 @@ fn apply(tx: &Transaction<'_>, event: &DomainEvent) -> anyhow::Result<()> {
                 "schedule",
             )?;
         }
+        EventKind::ThreadPrLinked {
+            thread_id,
+            pr,
+            manual,
+        } => {
+            expect_one(
+                tx.prepare_cached(
+                    "UPDATE threads SET pr = ?2, pr_status = NULL, pr_dismissed = ?3
+                     WHERE id = ?1",
+                )?
+                .execute(params![
+                    thread_id.to_string(),
+                    opt_json(pr.as_ref())?,
+                    pr.is_none() && *manual
+                ])?,
+                "thread",
+            )?;
+        }
+        EventKind::ThreadPrStatus { thread_id, status } => {
+            expect_one(
+                tx.prepare_cached("UPDATE threads SET pr_status = ?2 WHERE id = ?1")?
+                    .execute(params![thread_id.to_string(), opt_json(status.as_ref())?])?,
+                "thread",
+            )?;
+        }
+        EventKind::ProjectForgeChanged {
+            project_id,
+            settings,
+        } => {
+            expect_one(
+                tx.prepare_cached("UPDATE projects SET forge = ?2 WHERE id = ?1")?
+                    .execute(params![project_id.to_string(), forge_json(settings)?])?,
+                "project",
+            )?;
+        }
         EventKind::ItemFinished { item_id, .. } => {
             let data: String = tx
                 .prepare_cached("SELECT data FROM turn_items WHERE id = ?1")?
@@ -886,6 +955,21 @@ fn parse_thread_status(s: &str) -> ThreadStatus {
         "failed" => ThreadStatus::Failed,
         _ => ThreadStatus::Idle,
     }
+}
+
+fn opt_json<T: serde::Serialize>(value: Option<&T>) -> anyhow::Result<Option<String>> {
+    value
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// `NULL` for the default settings, so untouched projects store nothing.
+fn forge_json(settings: &ForgeSettings) -> anyhow::Result<Option<String>> {
+    if settings.is_default() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(settings)?))
 }
 
 fn context_json(context: Option<&PendingContext>) -> anyhow::Result<Option<String>> {
@@ -960,6 +1044,14 @@ fn thread_row(r: &Row<'_>) -> rusqlite::Result<Thread> {
             .get::<_, Option<String>>(13)?
             .map(|json| serde_json::from_str(&json).unwrap_or(PendingContext::Handoff)),
         parent_thread_id: opt_uuid_col(r, 14)?.map(ThreadId),
+        // Unreadable PR data reads as "not linked" / "not polled yet".
+        pr: r
+            .get::<_, Option<String>>(15)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        pr_status: r
+            .get::<_, Option<String>>(16)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        pr_dismissed: r.get(17)?,
     })
 }
 
