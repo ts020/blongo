@@ -4,6 +4,7 @@ name: Release
 # platform and publishes them as a GitHub Release. A tag with a hyphen
 # (v0.1.0-rc.1) becomes a pre-release. Creating the release (and its new
 # tag) on github.com works too: the files are attached to that release.
+# macOS downloads are a Blongo.app in a .dmg (packaging/macos/bundle.sh).
 # A pull request that touches this file builds the same archives without
 # publishing, so changes here are checked before they reach a real tag.
 
@@ -11,7 +12,7 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "packaging/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,8 +29,10 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-apple-darwin
             os: macos-15
+            mac_arch: arm64
           - target: x86_64-apple-darwin
             os: macos-15-intel
+            mac_arch: x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-2025
     runs-on: ${{ matrix.os }}
@@ -51,6 +54,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p blongo -p blongo-server
       - name: Package
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
@@ -74,6 +78,29 @@ jobs:
           fi
           rm -r "$name"
           ls -l
+      # macOS gets Blongo.app (with blongo-serve inside) in a .dmg. Signing
+      # and notarization use the secrets below on tags; without them (and on
+      # pull requests) the app is ad-hoc signed. See packaging/macos/bundle.sh.
+      - name: Package (macOS app)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ github.ref_type == 'tag' && secrets.MACOS_CERTIFICATE_P12_BASE64 || '' }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ github.ref_type == 'tag' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_ID || '' }}
+          APPLE_TEAM_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_APP_PASSWORD: ${{ github.ref_type == 'tag' && secrets.APPLE_APP_PASSWORD || '' }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            label="$GITHUB_REF_NAME"
+            version="${GITHUB_REF_NAME#v}"
+          else
+            label="pr-${GITHUB_SHA::7}"
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          mkdir -p dist
+          packaging/macos/bundle.sh "$version" target/release \
+            "dist/Blongo-${label}-macos-${{ matrix.mac_arch }}.dmg"
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}

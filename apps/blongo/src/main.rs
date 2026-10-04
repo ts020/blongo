@@ -46,6 +46,8 @@ mod highlight;
 mod inbox;
 mod input;
 mod keymap;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod login_env;
 mod markdown;
 mod notify;
 mod palette;
@@ -116,6 +118,8 @@ fn main() {
         },
         _ => {}
     }
+    #[cfg(target_os = "macos")]
+    login_env::import_if_bundled();
     // `blongo blongo://…`: hand the link to a running instance if there is
     // one; otherwise start and open it.
     let start_link = args.iter().find(|a| a.starts_with("blongo://")).cloned();

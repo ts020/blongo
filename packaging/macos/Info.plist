@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Blongo</string>
+    <key>CFBundleDisplayName</key><string>Blongo</string>
+    <key>CFBundleIdentifier</key><string>io.github.ts020.blongo</string>
+    <key>CFBundleExecutable</key><string>blongo</string>
+    <key>CFBundleIconFile</key><string>Blongo</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key><string>10.15.7</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+    <key>NSHumanReadableCopyright</key><string>MIT License</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>Blongo link</string>
+            <key>CFBundleURLSchemes</key><array><string>blongo</string></array>
+        </dict>
+    </array>
+</dict>
+</plist>
