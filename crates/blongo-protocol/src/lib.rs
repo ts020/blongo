@@ -13,6 +13,8 @@ pub mod provider;
 pub use provider::*;
 
 pub mod client;
+pub mod forge;
+pub use forge::*;
 pub mod wire;
 pub mod workspace;
 

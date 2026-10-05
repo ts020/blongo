@@ -30,6 +30,10 @@ use crate::{
     ApprovalPolicy, CoreConfig, CoreEvent, ImportReport, InstallState, LoginState, Request,
 };
 
+mod autofix;
+mod forge;
+mod merge;
+mod open;
 mod tools;
 
 /// Default title of a new thread; replaced by the first message.
@@ -123,6 +127,12 @@ enum Reply {
     Client,
     /// The core itself (scheduled runs): a refusal becomes a notice.
     Internal,
+    /// A query that sent a message (a pull request draft or fix): a
+    /// refusal answers it; a draft is answered when its turn ends, a fix
+    /// once the message is in.
+    Query(QueryId),
+    /// An automatic CI fix's message.
+    Fix(RunId),
     /// An agent's MCP tool call.
     Mcp {
         tx: oneshot::Sender<Result<Value, String>>,
@@ -190,12 +200,19 @@ enum PrepPlan {
         project_path: PathBuf,
         path: PathBuf,
         branch: String,
+        checkout: open::Checkout,
     },
     Rollback {
         cwd: PathBuf,
         pre: String,
         commit: String,
         sharers: u32,
+    },
+    /// Look up and check a pull request (`thread.link_pr`).
+    LinkPr {
+        ctx: forge::ForgeCtx,
+        cwd: PathBuf,
+        reference: (Option<String>, Option<String>, u64),
     },
 }
 
@@ -221,6 +238,13 @@ enum JobDone {
     Imported(anyhow::Result<ImportReport>),
     /// Background work that only held its key (archive clean-up).
     Released(Key),
+    /// A pull request poll ended.
+    Forge(Box<forge::ForgeDone>),
+    /// A PR tab query ended.
+    ForgeQuery(Box<forge::QueryDone>),
+    ForgeFix(Box<autofix::FixDone>),
+    ForgeMerge(Box<merge::MergeDone>),
+    ForgeOpen(Box<open::OpenDone>),
 }
 
 /// Work a command needs done (with I/O) before it can be decided.
@@ -233,6 +257,13 @@ struct Prepared {
     pre_rollback: Option<String>,
     /// Other threads working in the folder the rollback rewrote.
     sharers: u32,
+    /// The pull request `thread.link_pr` found.
+    pr: Option<Box<forge::Found>>,
+    /// Said in a new thread (its worktree did not start where asked).
+    notice: Option<String>,
+    /// The base branch a new worktree started from (cached for when
+    /// GitHub cannot be asked).
+    base: Option<String>,
 }
 
 /// Runtime state for a thread that has (or had) an agent session or run.
@@ -274,6 +305,7 @@ pub(crate) struct Orchestrator {
     /// not create: run → (thread, sender, project). They count toward the
     /// spawn limits while the run is waiting or working.
     agent_runs: HashMap<RunId, (ThreadId, ThreadId, ProjectId)>,
+    forge: forge::ForgeRt,
 }
 
 pub(crate) async fn run(
@@ -329,6 +361,7 @@ pub(crate) async fn run(
         mcp,
         waiters: HashMap::new(),
         agent_runs: HashMap::new(),
+        forge: forge::ForgeRt::default(),
     };
     if let Err(err) = core.start() {
         eprintln!("blongo-core: startup failed: {err:#}");
@@ -376,6 +409,7 @@ pub(crate) async fn run(
         }
         core.drain().await;
         core.start_queued().await;
+        core.flush_notices();
     }
 }
 
@@ -397,6 +431,7 @@ impl Orchestrator {
         for schedule in self.store.schedules()? {
             self.schedules.insert(schedule.id, schedule);
         }
+        self.forge_start();
         let snapshot = self.shell_snapshot()?;
         let _ = self.out.send(CoreEvent::Shell(Arc::new(snapshot)));
         Ok(())
@@ -501,7 +536,7 @@ impl Orchestrator {
                 self.projects.insert(project.id, project.clone());
             }
             EventKind::ThreadCreated { thread } => {
-                self.threads.insert(thread.id, thread.clone());
+                self.threads.insert(thread.id, (**thread).clone());
             }
             EventKind::ThreadRenamed { thread_id, title } => {
                 if let Some(t) = self.threads.get_mut(thread_id) {
@@ -558,8 +593,42 @@ impl Orchestrator {
             EventKind::ScheduleDeleted { schedule_id } => {
                 self.schedules.remove(schedule_id);
             }
+            EventKind::ThreadPrLinked {
+                thread_id,
+                pr,
+                manual,
+            } => {
+                if let Some(t) = self.threads.get_mut(thread_id) {
+                    t.pr = pr.clone();
+                    t.pr_status = None;
+                    t.pr_dismissed = pr.is_none() && *manual;
+                }
+            }
+            EventKind::ThreadPrStatus { thread_id, status } => {
+                if let Some(t) = self.threads.get_mut(thread_id) {
+                    t.pr_status = status.clone();
+                }
+            }
+            EventKind::ThreadBranchRenamed { thread_id, branch } => {
+                if let Some(w) = self
+                    .threads
+                    .get_mut(thread_id)
+                    .and_then(|t| t.worktree.as_mut())
+                {
+                    w.branch = branch.clone();
+                }
+            }
+            EventKind::ProjectForgeChanged {
+                project_id,
+                settings,
+            } => {
+                if let Some(p) = self.projects.get_mut(project_id) {
+                    p.forge = settings.clone();
+                }
+            }
             _ => {}
         }
+        self.forge_track(event);
     }
 
     fn rt(&mut self, thread_id: ThreadId) -> anyhow::Result<&mut ThreadRt> {
@@ -610,8 +679,8 @@ impl Orchestrator {
     fn deferred_key(&self, item: &Deferred) -> Key {
         match item {
             Deferred::Dispatch(pending) => command_key(&pending.command.command),
-            Deferred::Query(_, Query::GitSwitch { .. }) => Key::Global,
-            Deferred::Query(_, query) => Key::Thread(query.thread_id()),
+            Deferred::Query(_, Query::GitSwitch { .. } | Query::PrCreate { .. }) => Key::Global,
+            Deferred::Query(_, query) => query.thread_id().map_or(Key::None, Key::Thread),
             Deferred::Import(_) => Key::Global,
         }
     }
@@ -771,6 +840,11 @@ impl Orchestrator {
                 self.after_import(result);
             }
             JobDone::Released(key) => self.release_key(key),
+            JobDone::Forge(done) => self.forge_done(*done),
+            JobDone::ForgeQuery(done) => self.forge_query_done(*done),
+            JobDone::ForgeFix(done) => self.fix_done(*done),
+            JobDone::ForgeMerge(done) => self.merge_done(*done),
+            JobDone::ForgeOpen(done) => self.open_done(*done),
         }
     }
 
@@ -782,10 +856,43 @@ impl Orchestrator {
                 command_id: pending.command.command_id,
                 reason,
             }),
+            Reply::Internal
+                if matches!(
+                    pending.command.command,
+                    Command::ThreadArchive { thread_id } if self.forge.auto_archiving.remove(&thread_id)
+                ) =>
+            {
+                self.emit(CoreEvent::Notice {
+                    message: format!(
+                        "A merged pull request's thread was not archived: {reason}. Archive it \
+                         from the PR tab."
+                    ),
+                });
+            }
+            Reply::Internal if matches!(pending.command.command, Command::ThreadLinkPr { .. }) => {
+                if let Command::ThreadLinkPr { thread_id, .. } = pending.command.command {
+                    self.thread_notice(
+                        thread_id,
+                        &format!(
+                            "The pull request could not be linked: {reason}. Link it with Link PR."
+                        ),
+                    );
+                }
+            }
             Reply::Internal => {
                 eprintln!("blongo-core: scheduled command refused: {reason}");
                 self.emit(CoreEvent::Notice {
                     message: format!("A scheduled task could not run: {reason}"),
+                });
+            }
+            Reply::Fix(run_id) => self.fix_refused(run_id, &reason),
+            Reply::Query(id) => {
+                self.forge.drafts.retain(|_, q| *q != id);
+                self.forge.answers.remove(&id);
+                self.open_refused(id);
+                self.emit(CoreEvent::Reply {
+                    id,
+                    result: Err(reason),
                 });
             }
             Reply::Mcp { tx, .. } => {
@@ -796,6 +903,27 @@ impl Orchestrator {
 
     /// The command committed (or was a duplicate): tell whoever waits.
     fn succeed(&mut self, reply: Reply) {
+        if let Reply::Fix(run_id) = reply {
+            return self.fix_sent(run_id);
+        }
+        if let Reply::Query(id) = reply {
+            if self.opened(id) {
+                return;
+            }
+            // A draft answers when its turn ends; a fix now.
+            if !self.forge.drafts.values().any(|q| *q == id) {
+                let text = self
+                    .forge
+                    .answers
+                    .remove(&id)
+                    .unwrap_or_else(|| "sent to the agent".into());
+                self.emit(CoreEvent::Reply {
+                    id,
+                    result: Ok(QueryReply::Done(text)),
+                });
+            }
+            return;
+        }
         let Reply::Mcp { tx, then } = reply else {
             return;
         };
@@ -932,7 +1060,8 @@ impl Orchestrator {
                 }
                 let project_path = PathBuf::from(&project.path);
                 let id = thread_id.0.simple().to_string();
-                let branch = format!("blongo/{}", &id[id.len() - 12..]);
+                let generated = format!("{}{}", project.forge.branch_prefix, &id[id.len() - 12..]);
+                let (branch, checkout) = self.worktree_checkout(*thread_id, *project_id, generated);
                 let path = self
                     .config
                     .data_dir
@@ -942,6 +1071,7 @@ impl Orchestrator {
                     project_path,
                     path,
                     branch,
+                    checkout,
                 }))
             }
             Command::ThreadRollback {
@@ -998,6 +1128,7 @@ impl Orchestrator {
                     sharers: n,
                 }))
             }
+            Command::ThreadLinkPr { thread_id, pr } => self.prepare_link(*thread_id, pr).map(Some),
             _ => Ok(None),
         }
     }
@@ -1113,6 +1244,24 @@ async fn clean_up(
                 thread.title, worktree.path
             ),
         });
+        return;
+    }
+    // The branch of a merged pull request goes too, when it is exactly
+    // what was merged.
+    if let (Some(link), Some(status)) = (&thread.pr, &thread.pr_status)
+        && status.state == blongo_protocol::PrState::Merged
+        && !link.read_only
+        && link.head_branch == worktree.branch
+        && thread.parent_thread_id.is_none()
+        && thread.forked_from.is_none()
+        && let Err(err) = blongo_git::delete_merged_branch(
+            Path::new(&project.path),
+            &worktree.branch,
+            &status.head_sha,
+        )
+        .await
+    {
+        eprintln!("blongo-core: kept branch {}: {err:#}", worktree.branch);
     }
 }
 
@@ -1232,6 +1381,7 @@ impl Orchestrator {
                         name,
                         path,
                         created_at: now,
+                        forge: Default::default(),
                     },
                 });
             }
@@ -1281,6 +1431,18 @@ impl Orchestrator {
                         .map(|(_, m)| m.clone())
                 });
                 thread.worktree = prepared.worktree;
+                if let Some(base) = &prepared.base {
+                    self.cache_base(*project_id, base);
+                }
+                let notice = prepared.notice.map(|message| TurnItem {
+                    id: ItemId::new(),
+                    thread_id: *thread_id,
+                    run_id: None,
+                    ordinal: 0,
+                    created_at: now,
+                    kind: ItemKind::SystemNotice { message },
+                    text: "".into(),
+                });
                 if let Some(parent) = parent {
                     // A delegated task works where its parent works.
                     thread.parent_thread_id = Some(parent.id);
@@ -1288,7 +1450,14 @@ impl Orchestrator {
                         thread.worktree = parent.worktree.clone();
                     }
                 }
-                batch.events.push(EventKind::ThreadCreated { thread });
+                batch.events.push(EventKind::ThreadCreated {
+                    thread: Box::new(thread),
+                });
+                if let Some(item) = notice {
+                    batch.events.push(EventKind::ItemAdded {
+                        item: Arc::new(item),
+                    });
+                }
             }
             Command::ThreadFork {
                 source_thread_id,
@@ -1355,6 +1524,18 @@ impl Orchestrator {
             Command::ThreadRollback {
                 thread_id, run_id, ..
             } => self.decide_rollback(&mut batch, *thread_id, *run_id, &prepared)?,
+            Command::ThreadLinkPr { thread_id, .. } => {
+                self.decide_link(&mut batch, *thread_id, prepared.pr)?;
+            }
+            Command::ThreadUnlinkPr { thread_id } => {
+                self.decide_unlink(&mut batch, *thread_id)?;
+            }
+            Command::ProjectSetForge {
+                project_id,
+                settings,
+            } => {
+                self.decide_set_forge(&mut batch, *project_id, settings)?;
+            }
             Command::ThreadRename { thread_id, title } => {
                 self.live_thread(*thread_id)?;
                 let title = title.trim();
@@ -1686,7 +1867,9 @@ impl Orchestrator {
         thread.worktree = source.worktree.clone();
         thread.forked_from = Some(source_id);
         thread.pending_context = pending_context;
-        batch.events.push(EventKind::ThreadCreated { thread });
+        batch.events.push(EventKind::ThreadCreated {
+            thread: Box::new(thread),
+        });
 
         let mut run_map = HashMap::new();
         for run in &runs {
@@ -2996,6 +3179,7 @@ impl Orchestrator {
         }
         eprintln!("blongo: run {} finished ({status:?})", run.run_id);
         self.emit(CoreEvent::RunFinished { thread_id, status });
+        self.forge_after_turn(thread_id);
         if !self.is_busy(thread_id) {
             self.resolve_waiters(thread_id);
         }
@@ -3020,6 +3204,9 @@ impl Orchestrator {
             // and does not follow clock changes.
             let ms = (due.0 - Timestamp::now().0).clamp(0, 15 * 60_000) as u64;
             consider(Instant::now() + Duration::from_millis(ms));
+        }
+        if let Some(due) = self.forge.next_due() {
+            consider(due);
         }
         for rt in self.rt.values() {
             if let Some(deadline) = rt.run.as_ref().and_then(|r| r.interrupt_deadline) {
@@ -3051,6 +3238,7 @@ impl Orchestrator {
         if self.flush_deadline.is_some_and(|d| d <= now) {
             self.flush_text(None);
         }
+        self.forge_tick();
         let overdue: Vec<ThreadId> = self
             .rt
             .iter()
@@ -3192,6 +3380,7 @@ fn command_key(command: &Command) -> Key {
     match command {
         Command::ThreadRollback { .. } => Key::Global,
         Command::ProjectCreate { .. }
+        | Command::ProjectSetForge { .. }
         | Command::ScheduleCreate { .. }
         | Command::ScheduleUpdate { .. }
         | Command::ScheduleDelete { .. }
@@ -3207,13 +3396,31 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
             project_path,
             path,
             branch,
+            checkout,
         } => {
             let root = blongo_git::work_tree_root(&project_path)
                 .await
                 .ok_or_else(|| format!("{} is not in a git repository", project_path.display()))?;
-            blongo_git::add_worktree(&root, &path, &branch)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
+            let start = match checkout {
+                open::Checkout::New(base) => {
+                    let start = match base {
+                        Some(plan) => forge::worktree_base(&root, plan).await,
+                        None => forge::WorktreeBase::default(),
+                    };
+                    blongo_git::add_worktree(&root, &path, &branch, start.start.as_deref())
+                        .await
+                        .map(|()| start)
+                }
+                open::Checkout::At(at) => {
+                    blongo_git::add_worktree(&root, &path, &branch, Some(&at))
+                        .await
+                        .map(|()| forge::WorktreeBase::default())
+                }
+                open::Checkout::Existing => blongo_git::add_worktree_on(&root, &path, &branch)
+                    .await
+                    .map(|()| forge::WorktreeBase::default()),
+            }
+            .map_err(|e| format!("{e:#}"))?;
             // A project inside a larger repository keeps its relative place
             // in the worktree.
             let rel = project_path
@@ -3227,6 +3434,8 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
                     path: path.join(rel).to_string_lossy().into_owned(),
                     branch,
                 }),
+                notice: start.notice,
+                base: start.base,
                 ..Prepared::default()
             })
         }
@@ -3256,8 +3465,17 @@ async fn run_prep(plan: PrepPlan) -> Result<Prepared, String> {
                 restored: Some(commit),
                 pre_rollback: Some(pre),
                 sharers,
+                ..Prepared::default()
             })
         }
+        PrepPlan::LinkPr {
+            ctx,
+            cwd,
+            reference,
+        } => Ok(Prepared {
+            pr: Some(Box::new(forge::link(ctx, cwd, reference).await?)),
+            ..Prepared::default()
+        }),
     }
 }
 

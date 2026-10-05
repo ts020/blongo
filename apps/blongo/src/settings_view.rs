@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use blongo_client::forge::{self, ForgeKind, TokenFile};
 use blongo_client::update;
 use blongo_protocol::client::ApprovalPolicy;
-use blongo_protocol::{ProviderKind, Schedule, ScheduleId};
+use blongo_protocol::{BaseBranch, ForgeSettings, ProjectId, ProviderKind, Schedule, ScheduleId};
 use gpui::{Context, Entity, FontWeight, SharedString, Subscription, Window, div, prelude::*, px};
 
 use crate::input::{InputEvent, TextInput};
@@ -29,6 +29,8 @@ pub enum SettingsEvent {
     RunSchedule(ScheduleId),
     DeleteSchedule(ScheduleId),
     RemoveEnvironment(String),
+    /// The open thread's project's GitHub settings.
+    SetForge(ProjectId, ForgeSettings),
     ReloadKeybindings,
     TestNotification,
 }
@@ -46,6 +48,8 @@ pub struct ShellInfo {
     pub keybinding_problems: Vec<String>,
     pub data_dir: PathBuf,
     pub mcp: bool,
+    /// The open thread's project (id, name) and its GitHub settings.
+    pub forge: Option<(ProjectId, SharedString, ForgeSettings)>,
 }
 
 pub struct SettingsView {
@@ -55,6 +59,10 @@ pub struct SettingsView {
     token_inputs: Vec<(ForgeKind, Entity<TextInput>, Entity<TextInput>)>,
     cron_input: Entity<TextInput>,
     prompt_input: Entity<TextInput>,
+    base_input: Entity<TextInput>,
+    prefix_input: Entity<TextInput>,
+    /// The project (and settings) the GitHub inputs were filled from.
+    forge_shown: Option<(ProjectId, ForgeSettings)>,
     in_open_thread: bool,
     forges: TokenFile,
     update_status: Option<(bool, SharedString)>,
@@ -165,6 +173,30 @@ impl SettingsView {
                 }
             }),
         );
+        let base_input = cx.new(|cx| TextInput::new("develop (Enter saves)", false, cx));
+        let prefix_input = cx.new(|cx| TextInput::new("blongo/ (Enter saves)", false, cx));
+        subscriptions.push(
+            cx.subscribe_in(&base_input, window, |this, input, event, _, cx| {
+                if let InputEvent::Submit = event {
+                    let name = input.read(cx).text().trim().to_owned();
+                    this.set_forge(cx, |f| {
+                        f.base_branch = if name.is_empty() {
+                            BaseBranch::GithubDefault
+                        } else {
+                            BaseBranch::Custom { name: name.clone() }
+                        }
+                    });
+                }
+            }),
+        );
+        subscriptions.push(
+            cx.subscribe_in(&prefix_input, window, |this, input, event, _, cx| {
+                if let InputEvent::Submit = event {
+                    let prefix = input.read(cx).text().trim().to_owned();
+                    this.set_forge(cx, |f| f.branch_prefix = prefix.clone());
+                }
+            }),
+        );
         let load_error = cx.global::<Settings>().load_error.clone();
         Self {
             info,
@@ -173,6 +205,9 @@ impl SettingsView {
             token_inputs,
             cron_input,
             prompt_input,
+            base_input,
+            prefix_input,
+            forge_shown: None,
             in_open_thread: false,
             forges,
             update_status: None,
@@ -258,6 +293,73 @@ impl SettingsView {
             prompt,
             in_open_thread: self.in_open_thread,
         });
+    }
+
+    /// Change the open project's GitHub settings (the core checks them;
+    /// the shell shows a refusal).
+    fn set_forge(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut ForgeSettings)) {
+        let Some((project_id, _, settings)) = &self.info.forge else {
+            self.message = Some((
+                false,
+                "Open a thread first: settings are per project".into(),
+            ));
+            return cx.notify();
+        };
+        let mut settings = settings.clone();
+        f(&mut settings);
+        if settings
+            == self
+                .info
+                .forge
+                .as_ref()
+                .map(|(_, _, s)| s.clone())
+                .unwrap_or_default()
+        {
+            self.message = Some((true, "No change".into()));
+            return cx.notify();
+        }
+        self.message = Some((true, "Saving…".into()));
+        cx.emit(SettingsEvent::SetForge(*project_id, settings));
+        cx.notify();
+    }
+
+    /// The core refused the GitHub settings: say why and show the kept
+    /// ones again.
+    pub fn forge_refused(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.forge_shown = None;
+        self.message = Some((false, reason.into()));
+        cx.notify();
+    }
+
+    /// Fill the GitHub inputs when the project or its settings changed.
+    fn sync_forge(&mut self, cx: &mut Context<Self>) {
+        let now = self
+            .info
+            .forge
+            .as_ref()
+            .map(|(id, _, settings)| (*id, settings.clone()));
+        if now == self.forge_shown {
+            return;
+        }
+        if let (Some((was, _)), Some((id, _))) = (&self.forge_shown, &now)
+            && was == id
+        {
+            self.message = Some((true, "Saved".into()));
+        }
+        let (base, prefix) = match &now {
+            Some((_, f)) => (
+                match &f.base_branch {
+                    BaseBranch::Custom { name } => name.clone(),
+                    BaseBranch::GithubDefault => String::new(),
+                },
+                f.branch_prefix.clone(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        self.base_input.update(cx, |i, cx| i.set_text(&base, cx));
+        self.prefix_input
+            .update(cx, |i, cx| i.set_text(&prefix, cx));
+        self.forge_shown = now;
     }
 
     /// The shell accepted a new schedule.
@@ -411,6 +513,7 @@ fn mono(text: impl Into<SharedString>) -> gpui::Div {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_forge(cx);
         let s = cx.global::<Settings>().value.clone();
         let settings_path = cx.global::<Settings>().path.clone();
 
@@ -771,11 +874,129 @@ impl Render for SettingsView {
             );
         }
 
+        let mut github = section("GitHub pull requests");
+        match &self.info.forge {
+            None => {
+                github = github.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("Open a thread: these settings belong to its project."),
+                );
+            }
+            Some((_, name, f)) => {
+                let custom = matches!(f.base_branch, BaseBranch::Custom { .. });
+                github = github
+                    .child(
+                        row()
+                            .child(label("Project"))
+                            .child(div().text_xs().child(name.clone())),
+                    )
+                    .child(
+                        row()
+                            .child(label("Base branch"))
+                            .child(
+                                choice("forge-base-default".into(), "GitHub's default", !custom)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_forge(cx, |f| {
+                                            f.base_branch = BaseBranch::GithubDefault
+                                        })
+                                    })),
+                            )
+                            .child(div().text_xs().text_color(theme::text_muted()).child("or"))
+                            .child(field(&self.base_input)),
+                    )
+                    .child(
+                        row()
+                            .child(label("Branch prefix"))
+                            .child(field(&self.prefix_input)),
+                    )
+                    .child(
+                        row()
+                            .child(label("Fix failed CI"))
+                            .child(
+                                choice("forge-fix-on".into(), "Automatically", f.auto_fix_ci)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_ci = true)
+                                    })),
+                            )
+                            .child(
+                                choice("forge-fix-off".into(), "Only when I ask", !f.auto_fix_ci)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_ci = false)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .child(label("Stop after"))
+                            .children([2u32, 3, 5, 10].map(|n| {
+                                let text: &'static str = match n {
+                                    2 => "2 failures in a row",
+                                    3 => "3",
+                                    5 => "5",
+                                    _ => "10",
+                                };
+                                choice(
+                                    format!("forge-fix-max-{n}").into(),
+                                    text,
+                                    f.auto_fix_max == n,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.auto_fix_max = n)
+                                    },
+                                ))
+                            })),
+                    )
+                    .child(
+                        row()
+                            .child(label("After a merge"))
+                            .child(
+                                choice(
+                                    "forge-archive-ask".into(),
+                                    "Suggest archiving",
+                                    !f.archive_on_merge,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.archive_on_merge = false)
+                                    },
+                                )),
+                            )
+                            .child(
+                                choice(
+                                    "forge-archive-auto".into(),
+                                    "Archive the thread",
+                                    f.archive_on_merge,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_forge(cx, |f| f.archive_on_merge = true)
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(theme::text_faint()).child(
+                        "New worktrees start from the base branch as GitHub has it, and pull \
+                         requests target it. When GitHub cannot be asked, the last known default \
+                         is used, then the remote's HEAD. Branches Blongo names start with the \
+                         prefix; an empty base field means GitHub's default. When the checks of \
+                         a pull request fail, what CI said goes to the thread's agent and Blongo \
+                         commits and pushes its fix (never forced), until the checks pass or \
+                         fail that many times in a row. Archiving removes the worktree when \
+                         nothing in it would be lost, and the branch when it is exactly what was \
+                         merged.",
+                    ));
+            }
+        }
+
         let body: Vec<gpui::Div> = match self.tab {
             Tab::General => vec![approvals, appearance, notifications],
             Tab::Providers => vec![providers],
             Tab::Schedules => vec![schedules],
             Tab::Inbox => vec![inbox],
+            Tab::GitHub => vec![github],
             Tab::Updates => vec![updates],
             Tab::Keys => vec![keybindings],
             Tab::Data => vec![data, envs],
@@ -852,17 +1073,19 @@ pub enum Tab {
     Providers,
     Schedules,
     Inbox,
+    GitHub,
     Updates,
     Keys,
     Data,
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::General,
         Tab::Providers,
         Tab::Schedules,
         Tab::Inbox,
+        Tab::GitHub,
         Tab::Updates,
         Tab::Keys,
         Tab::Data,
@@ -874,6 +1097,7 @@ impl Tab {
             Tab::Providers => "Providers & models",
             Tab::Schedules => "Scheduled runs",
             Tab::Inbox => "Review inbox",
+            Tab::GitHub => "GitHub",
             Tab::Updates => "Updates",
             Tab::Keys => "Keybindings",
             Tab::Data => "Data & environments",

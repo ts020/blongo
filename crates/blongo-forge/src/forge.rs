@@ -52,7 +52,7 @@ pub struct TokenFile {
 }
 
 pub fn default_path() -> PathBuf {
-    crate::environments::config_dir().join("forge.json")
+    crate::config_dir().join("forge.json")
 }
 
 impl TokenFile {
@@ -68,7 +68,7 @@ impl TokenFile {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        crate::secret::write_private(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+        crate::fs::write_private(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn get(&self, kind: ForgeKind) -> Option<&Forge> {

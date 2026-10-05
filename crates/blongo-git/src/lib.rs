@@ -342,10 +342,16 @@ pub async fn delete_thread_refs(cwd: &Path, thread: &str, keep: &HashSet<String>
     delete_refs(cwd, &refs).await;
 }
 
-/// Create a worktree for `branch` at `path` from the repository at `repo`'s
-/// current HEAD.
-pub async fn add_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
-    if head(repo).await.is_none() {
+/// Create a worktree for a new `branch` at `path` from `start` (a commit
+/// or ref; `None`: the repository at `repo`'s current HEAD). The branch
+/// does not track `start`: it is pushed under its own name later.
+pub async fn add_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    start: Option<&str>,
+) -> anyhow::Result<()> {
+    if start.is_none() && head(repo).await.is_none() {
         bail!("the project has no commits yet; a worktree needs one");
     }
     if let Some(parent) = path.parent() {
@@ -355,10 +361,31 @@ pub async fn add_worktree(repo: &Path, path: &Path, branch: &str) -> anyhow::Res
     git(
         repo,
         &[
-            "worktree", "add", "--quiet", "-b", branch, &path_str, "HEAD",
+            "worktree",
+            "add",
+            "--quiet",
+            "--no-track",
+            "-b",
+            branch,
+            &path_str,
+            start.unwrap_or("HEAD"),
         ],
     )
     .await?;
+    Ok(())
+}
+
+/// Add a worktree at `path` with the existing local `branch` checked out
+/// (git refuses a branch checked out elsewhere).
+pub async fn add_worktree_on(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
+    if branch.starts_with('-') {
+        bail!("not a branch name");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path_str = path.to_string_lossy();
+    git(repo, &["worktree", "add", "--quiet", &path_str, branch]).await?;
     Ok(())
 }
 
@@ -406,6 +433,32 @@ pub async fn owned_worktree_top(repo: &Path, path: &Path, root: &Path) -> anyhow
         bail!("{} is a main checkout, not a worktree", top.display());
     }
     Ok(top)
+}
+
+/// Delete the local branch `branch` of `repo`, only while it points at
+/// `sha` (a merged pull request's head: nothing on it is lost). `git
+/// branch -D` itself refuses a branch checked out in any worktree.
+/// `Ok(false)`: it was kept (moved on, or gone already).
+pub async fn delete_merged_branch(repo: &Path, branch: &str, sha: &str) -> anyhow::Result<bool> {
+    if branch.is_empty() || branch.starts_with('-') || sha.is_empty() {
+        bail!("not a branch name");
+    }
+    let tip = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    if tip != sha {
+        return Ok(false);
+    }
+    git(repo, &["branch", "-D", "--", branch]).await?;
+    Ok(true)
 }
 
 /// Remove a worktree created by [`add_worktree`] (its branch stays), after

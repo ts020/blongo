@@ -441,6 +441,13 @@ async fn a_slow_reader_is_resnapshotted_with_bounded_memory() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
     let stream = socket.connect(server.addr.unwrap()).await.unwrap();
+    // A second handle on the socket, to widen its buffer once the client
+    // reads again: with a 4 KiB buffer the receiver never advertises a
+    // window worth an update, so catching up would hang on the sender's
+    // zero-window probes, whose backoff grows with how long it waited.
+    let std_stream = stream.into_std().unwrap();
+    let handle = std_stream.try_clone().unwrap();
+    let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
     let (ws, _) = tokio_tungstenite::client_async_with_config(
         target.as_str(),
         stream,
@@ -478,6 +485,9 @@ async fn a_slow_reader_is_resnapshotted_with_bounded_memory() {
         .load(std::sync::atomic::Ordering::Relaxed);
     assert!(resnapshots >= 1, "the slow client never overflowed");
 
+    socket2::SockRef::from(&handle)
+        .set_recv_buffer_size(1 << 20)
+        .unwrap();
     // Now read: Resnapshot, then a snapshot, then deltas; together they
     // hold the whole reply, with nothing lost or doubled after the
     // snapshot.
@@ -1179,4 +1189,189 @@ async fn agent_delegates_through_the_bridge(
     assert_eq!(finished, 1, "the child ran");
     assert!(text.contains("echo: from the child"), "{text}");
     assert!(!text.starts_with("ERROR"), "{text}");
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// The fake GitHub (tools/fixtures/fake_github.py) on loopback; killed on
+/// drop.
+struct FakeGitHub(std::process::Child, String);
+
+impl Drop for FakeGitHub {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl FakeGitHub {
+    async fn start(dir: &std::path::Path) -> Self {
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/fixtures/fake_github.py");
+        let port_file = dir.join("gh.port");
+        let mut child = std::process::Command::new("python3")
+            .arg(script)
+            .arg(&port_file)
+            .spawn()
+            .expect("python3 for the fake GitHub");
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let port = loop {
+            if let Ok(p) = std::fs::read_to_string(&port_file)
+                && !p.is_empty()
+            {
+                break p;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("fake GitHub exited: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake GitHub did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        Self(child, format!("http://127.0.0.1:{}", port.trim()))
+    }
+
+    async fn control(&self, body: serde_json::Value) {
+        use blongo_client::http::{Request, send};
+        let resp = send(Request::post_json(format!("{}/__control", self.1), &body))
+            .await
+            .unwrap();
+        assert!(resp.ok(), "control {body}: {}", resp.text());
+    }
+}
+
+/// GitHub work runs on the host: a remote client lists a project's pull
+/// requests and issues and starts a thread from an issue, and the token
+/// never crosses the wire (only the host reads it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_work_runs_on_the_host_and_the_token_stays_there() {
+    use blongo_protocol::workspace::{Query, QueryReply};
+    const TOKEN: &str = "test-token";
+    let dir = temp_dir("forge");
+    // A repository whose origin is github.com/acme/widgets (a local bare
+    // repository underneath).
+    let bare = dir.join("remote.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+    let project = dir.join("project");
+    git(&project, &["init", "--quiet", "-b", "main"]);
+    for (k, v) in [
+        ("user.name", "Test"),
+        ("user.email", "test@localhost"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&project, &["config", k, v]);
+    }
+    git(
+        &project,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", bare.display()),
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    std::fs::write(project.join("README.md"), "readme\n").unwrap();
+    git(&project, &["add", "-A"]);
+    git(&project, &["commit", "--quiet", "-m", "init"]);
+    git(&project, &["push", "--quiet", "-u", "origin", "main"]);
+
+    let gh = FakeGitHub::start(&dir).await;
+    gh.control(serde_json::json!({"op": "repo", "repo": "acme/widgets"}))
+        .await;
+    gh.control(
+        serde_json::json!({"op": "issue", "repo": "acme/widgets", "issue":
+        {"number": 5, "title": "Crash on empty input", "body": "Steps to reproduce"}}),
+    )
+    .await;
+    gh.control(
+        serde_json::json!({"op": "pull", "repo": "acme/widgets", "pull":
+        {"number": 3, "title": "Speed up the parser", "head": "fast"}}),
+    )
+    .await;
+    let tokens = dir.join("forge.json");
+    let mut file = blongo_client::forge::TokenFile::default();
+    file.set(blongo_client::forge::ForgeKind::GitHub, None, TOKEN.into());
+    file.save(&tokens).unwrap();
+    let mut config = config(&dir);
+    config.core.forge_tokens = tokens;
+    config.core.github_api = Some(gh.1.clone());
+    let server = blongo_server::start(config).unwrap();
+    let proxy = Proxy::start(server.addr.unwrap()).await;
+    let env = pair(&dir, &ws_target(proxy.addr)).await;
+    let (backend, mut rx) = connect_on(&rt(), env, fast_options());
+    wait_connected(&mut rx).await;
+    let project_id = ProjectId::new();
+    backend.dispatch(CommandEnvelope::new(Command::ProjectCreate {
+        project_id,
+        name: String::new(),
+        path: project.to_string_lossy().into_owned(),
+    }));
+    wait_for(&mut rx, |e| match e {
+        CoreEvent::Event(ev) => matches!(ev.kind, EventKind::ProjectCreated { .. }).then_some(()),
+        _ => None,
+    })
+    .await;
+
+    backend.query(1, Query::ForgeCandidates { project_id });
+    let reply = wait_for(&mut rx, |e| match e {
+        CoreEvent::Reply { id: 1, result } => Some(result.clone()),
+        _ => None,
+    })
+    .await;
+    let Ok(QueryReply::Candidates(c)) = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(c.repo, "acme/widgets");
+    assert_eq!(c.pulls.iter().map(|p| p.number).collect::<Vec<_>>(), [3]);
+    assert_eq!(c.issues.iter().map(|i| i.number).collect::<Vec<_>>(), [5]);
+
+    let thread_id = ThreadId::new();
+    backend.query(
+        2,
+        Query::ThreadFrom {
+            project_id: Some(project_id),
+            thread_id,
+            source: blongo_protocol::ThreadSource::Issue {
+                reference: "#5".into(),
+            },
+            provider: Default::default(),
+            model: None,
+        },
+    );
+    let reply = wait_for(&mut rx, |e| match e {
+        CoreEvent::Reply { id: 2, result } => Some(result.clone()),
+        _ => None,
+    })
+    .await;
+    let Ok(QueryReply::ThreadOpened(opened)) = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(opened.thread_id, thread_id);
+    assert!(opened.draft.unwrap().contains("Steps to reproduce"));
+
+    // What crossed the wire: the issue, never the token.
+    let seen = proxy.seen.lock().unwrap().clone();
+    let has = |needle: &str| seen.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(has("Steps to reproduce"), "the capture sees plain frames");
+    assert!(!has(TOKEN), "the token crossed the wire");
+    drop(backend);
+    server.stop();
 }

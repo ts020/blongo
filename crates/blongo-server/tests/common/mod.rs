@@ -237,6 +237,8 @@ pub struct Proxy {
     upstream: Arc<std::sync::Mutex<SocketAddr>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     pub refusing: Arc<AtomicBool>,
+    /// Every byte that went through, both ways.
+    pub seen: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Proxy {
@@ -246,7 +248,9 @@ impl Proxy {
         let upstream = Arc::new(std::sync::Mutex::new(upstream));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let refusing = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (up, generation2, refusing2) = (upstream.clone(), generation.clone(), refusing.clone());
+        let seen2 = seen.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((client, _)) = listener.accept().await else {
@@ -259,6 +263,7 @@ impl Proxy {
                 let target = *up.lock().unwrap();
                 let my_gen = generation2.load(Ordering::SeqCst);
                 let generation = generation2.clone();
+                let seen = seen2.clone();
                 tokio::spawn(async move {
                     let Ok(server) = TcpStream::connect(target).await else {
                         return;
@@ -276,7 +281,21 @@ impl Proxy {
                                 Ok(0) | Err(_) => return,
                                 Ok(n) => n,
                             };
+                            seen.lock().unwrap().extend_from_slice(&buf[..n]);
                             if !is_cut() && cw.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    };
+                    let upstream = async {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match cr.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                            if sw.write_all(&buf[..n]).await.is_err() {
                                 return;
                             }
                         }
@@ -288,7 +307,7 @@ impl Proxy {
                         tokio::time::sleep(CUT_SWALLOW).await;
                     };
                     tokio::select! {
-                        _ = tokio::io::copy(&mut cr, &mut sw) => {}
+                        _ = upstream => {}
                         _ = downstream => {}
                         _ = cut => {}
                     }
@@ -300,6 +319,7 @@ impl Proxy {
             upstream,
             generation,
             refusing,
+            seen,
         }
     }
 

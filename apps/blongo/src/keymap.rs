@@ -23,7 +23,7 @@
 //! When-clauses: context names joined with `!`, `&&`, `||` and parentheses;
 //! an unknown name is false. Names: `threadOpen`, `busy`, `remote`,
 //! `terminalOpen`, `paletteOpen`, `view.chat`, `view.diff`, `view.files`,
-//! `view.inbox`, `view.settings`.
+//! `view.pr`, `view.inbox`, `view.settings`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -113,6 +113,12 @@ pub const COMMANDS: &[CommandDef] = &[
         Some("alt-e"),
         Some("threadOpen"),
     ),
+    c(
+        "view.pr",
+        "Show the pull request",
+        Some("alt-r"),
+        Some("threadOpen"),
+    ),
     c("view.inbox", "Open the review inbox", Some("alt-i"), None),
     c("view.settings", "Open settings", Some("secondary-,"), None),
     c("provider.codex", "Use Codex", Some("alt-1"), None),
@@ -133,6 +139,31 @@ pub const COMMANDS: &[CommandDef] = &[
         "model.next",
         "Next model",
         Some("alt-m"),
+        Some("threadOpen"),
+    ),
+    c(
+        "pr.create",
+        "Create a pull request…",
+        Some("alt-p"),
+        Some("threadOpen"),
+    ),
+    c("pr.link", "Link a pull request…", None, Some("threadOpen")),
+    c(
+        "pr.open",
+        "Open the pull request on GitHub",
+        None,
+        Some("threadOpen"),
+    ),
+    c(
+        "pr.refresh",
+        "Check the pull request now",
+        None,
+        Some("threadOpen"),
+    ),
+    c(
+        "pr.unlink",
+        "Unlink the pull request",
+        None,
         Some("threadOpen"),
     ),
     c("theme.toggle", "Toggle light / dark theme", None, None),

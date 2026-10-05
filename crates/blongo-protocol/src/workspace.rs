@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunId, ThreadId};
+use crate::{ProjectId, ProviderKind, RunId, ThreadId};
 
 /// Client-chosen id that pairs a query with its reply.
 pub type QueryId = u64;
@@ -75,10 +75,104 @@ pub enum Query {
         thread_id: ThreadId,
         message: String,
     },
+    /// Check the thread's pull request on GitHub now (and look for the
+    /// branch's pull request when none is linked). Answered with `Done`
+    /// once the check finished; the status arrives as an event.
+    PrRefresh {
+        thread_id: ThreadId,
+    },
+    /// Everything the PR tab shows (fetched now, not stored). Also
+    /// refreshes the thread's status.
+    PrDetail {
+        thread_id: ThreadId,
+    },
+    /// Change the linked pull request's title and/or body on GitHub.
+    /// Refused for read-only links.
+    PrEdit {
+        thread_id: ThreadId,
+        title: Option<String>,
+        body: Option<String>,
+    },
+    /// What the Create PR form starts from (no changes made).
+    PrPrepare {
+        thread_id: ThreadId,
+    },
+    /// Send `prompt` to the thread's agent (queued behind a running turn)
+    /// and answer with the draft it returns as JSON when the turn ends.
+    PrDraft {
+        thread_id: ThreadId,
+        prompt: String,
+    },
+    /// Commit (when asked), rename the branch (when never pushed), push
+    /// it (never forced) and open the pull request, then link it. Each
+    /// step is skipped when already done, so a failed one can be retried.
+    PrCreate {
+        thread_id: ThreadId,
+        request: crate::forge::PrCreateRequest,
+    },
+    /// Push the thread's branch (never forced).
+    PrPush {
+        thread_id: ThreadId,
+    },
+    /// Send the failing checks of the linked pull request to the thread's
+    /// agent. Its changes are not pushed for it (the PR tab's Push does);
+    /// automatic fixes count from zero again.
+    PrFix {
+        thread_id: ThreadId,
+    },
+    /// Send the pull request's unresolved review threads to the thread's
+    /// agent (only those in `threads`, by id, when it is not empty).
+    PrComments {
+        thread_id: ThreadId,
+        #[serde(default)]
+        threads: Vec<String>,
+    },
+    /// Fetch the base branch and merge it into the thread's branch
+    /// (never a rebase). Conflicts are left in progress and sent to the
+    /// thread's agent to resolve; nothing is pushed.
+    PrMergeBase {
+        thread_id: ThreadId,
+    },
+    /// Merge the linked pull request on GitHub with `method`, only if its
+    /// head is still `sha` (what the user saw). `auto`: enable auto-merge
+    /// instead (GitHub merges once the requirements pass).
+    PrMerge {
+        thread_id: ThreadId,
+        method: crate::forge::MergeMethod,
+        sha: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// Archive the thread of a merged pull request; with `delete_remote`,
+    /// first delete its branch on GitHub (only if it is still at the
+    /// merged commit).
+    PrArchive {
+        thread_id: ThreadId,
+        #[serde(default)]
+        delete_remote: bool,
+    },
+    /// The pull requests, issues and branches a thread of the project
+    /// can start from.
+    ForgeCandidates {
+        project_id: ProjectId,
+    },
+    /// Start thread `thread_id` in its own worktree on `source`'s work
+    /// (`project_id: None`: the project whose remote is the pull request
+    /// URL's repository). Answered with `ThreadOpened` once it exists.
+    ThreadFrom {
+        project_id: Option<ProjectId>,
+        thread_id: ThreadId,
+        source: crate::forge::ThreadSource,
+        #[serde(default)]
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+    },
 }
 
 impl Query {
-    pub fn thread_id(&self) -> ThreadId {
+    /// The existing thread the query is about (`None`: a project's).
+    pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::DiffSummary { thread_id, .. }
             | Self::DiffFile { thread_id, .. }
@@ -88,13 +182,33 @@ impl Query {
             | Self::GitStatus { thread_id }
             | Self::GitBranches { thread_id }
             | Self::GitSwitch { thread_id, .. }
-            | Self::GitCommit { thread_id, .. } => *thread_id,
+            | Self::GitCommit { thread_id, .. }
+            | Self::PrRefresh { thread_id }
+            | Self::PrDetail { thread_id }
+            | Self::PrEdit { thread_id, .. }
+            | Self::PrPrepare { thread_id }
+            | Self::PrDraft { thread_id, .. }
+            | Self::PrCreate { thread_id, .. }
+            | Self::PrPush { thread_id }
+            | Self::PrFix { thread_id }
+            | Self::PrComments { thread_id, .. }
+            | Self::PrMergeBase { thread_id }
+            | Self::PrMerge { thread_id, .. }
+            | Self::PrArchive { thread_id, .. } => Some(*thread_id),
+            Self::ForgeCandidates { .. } | Self::ThreadFrom { .. } => None,
         }
     }
 
     /// Changes the workspace (sequenced with the thread's other work).
     pub fn is_mutation(&self) -> bool {
-        matches!(self, Self::GitSwitch { .. } | Self::GitCommit { .. })
+        matches!(
+            self,
+            Self::GitSwitch { .. }
+                | Self::GitCommit { .. }
+                | Self::PrCreate { .. }
+                | Self::PrPush { .. }
+                | Self::PrMergeBase { .. }
+        )
     }
 }
 
@@ -119,6 +233,11 @@ pub enum QueryReply {
     Branches(Vec<BranchInfo>),
     /// A mutation finished; a human-readable summary.
     Done(String),
+    PrDetail(Box<crate::forge::PrDetail>),
+    PrPrepare(Box<crate::forge::PrPrepare>),
+    PrDraft(crate::forge::PrDraft),
+    Candidates(Box<crate::forge::ForgeCandidates>),
+    ThreadOpened(crate::forge::ThreadOpened),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

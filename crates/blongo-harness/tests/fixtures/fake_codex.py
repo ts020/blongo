@@ -25,10 +25,16 @@ Phase 4: "mcp: TOOL JSON" calls one of Blongo's MCP tools through the bridge
 named in thread/start `config.mcp_servers.blongo` and streams its answer;
 "usage" reports token usage twice; "sleep N" answers after N seconds;
 FAKE_CODEX_DUMP_START appends every thread/start's params (JSON per line).
+
+GitHub: a prompt starting with "Draft a pull request" (Blongo's draft
+prompt) is answered with a fixed draft in a ```json block; one starting
+with "CI failed on branch" (a CI fix) writes ci-fix.txt in the working
+directory (different each turn) and answers "fixed".
 """
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -370,6 +376,14 @@ def main():
         text = msg["params"]["input"][0]["text"]
         if text.startswith("mcp:") or text.startswith("mcp*"):
             mcp_turn(turn_id, text)
+        elif text.startswith("Draft a pull request"):
+            draft = {"title": "Handle empty input in the parser",
+                     "body": "## Why\nEmpty input crashed the parser.\n\n## Testing\nThe e2e run.",
+                     "commit_message": "Handle empty input"}
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1",
+                    "delta": "Here is a draft:\n```json\n" + json.dumps(draft) + "\n```"})
+            complete(turn_id, "completed")
         elif "echo:" in text:
             notify("item/agentMessage/delta",
                    {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": text})
@@ -412,6 +426,27 @@ def main():
             notify("item/agentMessage/delta",
                    {"threadId": THREAD, "turnId": turn_id, "itemId": "m1",
                     "delta": f"wrote {files} files"})
+            complete(turn_id, "completed")
+        elif text.startswith("CI failed on branch"):
+            with open("ci-fix.txt", "w") as f:
+                f.write(f"fix {turn_seq} {time.time()}\n")
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "fixed"})
+            complete(turn_id, "completed")
+        elif text.startswith("Merging ") and "stopped with conflicts" in text:
+            # Resolve every listed file with this side's version and
+            # finish the merge.
+            files = [l[2:] for l in text.splitlines() if l.startswith("- ")]
+            for name in files:
+                subprocess.run(["git", "checkout", "--ours", "--", name], check=True)
+                subprocess.run(["git", "add", "--", name], check=True)
+            subprocess.run(["git", "commit", "--quiet", "--no-edit"], check=True)
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "resolved"})
+            complete(turn_id, "completed")
+        elif text.startswith("Review comments on your changes:"):
+            notify("item/agentMessage/delta",
+                   {"threadId": THREAD, "turnId": turn_id, "itemId": "m1", "delta": "addressed"})
             complete(turn_id, "completed")
         elif text.startswith("write "):
             _, name, body = text.split(" ", 2)

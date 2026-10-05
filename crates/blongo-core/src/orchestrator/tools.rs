@@ -65,6 +65,53 @@ impl Orchestrator {
     /// Resolve a query's folder and trees on the loop, run it as a task
     /// and answer straight from there.
     pub(super) fn query(&mut self, id: QueryId, query: Query) {
+        if let Query::PrRefresh { thread_id } = query {
+            return self.pr_refresh(id, thread_id);
+        }
+        if matches!(
+            query,
+            Query::PrDetail { .. } | Query::PrEdit { .. } | Query::PrPrepare { .. }
+        ) {
+            return self.pr_query(id, query);
+        }
+        if let Query::PrDraft { thread_id, prompt } = query {
+            return self.pr_draft(id, thread_id, prompt);
+        }
+        if let Query::PrFix { thread_id } = query {
+            return self.pr_fix(id, thread_id);
+        }
+        if let Query::PrComments { thread_id, threads } = query {
+            return self.pr_comments(id, thread_id, threads);
+        }
+        if let Query::PrMerge {
+            thread_id,
+            method,
+            sha,
+            auto,
+        } = query
+        {
+            return self.pr_merge(id, thread_id, method, sha, auto);
+        }
+        if let Query::PrArchive {
+            thread_id,
+            delete_remote,
+        } = query
+        {
+            return self.pr_archive(id, thread_id, delete_remote);
+        }
+        if let Query::ForgeCandidates { project_id } = query {
+            return self.forge_candidates(id, project_id);
+        }
+        if let Query::ThreadFrom {
+            project_id,
+            thread_id,
+            source,
+            provider,
+            model,
+        } = query
+        {
+            return self.thread_from(id, project_id, thread_id, source, provider, model);
+        }
         match self.query_plan(&query) {
             Ok((cwd, plan)) => {
                 let out = self.out.clone();
@@ -81,7 +128,7 @@ impl Orchestrator {
     }
 
     fn query_plan(&self, query: &Query) -> Result<(PathBuf, Plan), String> {
-        let (_, cwd) = self.thread_cwd(query.thread_id())?;
+        let (_, cwd) = self.thread_cwd(query.thread_id().ok_or("not a thread query")?)?;
         let cwd = PathBuf::from(cwd);
         let plan = match query {
             Query::DiffSummary { thread_id, scope } => {
@@ -153,6 +200,22 @@ impl Orchestrator {
                     message: message.clone(),
                 }
             }
+            Query::PrRefresh { .. }
+            | Query::PrDetail { .. }
+            | Query::PrEdit { .. }
+            | Query::PrPrepare { .. }
+            | Query::PrDraft { .. }
+            | Query::PrCreate { .. }
+            | Query::PrPush { .. }
+            | Query::PrFix { .. }
+            | Query::PrComments { .. }
+            | Query::PrMergeBase { .. }
+            | Query::PrMerge { .. }
+            | Query::PrArchive { .. }
+            | Query::ForgeCandidates { .. }
+            | Query::ThreadFrom { .. } => {
+                return Err("not a workspace query".into());
+            }
         };
         Ok((cwd, plan))
     }
@@ -161,8 +224,14 @@ impl Orchestrator {
     /// branch switch, every thread in the same folder) is idle; it holds
     /// `key` until done.
     pub(super) fn mutate(&mut self, id: QueryId, query: Query, key: Key) {
+        if matches!(query, Query::PrCreate { .. } | Query::PrPush { .. }) {
+            return self.pr_mutate(id, query, key);
+        }
+        if let Query::PrMergeBase { thread_id } = query {
+            return self.pr_merge_base(id, thread_id, key);
+        }
         let checked = (|| {
-            let thread_id = query.thread_id();
+            let thread_id = query.thread_id().ok_or("not a thread query")?;
             let (thread, cwd) = self.thread_cwd(thread_id)?;
             self.ensure_idle(&thread)?;
             if matches!(query, Query::GitSwitch { .. })
