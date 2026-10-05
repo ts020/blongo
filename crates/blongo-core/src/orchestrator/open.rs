@@ -681,7 +681,6 @@ fn github_parts(
     Ok((repo, r))
 }
 
-/// One line of at most [`MAX_TITLE_CHARS`] (`fallback` when empty).
 /// Bring the local `branch` up to `at` (just fetched) when it is only
 /// behind; a branch with commits of its own is kept as it is. The note
 /// goes after the thread's opening message.
@@ -695,6 +694,7 @@ async fn freshen(cwd: &Path, branch: &str, at: &str, whose: &str) -> Result<Stri
     })
 }
 
+/// One line of at most [`MAX_TITLE_CHARS`] (`fallback` when empty).
 fn short_title(title: &str, fallback: &str) -> String {
     let line = title.replace(['\n', '\r'], " ");
     let line = line.trim();

@@ -142,7 +142,11 @@ impl Orchestrator {
                 return Err("only the branch of a merged pull request is deleted".into());
             }
             let ours = thread.worktree.as_ref().map(|w| w.branch.as_str());
-            if link.read_only || !forge::owns_branch(thread) || ours != Some(&link.head_branch) {
+            if link.read_only
+                || !forge::owns_branch(thread)
+                || ours != Some(&link.head_branch)
+                || self.borrowed_branch(thread.id)
+            {
                 return Err("only the thread that owns the branch can delete it".into());
             }
             Ok(Some((link, status.head_sha.clone())))
