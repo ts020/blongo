@@ -16,7 +16,7 @@ use blongo_client::environments::{self, Environment, EnvironmentFile};
 use blongo_client::{Backend, Events};
 use blongo_core::{CoreEvent, InstallState, LoginState};
 use blongo_protocol::client::{ConnectionState, TerminalEvent};
-use blongo_protocol::workspace::DiffScope;
+use blongo_protocol::workspace::{DiffScope, Query, QueryReply};
 use blongo_protocol::{
     ApprovalState, Command, CommandEnvelope, CommandId, Delivery, EventKind, ItemId, ItemKind,
     ModelInfo, ProjectId, ProviderKind, RunId, RunStatus, Schedule, ScheduleId, Thread, ThreadId,
@@ -850,7 +850,7 @@ impl Shell {
                 }
             }
             EventKind::ThreadCreated { thread } => {
-                let thread = thread.clone();
+                let thread = (**thread).clone();
                 let id = thread.id;
                 self.sidebar.update(cx, |s, cx| {
                     let threads = &mut s.envs[env].threads;
@@ -863,6 +863,58 @@ impl Shell {
                     self.pending_select = None;
                     self.select(env, id, cx);
                 }
+            }
+            EventKind::ThreadPrLinked {
+                thread_id,
+                pr,
+                manual,
+            } => {
+                let changed = self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(env, *thread_id, cx, |t| {
+                        t.pr = pr.clone();
+                        t.pr_status = None;
+                        t.pr_dismissed = pr.is_none() && *manual;
+                        true
+                    })
+                });
+                if changed && self.is_selected(env, *thread_id, cx) {
+                    cx.notify();
+                }
+            }
+            EventKind::ThreadPrStatus { thread_id, status } => {
+                let mut note = None;
+                let changed = self.sidebar.update(cx, |s, cx| {
+                    s.update_thread(env, *thread_id, cx, |t| {
+                        if let (Some(pr), Some(new)) = (&t.pr, status) {
+                            note = crate::pr::transition(t.pr_status.as_ref(), new)
+                                .map(|what| (format!("{} {what}", pr.label()), t.title.clone()));
+                        }
+                        t.pr_status = status.clone();
+                        true
+                    })
+                });
+                if let Some((body, title)) = note {
+                    self.notify(&body, &title, cx);
+                }
+                if changed && self.is_selected(env, *thread_id, cx) {
+                    cx.notify();
+                }
+            }
+            EventKind::ProjectForgeChanged {
+                project_id,
+                settings,
+            } => {
+                self.sidebar.update(cx, |s, cx| {
+                    if let Some(p) = s.envs[env]
+                        .projects
+                        .iter_mut()
+                        .find(|p| p.id == *project_id)
+                    {
+                        p.forge = settings.clone();
+                        cx.notify();
+                    }
+                });
+                self.refresh_settings_info(cx);
             }
             EventKind::ThreadRenamed { thread_id, title } => {
                 let changed = self.sidebar.update(cx, |s, cx| {
@@ -1843,6 +1895,31 @@ impl Shell {
                 }
             }
             "thread.fork" => self.fork(None, cx),
+            "pr.link" => {
+                if self.selected(cx).is_some() {
+                    self.show_palette(
+                        crate::palette::Mode::Prompt {
+                            id: "pr.link",
+                            placeholder: "Pull request URL, owner/name#12 or #12",
+                            hint: "Enter links this thread to the pull request.",
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "pr.open" => {
+                if let Some(pr) = self.selected_thread(cx).and_then(|t| t.pr) {
+                    open_pr(&pr, cx);
+                }
+            }
+            "pr.refresh" => self.refresh_pr(cx),
+            "pr.unlink" => {
+                let linked = self.selected_thread(cx).is_some_and(|t| t.pr.is_some());
+                if let Some((_, thread_id)) = self.selected(cx).filter(|_| linked) {
+                    self.dispatch_selected(Command::ThreadUnlinkPr { thread_id }, cx);
+                }
+            }
             "thread.undo" => self.undo_last(cx),
             "thread.stop" => self.stop(cx),
             "terminal.toggle" => self.toggle_terminal(window, cx),
@@ -1911,6 +1988,54 @@ impl Shell {
         } else {
             crate::palette::commands(&self.bindings)
         };
+        self.show_palette(mode, window, cx);
+    }
+
+    fn on_prompt(&mut self, id: &str, text: &str, cx: &mut Context<Self>) {
+        if id == "pr.link"
+            && let Some((_, thread_id)) = self.selected(cx)
+        {
+            self.dispatch_selected(
+                Command::ThreadLinkPr {
+                    thread_id,
+                    pr: text.to_owned(),
+                },
+                cx,
+            );
+        }
+    }
+
+    /// Ask the environment to check the open thread's pull request now.
+    fn refresh_pr(&mut self, cx: &mut Context<Self>) {
+        let Some((env, thread_id)) = self.selected(cx) else {
+            return;
+        };
+        let backend = self.backend(env).clone();
+        crate::query::ask(
+            &backend,
+            Query::PrRefresh { thread_id },
+            cx.weak_entity(),
+            cx,
+            |this, result, cx| {
+                this.notice = Some(
+                    match result {
+                        Ok(QueryReply::Done(text)) => text,
+                        Ok(_) => return,
+                        Err(err) => err,
+                    }
+                    .into(),
+                );
+                cx.notify();
+            },
+        );
+    }
+
+    fn show_palette(
+        &mut self,
+        mode: crate::palette::Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let palette = cx.new(|cx| Palette::new(mode, window, cx));
         self.view_subscriptions.push(cx.subscribe_in(
             &palette,
@@ -1925,6 +2050,10 @@ impl Shell {
                     PaletteEvent::OpenFile(path) => {
                         this.open_file = Some(path.clone());
                         this.set_view(View::Files, cx);
+                    }
+                    PaletteEvent::Submit(id, text) => {
+                        window.focus(&this.composer.focus_handle(cx), cx);
+                        this.on_prompt(id, text, cx);
                     }
                     PaletteEvent::Dismiss => {
                         window.focus(&this.composer.focus_handle(cx), cx);
@@ -2440,6 +2569,56 @@ impl Shell {
         };
 
         let usage = self.usage_label();
+        let pr_chip = thread.pr.as_ref().map(|pr| {
+            let badge = crate::pr::badge(&thread).unwrap_or(blongo_protocol::PrBadge::Open);
+            let error = thread.pr_status.as_ref().and_then(|s| s.error.clone());
+            let title = thread
+                .pr_status
+                .as_ref()
+                .map(|s| s.title.clone())
+                .filter(|t| !t.is_empty());
+            let link = pr.clone();
+            let label = match &title {
+                Some(t) => format!("#{} {t}", pr.number),
+                None => format!("#{}", pr.number),
+            };
+            div()
+                .id("pr-chip")
+                .flex()
+                .items_center()
+                .gap_1()
+                .max_w(px(320.))
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .hover(|d| d.bg(theme::surface_hover()))
+                .on_click(cx.listener(move |_, _, _, cx| open_pr(&link, cx)))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(theme::link())
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_color(crate::pr::color(badge))
+                        .child(badge.label()),
+                )
+                .when_some(error, |d, e| {
+                    d.child(
+                        div()
+                            .max_w(px(200.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(theme::warning())
+                            .child(SharedString::from(format!("⚠ {e}"))),
+                    )
+                })
+        });
         let tab = |id: &'static str, label: &'static str, view: View, current: View| {
             header_action(id, label)
                 .when(view == current, |d| {
@@ -2479,6 +2658,12 @@ impl Shell {
                     .text_color(theme::text_faint())
                     .child(SharedString::from(location)),
             )
+            .when_some(pr_chip, |d, chip| d.child(chip))
+            .when(thread.pr.is_none(), |d| {
+                d.child(header_action("link-pr", "Link PR").on_click(
+                    cx.listener(|this, _, window, cx| this.run_command("pr.link", window, cx)),
+                ))
+            })
             .when_some(usage, |d, usage| {
                 d.child(
                     div()
@@ -2881,4 +3066,12 @@ fn canonical(path: &str) -> PathBuf {
     std::path::Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Open a pull request's page. The URL came from GitHub (or a remote
+/// server): only an `https` page on the pull request's own host opens.
+fn open_pr(pr: &blongo_protocol::PrLink, cx: &mut App) {
+    if let Some(url) = crate::pr::safe_url(pr) {
+        cx.open_url(&url);
+    }
 }

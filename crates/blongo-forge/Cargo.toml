@@ -1,5 +1,5 @@
 [package]
-name = "blongo-core"
+name = "blongo-forge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,14 +7,12 @@ publish.workspace = true
 
 [dependencies]
 blongo-protocol.workspace = true
-blongo-harness.workspace = true
-blongo-store.workspace = true
-blongo-git.workspace = true
-blongo-forge.workspace = true
-rusqlite.workspace = true
-anyhow.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net"] }
 dirs.workspace = true
 getrandom.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

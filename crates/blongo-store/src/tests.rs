@@ -12,6 +12,7 @@ fn fixture(store: &mut Store) -> Fixture {
         name: "demo".into(),
         path: "/tmp/demo".into(),
         created_at: Timestamp(1),
+        forge: Default::default(),
     };
     let thread = Thread::new(ThreadId::new(), project.id, "New thread", Timestamp(2));
     store
@@ -22,7 +23,7 @@ fn fixture(store: &mut Store) -> Fixture {
                     project: project.clone(),
                 },
                 EventKind::ThreadCreated {
-                    thread: thread.clone(),
+                    thread: Box::new(thread.clone()),
                 },
             ],
             effects: vec![],
@@ -227,7 +228,9 @@ fn foreign_keys_are_enforced() {
     let thread = Thread::new(ThreadId::new(), ProjectId::new(), "orphan", Timestamp(1));
     assert!(
         store
-            .commit(Batch::default().event(EventKind::ThreadCreated { thread }))
+            .commit(Batch::default().event(EventKind::ThreadCreated {
+                thread: Box::new(thread)
+            }))
             .is_err()
     );
 }
@@ -536,7 +539,7 @@ fn thread_fields_round_trip() {
     });
     store
         .commit(Batch::default().event(EventKind::ThreadCreated {
-            thread: thread.clone(),
+            thread: Box::new(thread.clone()),
         }))
         .unwrap();
     assert_eq!(store.thread(thread.id).unwrap().unwrap(), thread);
@@ -574,7 +577,7 @@ fn usage_parent_thread_and_schedules_round_trip() {
             command_id: None,
             events: vec![
                 EventKind::ThreadCreated {
-                    thread: child.clone(),
+                    thread: Box::new(child.clone()),
                 },
                 EventKind::RunCreated { run: r.clone() },
                 EventKind::RunUsage {
@@ -658,4 +661,96 @@ fn two_connections_interleave_with_increasing_sequences() {
     // A connection that only read learns the newest sequence.
     assert_eq!(a.refresh_last_sequence().unwrap(), last);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pull_request_links_statuses_and_forge_settings_persist() {
+    let mut store = Store::open_in_memory().unwrap();
+    let f = fixture(&mut store);
+    let link = blongo_protocol::PrLink {
+        host: "github.com".into(),
+        repo: "acme/widgets".into(),
+        number: 7,
+        url: "https://github.com/acme/widgets/pull/7".into(),
+        head_branch: "b".into(),
+        base_branch: "main".into(),
+        read_only: false,
+    };
+    let status = blongo_protocol::PrStatus {
+        title: "t".into(),
+        ..Default::default()
+    };
+    let settings = ForgeSettings {
+        branch_prefix: "x/".into(),
+        ..Default::default()
+    };
+    let commit = |store: &mut Store, events| {
+        store
+            .commit(Batch {
+                command_id: None,
+                events,
+                effects: vec![],
+            })
+            .unwrap();
+    };
+    commit(
+        &mut store,
+        vec![
+            EventKind::ThreadPrLinked {
+                thread_id: f.thread.id,
+                pr: Some(link.clone()),
+                manual: false,
+            },
+            EventKind::ThreadPrStatus {
+                thread_id: f.thread.id,
+                status: Some(status.clone()),
+            },
+            EventKind::ProjectForgeChanged {
+                project_id: f.project.id,
+                settings: settings.clone(),
+            },
+        ],
+    );
+    let t = store.thread(f.thread.id).unwrap().unwrap();
+    assert_eq!(t.pr, Some(link));
+    assert_eq!(t.pr_status, Some(status));
+    assert!(!t.pr_dismissed);
+    assert_eq!(
+        store.project(f.project.id).unwrap().unwrap().forge,
+        settings
+    );
+
+    // Unlinking clears the status and remembers the user's choice.
+    commit(
+        &mut store,
+        vec![EventKind::ThreadPrLinked {
+            thread_id: f.thread.id,
+            pr: None,
+            manual: true,
+        }],
+    );
+    let t = store.thread(f.thread.id).unwrap().unwrap();
+    assert_eq!((t.pr, t.pr_status, t.pr_dismissed), (None, None, true));
+
+    // Default settings are stored as nothing.
+    commit(
+        &mut store,
+        vec![EventKind::ProjectForgeChanged {
+            project_id: f.project.id,
+            settings: ForgeSettings::default(),
+        }],
+    );
+    assert!(
+        store
+            .project(f.project.id)
+            .unwrap()
+            .unwrap()
+            .forge
+            .is_default()
+    );
+
+    assert_eq!(store.forge_cache("k").unwrap(), None);
+    store.set_forge_cache("k", "v1").unwrap();
+    store.set_forge_cache("k", "v2").unwrap();
+    assert_eq!(store.forge_cache("k").unwrap().unwrap().0, "v2");
 }

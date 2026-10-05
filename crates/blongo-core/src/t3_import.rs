@@ -223,6 +223,7 @@ fn import_from(
                             },
                             path: path.clone(),
                             created_at: Timestamp::now(),
+                            forge: Default::default(),
                         },
                     }],
                     effects: vec![],
@@ -319,7 +320,9 @@ fn import_from(
                 // No provider session to resume: the next message carries
                 // the conversation.
                 thread.pending_context = Some(PendingContext::Handoff);
-                events.push(EventKind::ThreadCreated { thread });
+                events.push(EventKind::ThreadCreated {
+                    thread: Box::new(thread),
+                });
                 (HashSet::new(), HashSet::new(), 0u32, i64::MIN)
             }
         };
