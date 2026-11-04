@@ -56,7 +56,7 @@ tree-sitter-go = "0.25"
 tree-sitter-c = "0.24"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Phase 3: wire protocol, auth, transports (all permissive).
 rmp-serde = "1"
 serde_bytes = "0.11"
